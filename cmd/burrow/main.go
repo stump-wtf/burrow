@@ -6,27 +6,59 @@
 package main
 
 import (
-	"fmt"
+	"context"
 	"log/slog"
 	"net/http"
 	"os"
 
 	"gitea.stump.rocks/stump.wtf/burrow/internal/buildinfo"
+	"gitea.stump.rocks/stump.wtf/burrow/internal/config"
+	"gitea.stump.rocks/stump.wtf/burrow/internal/httpapi"
+	"gitea.stump.rocks/stump.wtf/burrow/internal/oidc"
+	"gitea.stump.rocks/stump.wtf/burrow/internal/skills"
+	"gitea.stump.rocks/stump.wtf/burrow/internal/store"
 )
 
 func main() {
-	addr := os.Getenv("BURROW_ADDR")
-	if addr == "" {
-		addr = ":8080"
+	cfg, err := config.FromEnv()
+	if err != nil {
+		slog.Error("configuration", "error", err)
+		os.Exit(1)
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "burrow %s — stage A in progress\n", buildinfo.Version)
+	st, err := store.Open(cfg.DBPath)
+	if err != nil {
+		slog.Error("open database", "error", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+
+	catalog := skills.NewCatalog(skills.Source{
+		Dir:      cfg.SkillsDir,
+		GitURL:   cfg.SkillsGitURL,
+		CacheDir: cfg.SkillsCacheDir,
 	})
 
-	slog.Info("burrow listening", "addr", addr, "version", buildinfo.Version)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	redirectURL := cfg.OIDCRedirectURL
+	if redirectURL == "" {
+		redirectURL = cfg.BaseURL + "/auth/oidc/callback"
+	}
+	if redirectURL == "/auth/oidc/callback" {
+		slog.Error("configuration: set BURROW_BASE_URL or BURROW_OIDC_REDIRECT_URL so the OIDC redirect is absolute")
+		os.Exit(1)
+	}
+	client, err := oidc.New(context.Background(), cfg.OIDCIssuerURL, cfg.OIDCClientID, cfg.OIDCClientSecret, redirectURL)
+	if err != nil {
+		slog.Error("connect to OIDC issuer", "error", err)
+		os.Exit(1)
+	}
+
+	srv := &http.Server{
+		Addr:    cfg.Addr,
+		Handler: httpapi.New(cfg, st, catalog, client).Routes(),
+	}
+	slog.Info("burrow listening", "addr", cfg.Addr, "version", buildinfo.Version, "org", cfg.OrgSlug)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		slog.Error("server exited", "error", err)
 		os.Exit(1)
 	}
