@@ -86,7 +86,7 @@ func (s *Server) handleResources(w http.ResponseWriter, r *http.Request) {
 		"orgMemberId":    memberID(userID(r)),
 		"teamIds":        []string{},
 		"resources": map[string]any{
-			"llmProviders": map[string]string{},
+			"llmProviders": s.providers.Snapshot(),
 			"marketplaces": map[string]any{
 				marketplaceID(s.cfg): map[string]any{
 					"lastUpdatedAt": isoOrEpoch(catalogUpdatedAt(list)),

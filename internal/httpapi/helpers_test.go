@@ -73,7 +73,7 @@ func newTestEnv(t *testing.T) *testEnv {
 		t.Fatalf("seed session: %v", err)
 	}
 
-	srv := httptest.NewServer(httpapi.New(cfg, st, skills.NewCatalog(skills.Source{Dir: skillsDir}), nil).Routes())
+	srv := httptest.NewServer(httpapi.New(cfg, st, skills.NewCatalog(skills.Source{Dir: skillsDir}), nil, nil).Routes())
 	t.Cleanup(srv.Close)
 
 	return &testEnv{

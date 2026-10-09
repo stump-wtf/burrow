@@ -29,7 +29,7 @@ func newOIDCTestEnv(t *testing.T) *testEnv {
 	if err != nil {
 		t.Fatalf("oidc client against fake issuer: %v", err)
 	}
-	e.srv.Config.Handler = httpapi.New(e.cfg, e.st, skills.NewCatalog(skills.Source{Dir: e.cfg.SkillsDir}), client).Routes()
+	e.srv.Config.Handler = httpapi.New(e.cfg, e.st, skills.NewCatalog(skills.Source{Dir: e.cfg.SkillsDir}), nil, client).Routes()
 	return e
 }
 

@@ -15,6 +15,7 @@ import (
 	"gitea.stump.rocks/stump.wtf/burrow/internal/config"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/httpapi"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/oidc"
+	"gitea.stump.rocks/stump.wtf/burrow/internal/providers"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/skills"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/store"
 )
@@ -32,6 +33,22 @@ func main() {
 		os.Exit(1)
 	}
 	defer st.Close()
+
+	var llmRuntime *providers.Runtime
+	if cfg.ProvidersFile != "" {
+		providerList, err := providers.Load(cfg.ProvidersFile)
+		if err != nil {
+			slog.Error("load llm providers", "error", err)
+			os.Exit(1)
+		}
+		info, err := os.Stat(cfg.ProvidersFile)
+		if err != nil {
+			slog.Error("stat llm providers file", "error", err)
+			os.Exit(1)
+		}
+		llmRuntime = providers.NewRuntime(providerList, info.ModTime())
+		slog.Info("llm providers loaded", "count", len(providerList))
+	}
 
 	catalog := skills.NewCatalog(skills.Source{
 		Dir:      cfg.SkillsDir,
@@ -55,7 +72,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:    cfg.Addr,
-		Handler: httpapi.New(cfg, st, catalog, client).Routes(),
+		Handler: httpapi.New(cfg, st, catalog, llmRuntime, client).Routes(),
 	}
 	slog.Info("burrow listening", "addr", cfg.Addr, "version", buildinfo.Version, "org", cfg.OrgSlug)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

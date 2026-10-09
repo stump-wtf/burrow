@@ -4,14 +4,8 @@ import (
 	"net/http"
 )
 
-// Stage A stubs: endpoints the client polls but whose stage has not landed.
+// Stage stubs: endpoints the client polls but whose stage has not landed.
 // Each returns exactly the empty the client contract prescribes.
-
-// handleLLMProviders answers GET /v1/llm-providers (polled). Stage B fills it
-// with LiteLLM-backed providers (ADR-0001).
-func (s *Server) handleLLMProviders(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"llmProviders": []any{}})
-}
 
 // handleMCPConnections answers GET /v1/mcp-connections: an empty connections
 // list until Stage C.

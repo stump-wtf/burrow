@@ -41,6 +41,10 @@ type Config struct {
 	SkillsGitURL   string
 	SkillsCacheDir string
 
+	// ProvidersFile is the optional JSON file of org LLM provider
+	// definitions (Stage B); empty serves none.
+	ProvidersFile string
+
 	GrantTTL     time.Duration
 	SessionTTL   time.Duration
 	MCPTokenTTL  time.Duration
@@ -62,6 +66,7 @@ func FromEnv() (*Config, error) {
 		SkillsDir:        os.Getenv("BURROW_SKILLS_DIR"),
 		SkillsGitURL:     os.Getenv("BURROW_SKILLS_GIT_URL"),
 		SkillsCacheDir:   env("BURROW_SKILLS_CACHE_DIR", ""),
+		ProvidersFile:    os.Getenv("BURROW_PROVIDERS_FILE"),
 		GrantTTL:         envDuration("BURROW_GRANT_TTL", 5*time.Minute),
 		SessionTTL:       envDuration("BURROW_SESSION_TTL", 30*24*time.Hour),
 		MCPTokenTTL:      envDuration("BURROW_MCP_TOKEN_TTL", 24*time.Hour),

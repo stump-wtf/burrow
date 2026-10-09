@@ -9,6 +9,7 @@ import (
 
 	"gitea.stump.rocks/stump.wtf/burrow/internal/config"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/oidc"
+	"gitea.stump.rocks/stump.wtf/burrow/internal/providers"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/skills"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/store"
 )
@@ -23,15 +24,16 @@ type OIDCClient interface {
 
 // Server carries burrow's handlers.
 type Server struct {
-	cfg    *config.Config
-	store  *store.Store
-	skills *skills.Catalog
-	oidc   OIDCClient
+	cfg       *config.Config
+	store     *store.Store
+	skills    *skills.Catalog
+	providers *providers.Runtime // nil serves none
+	oidc      OIDCClient
 }
 
 // New builds the server.
-func New(cfg *config.Config, st *store.Store, catalog *skills.Catalog, client OIDCClient) *Server {
-	return &Server{cfg: cfg, store: st, skills: catalog, oidc: client}
+func New(cfg *config.Config, st *store.Store, catalog *skills.Catalog, runtime *providers.Runtime, client OIDCClient) *Server {
+	return &Server{cfg: cfg, store: st, skills: catalog, providers: runtime, oidc: client}
 }
 
 // Routes assembles the full router. Every /v1 route lives under /api/den (the
@@ -62,6 +64,7 @@ func (s *Server) Routes() http.Handler {
 	api.HandleFunc("GET /v1/plugins/{id}/config-objects", s.requireSession(s.handlePluginConfigObjects))
 	api.HandleFunc("GET /v1/config-objects/{id}/versions/latest", s.requireSession(s.handleConfigObjectLatest))
 	api.HandleFunc("GET /v1/llm-providers", s.requireSession(s.handleLLMProviders))
+	api.HandleFunc("GET /v1/llm-providers/{id}/connect", s.requireSession(s.handleLLMProviderConnect))
 	api.HandleFunc("GET /v1/mcp-connections", s.requireSession(s.handleMCPConnections))
 	api.HandleFunc("GET /v1/inference-providers", s.requireSession(s.handleInferenceProviders))
 	api.HandleFunc("POST /v1/mcp/token", s.requireSession(s.handleMCPToken))
