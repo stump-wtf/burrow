@@ -74,7 +74,7 @@ func TestRuntimeRowsAndConnect(t *testing.T) {
 	runtime := providers.NewRuntime(list, time.Unix(1700000000, 0))
 
 	t.Setenv("LITELLM_API_KEY", "sk-test-value")
-	rows := runtime.Rows()
+	rows := runtime.RowsFor(nil)
 	if len(rows) != 1 {
 		t.Fatalf("one row, got %d", len(rows))
 	}
@@ -105,11 +105,11 @@ func TestRuntimeRowsAndConnect(t *testing.T) {
 		t.Fatalf("updatedAt must be set")
 	}
 
-	connectRow, key, ok := runtime.Connect("lpr_litellm")
+	connectRow, key, ok := runtime.ConnectFor("lpr_litellm", nil)
 	if !ok || key == nil || *key != "sk-test-value" || connectRow.ID != "lpr_litellm" {
 		t.Fatalf("connect: %v %v", key, connectRow.ID)
 	}
-	if _, _, ok := runtime.Connect("lpr_missing"); ok {
+	if _, _, ok := runtime.ConnectFor("lpr_missing", nil); ok {
 		t.Fatalf("unknown provider must not connect")
 	}
 }
@@ -122,11 +122,11 @@ func TestRuntimeWithoutKeyReportsHasAPIKeyFalse(t *testing.T) {
 	runtime := providers.NewRuntime(list, time.Unix(1700000000, 0))
 	// Force the key absent even when the host shell carries one.
 	t.Setenv("LITELLM_API_KEY", "")
-	rows := runtime.Rows()
+	rows := runtime.RowsFor(nil)
 	if rows[0].HasAPIKey != false {
 		t.Fatalf("hasApiKey must be false when the env var is unset")
 	}
-	_, key, ok := runtime.Connect("lpr_litellm")
+	_, key, ok := runtime.ConnectFor("lpr_litellm", nil)
 	if !ok || key != nil {
 		t.Fatalf("connect without a provisioned key must omit the key: %v", key)
 	}
@@ -135,13 +135,13 @@ func TestRuntimeWithoutKeyReportsHasAPIKeyFalse(t *testing.T) {
 // A nil runtime (no providers file configured) serves the Stage A empties.
 func TestNilRuntimeServesNone(t *testing.T) {
 	var runtime *providers.Runtime
-	if rows := runtime.Rows(); len(rows) != 0 {
+	if rows := runtime.RowsFor(nil); len(rows) != 0 {
 		t.Fatalf("nil runtime rows: %+v", rows)
 	}
-	if snap := runtime.Snapshot(); len(snap) != 0 {
+	if snap := runtime.SnapshotFor(nil); len(snap) != 0 {
 		t.Fatalf("nil runtime snapshot: %+v", snap)
 	}
-	if _, _, ok := runtime.Connect("lpr_x"); ok {
+	if _, _, ok := runtime.ConnectFor("lpr_x", nil); ok {
 		t.Fatalf("nil runtime must not connect")
 	}
 }
@@ -152,7 +152,7 @@ func TestSnapshotCarriesUpdatedAt(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime := providers.NewRuntime(list, time.Unix(1700000000, 0))
-	snap := runtime.Snapshot()
+	snap := runtime.SnapshotFor(nil)
 	if snap["lpr_litellm"] != runtime.UpdatedAt() {
 		t.Fatalf("snapshot must map id→updatedAt: %+v", snap)
 	}

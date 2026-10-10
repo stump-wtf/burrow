@@ -17,6 +17,7 @@ single sign-on through the identity provider you already run.
 |---|---|---|
 | A | OIDC sign-in, org, Library skills, the MCP endpoint that delivers skills to the agent | shipped |
 | B | Org LLM providers pointing at a LiteLLM gateway | shipped (unconfigured; set `BURROW_PROVIDERS_FILE` to enable) |
+| B+ | Per-member provider and model access by OIDC group (`groups` on a provider row or model; SPEC-0003) | in review |
 | C | Shared MCP connections | planned |
 | D | Automations and Dashboard | planned |
 

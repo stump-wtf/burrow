@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -173,5 +174,42 @@ func TestGrantSpentOnceUnderConcurrentExchange(t *testing.T) {
 	wg.Wait()
 	if winnert != 1 {
 		t.Fatalf("exactly one exchange must win, got %d of %d", winnert, attempts)
+	}
+}
+
+// Governing: SPEC-0003 REQ "Groups claim" — groups round-trip through the
+// store, an empty claim reads back as an empty list (never nil), and a later
+// sign-in replaces rather than merges.
+func TestUserGroupsRoundTripAndReplace(t *testing.T) {
+	st := storetest.Open(t)
+	ctx := context.Background()
+
+	if err := st.UpsertUser(ctx, store.User{ID: "u1", Email: "u1@example.com", Name: "U1"}); err != nil {
+		t.Fatal(err)
+	}
+	u, err := st.GetUser(ctx, "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Groups == nil || len(u.Groups) != 0 {
+		t.Fatalf("no claim must read back as an empty, non-nil list, got %#v", u.Groups)
+	}
+
+	if err := st.UpsertUser(ctx, store.User{ID: "u1", Email: "u1@example.com", Name: "U1", Groups: []string{"family", "friends"}}); err != nil {
+		t.Fatal(err)
+	}
+	if u, err = st.GetUser(ctx, "u1"); err != nil || strings.Join(u.Groups, ",") != "family,friends" {
+		t.Fatalf("groups after sign-in: %v (err %v)", u.Groups, err)
+	}
+
+	if err := st.UpsertUser(ctx, store.User{ID: "u1", Email: "u1@example.com", Name: "U1", Groups: []string{"owner"}}); err != nil {
+		t.Fatal(err)
+	}
+	users, err := st.ListUsers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 1 || strings.Join(users[0].Groups, ",") != "owner" {
+		t.Fatalf("a later sign-in must replace the groups, got %#v", users)
 	}
 }

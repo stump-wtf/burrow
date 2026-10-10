@@ -65,6 +65,11 @@ func (s *Server) handleOrg(w http.ResponseWriter, r *http.Request) {
 // handleResources answers GET /v1/resources: the resource snapshot the client
 // diffs to notice Library changes.
 func (s *Server) handleResources(w http.ResponseWriter, r *http.Request) {
+	groups, err := s.memberGroups(r)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "could not load the member")
+		return
+	}
 	list, err := s.skills.All(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "could not load the Library")
@@ -86,7 +91,7 @@ func (s *Server) handleResources(w http.ResponseWriter, r *http.Request) {
 		"orgMemberId":    memberID(userID(r)),
 		"teamIds":        []string{},
 		"resources": map[string]any{
-			"llmProviders": s.providers.Snapshot(),
+			"llmProviders": s.providers.SnapshotFor(groups),
 			"marketplaces": map[string]any{
 				marketplaceID(s.cfg): map[string]any{
 					"lastUpdatedAt": isoOrEpoch(catalogUpdatedAt(list)),

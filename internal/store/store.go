@@ -15,6 +15,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -27,6 +28,9 @@ type User struct {
 	ID    string // the OIDC subject; opaque to the client
 	Email string
 	Name  string
+	// Groups is the member's OIDC groups claim as of their last sign-in
+	// (SPEC-0003 REQ "Groups claim"). Never nil once read from the store.
+	Groups []string
 }
 
 // ErrNotFound is returned when a row does not exist.
@@ -93,6 +97,9 @@ CREATE TABLE IF NOT EXISTS oidc_states (
 	created_at TIMESTAMPTZ NOT NULL,
 	expires_at TIMESTAMPTZ NOT NULL
 );
+-- SPEC-0003 REQ "Groups claim": the member's groups as of their last sign-in,
+-- a JSON array. Named oidc_groups because GROUPS is a reserved word.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS oidc_groups TEXT NOT NULL DEFAULT '[]';
 CREATE TABLE IF NOT EXISTS mcp_tokens (
 	token_hash TEXT PRIMARY KEY,
 	user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -125,12 +132,18 @@ func hashToken(token string) string {
 }
 
 // UpsertUser records a user identified by their OIDC subject, refreshing the
-// email and name claims on every sign-in.
+// email, name and groups claims on every sign-in. Groups are replaced, not
+// merged: the claim is the whole truth as of this sign-in (SPEC-0003).
 func (s *Store) UpsertUser(ctx context.Context, u User) error {
-	_, err := s.db.ExecContext(ctx, `
-INSERT INTO users (id, email, name, created_at, updated_at) VALUES ($1, $2, $3, $4, $4)
-ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name, updated_at = EXCLUDED.updated_at`,
-		u.ID, u.Email, u.Name, now())
+	groups, err := encodeGroups(u.Groups)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO users (id, email, name, oidc_groups, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $5)
+ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name,
+	oidc_groups = EXCLUDED.oidc_groups, updated_at = EXCLUDED.updated_at`,
+		u.ID, u.Email, u.Name, groups, now())
 	if err != nil {
 		return fmt.Errorf("store: upsert user: %w", err)
 	}
@@ -140,20 +153,24 @@ ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name, upd
 // GetUser fetches one user by id.
 func (s *Store) GetUser(ctx context.Context, id string) (User, error) {
 	var u User
-	err := s.db.QueryRowContext(ctx, `SELECT id, email, name FROM users WHERE id = $1`, id).
-		Scan(&u.ID, &u.Email, &u.Name)
+	var groups string
+	err := s.db.QueryRowContext(ctx, `SELECT id, email, name, oidc_groups FROM users WHERE id = $1`, id).
+		Scan(&u.ID, &u.Email, &u.Name, &groups)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return User{}, ErrNotFound
 		}
 		return User{}, fmt.Errorf("store: get user: %w", err)
 	}
+	if u.Groups, err = decodeGroups(groups); err != nil {
+		return User{}, err
+	}
 	return u, nil
 }
 
 // ListUsers returns every user, oldest first (the /v1/org member directory).
 func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, email, name FROM users ORDER BY created_at, id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, email, name, oidc_groups FROM users ORDER BY created_at, id`)
 	if err != nil {
 		return nil, fmt.Errorf("store: list users: %w", err)
 	}
@@ -161,12 +178,37 @@ func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
 	var users []User
 	for rows.Next() {
 		var u User
-		if err := rows.Scan(&u.ID, &u.Email, &u.Name); err != nil {
+		var groups string
+		if err := rows.Scan(&u.ID, &u.Email, &u.Name, &groups); err != nil {
 			return nil, fmt.Errorf("store: scan user: %w", err)
+		}
+		if u.Groups, err = decodeGroups(groups); err != nil {
+			return nil, err
 		}
 		users = append(users, u)
 	}
 	return users, rows.Err()
+}
+
+// encodeGroups stores groups as a JSON array; nil and empty both store "[]".
+func encodeGroups(groups []string) (string, error) {
+	if groups == nil {
+		groups = []string{}
+	}
+	raw, err := json.Marshal(groups)
+	if err != nil {
+		return "", fmt.Errorf("store: encode groups: %w", err)
+	}
+	return string(raw), nil
+}
+
+// decodeGroups reads the JSON array back, never returning nil.
+func decodeGroups(raw string) ([]string, error) {
+	groups := []string{}
+	if err := json.Unmarshal([]byte(raw), &groups); err != nil {
+		return nil, fmt.Errorf("store: decode groups: %w", err)
+	}
+	return groups, nil
 }
 
 // MintGrant issues a single-use sign-in grant for user, valid for ttl.

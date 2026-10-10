@@ -25,7 +25,7 @@ func newOIDCTestEnv(t *testing.T) *testEnv {
 
 	issuer := newFakeIssuer(t, "burrow-desktop")
 	client, err := oidc.New(context.Background(), issuer.srv.URL, "burrow-desktop", "secret",
-		e.srv.URL+"/auth/oidc/callback")
+		e.srv.URL+"/auth/oidc/callback", false)
 	if err != nil {
 		t.Fatalf("oidc client against fake issuer: %v", err)
 	}
