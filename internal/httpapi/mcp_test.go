@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
@@ -308,5 +309,41 @@ func TestMCPUnknownMethodAndResource(t *testing.T) {
 	})
 	if !strings.Contains(string(body), "-32002") {
 		t.Fatalf("unknown resource must be a JSON-RPC error, got %s", body)
+	}
+}
+
+// stump.wtf/burrow#16: the MCP path must leave enough in the log to tell
+// whether a client's load attempt ever reached burrow, and must never carry a
+// token value.
+func TestMCPPathLogsOutcomeWithoutTokens(t *testing.T) {
+	e := newTestEnv(t)
+	var logs bytes.Buffer
+	restore := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(restore) })
+
+	token := e.mcpToken(t)
+
+	// A request with no token at all, then an expired/unknown one, then a
+	// served initialize.
+	e.mcpPost(t, "", map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+	e.mcpPost(t, "not-a-real-token", map[string]any{"jsonrpc": "2.0", "id": 2, "method": "initialize"})
+	if resp, _ := e.mcpPost(t, token, map[string]any{"jsonrpc": "2.0", "id": 3, "method": "initialize"}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d", resp.StatusCode)
+	}
+
+	written := logs.String()
+	for _, want := range []string{
+		`reason=missing_mcp_token token_present=false`,
+		`reason=invalid_mcp_token token_present=true`,
+		`msg="mcp: request served" method=initialize`,
+		`msg="mcp: token minted"`,
+	} {
+		if !strings.Contains(written, want) {
+			t.Fatalf("log must contain %q, got:\n%s", want, written)
+		}
+	}
+	if strings.Contains(written, token) || strings.Contains(written, e.token) {
+		t.Fatalf("log must never contain a token value:\n%s", written)
 	}
 }

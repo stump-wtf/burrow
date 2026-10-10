@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -32,9 +33,14 @@ func (s *Server) handleMCPToken(w http.ResponseWriter, r *http.Request) {
 	_ = decodeBody(r, &body)
 	token, expiresAt, err := s.store.MintMCPToken(r.Context(), userID(r), s.cfg.OrgID(), s.cfg.MCPTokenTTL)
 	if err != nil {
+		slog.Error("mcp: token mint failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "server_error", "could not mint an MCP token")
 		return
 	}
+	// The minted value is never logged: this line is the answer to "did the
+	// client ever get a token at all", which is the first question when an
+	// MCP load fails on the client side and says nothing about the server.
+	slog.Info("mcp: token minted", "user", userID(r), "expires_at", expiresAt.Format(time.RFC3339))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token":          token,
 		"expiresAt":      expiresAt.Format(time.RFC3339),
@@ -75,9 +81,16 @@ func idOrNull(id json.RawMessage) any {
 
 // handleMCPAgent is the Streamable HTTP MCP endpoint. JSON responses only —
 // the client's transport accepts either JSON or SSE.
+// Logging on this path exists because of stump.wtf/burrow#16: the desktop app
+// reported "couldn't load the MCP openwork-cloud" during an edge-TLS outage,
+// and nothing burrow logged could show whether the client's attempts ever
+// arrived. Log the method, the outcome, and whether a token was presented —
+// never a token value.
 func (s *Server) handleMCPAgent(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	token := bearerToken(r)
 	if token == "" {
+		slog.Warn("mcp: request refused", "reason", "missing_mcp_token", "token_present", false)
 		s.writeMCPError(w, http.StatusUnauthorized, nil, -32001, "missing_mcp_token", map[string]string{"code": "missing_mcp_token"})
 		return
 	}
@@ -86,12 +99,14 @@ func (s *Server) handleMCPAgent(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, store.ErrExpired) {
 			code = "expired_mcp_token"
 		}
+		slog.Warn("mcp: request refused", "reason", code, "token_present", true, "error", err)
 		s.writeMCPError(w, http.StatusUnauthorized, nil, -32001, code, map[string]string{"code": code})
 		return
 	}
 
 	var msg jsonrpcMessage
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&msg); err != nil {
+		slog.Warn("mcp: unreadable request body", "error", err)
 		s.writeMCPError(w, http.StatusBadRequest, nil, -32700, "parse error", nil)
 		return
 	}
@@ -99,15 +114,18 @@ func (s *Server) handleMCPAgent(w http.ResponseWriter, r *http.Request) {
 	// Notifications (no id) get HTTP 202 with an empty body — the client's
 	// transport requires exactly that for notifications/initialized.
 	if len(msg.ID) == 0 {
+		slog.Debug("mcp: notification", "method", msg.Method)
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
 
 	result, rpcErr := s.dispatchMCP(r, msg)
 	if rpcErr != nil {
+		slog.Warn("mcp: request failed", "method", msg.Method, "code", rpcErr.Code, "message", rpcErr.Message, "elapsed", time.Since(start))
 		s.writeMCPError(w, http.StatusOK, msg.ID, rpcErr.Code, rpcErr.Message, rpcErr.Data)
 		return
 	}
+	slog.Info("mcp: request served", "method", msg.Method, "elapsed", time.Since(start))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -168,6 +186,7 @@ func (s *Server) dispatchMCP(r *http.Request, msg jsonrpcMessage) (any, *jsonrpc
 		}
 		index, err := s.skillIndex(r)
 		if err != nil {
+			slog.Error("mcp: skill index failed", "error", err)
 			return nil, &jsonrpcError{Code: -32003, Message: "could not load the skill index"}
 		}
 		return map[string]any{
@@ -236,6 +255,7 @@ func (s *Server) callTool(r *http.Request, name string, args json.RawMessage) (a
 		_ = json.Unmarshal(args, &params)
 		matches, err := s.skills.Search(r.Context(), params.Query)
 		if err != nil {
+			slog.Error("mcp: Library search failed", "error", err)
 			return nil, &jsonrpcError{Code: -32003, Message: "could not load the Library"}
 		}
 		entries := make([]map[string]any, 0, len(matches))
@@ -259,6 +279,7 @@ func (s *Server) callTool(r *http.Request, name string, args json.RawMessage) (a
 		}
 		skill, ok, err := s.skillByCapability(r, params.Capability)
 		if err != nil {
+			slog.Error("mcp: Library lookup failed", "capability", params.Capability, "error", err)
 			return nil, &jsonrpcError{Code: -32003, Message: "could not load the Library"}
 		}
 		if !ok {
@@ -280,6 +301,7 @@ func (s *Server) callTool(r *http.Request, name string, args json.RawMessage) (a
 		}
 		skill, ok, err := s.skills.Find(r.Context(), params.Name)
 		if err != nil {
+			slog.Error("mcp: skill read failed", "skill", params.Name, "error", err)
 			return nil, &jsonrpcError{Code: -32003, Message: "could not load the Library"}
 		}
 		if !ok {
