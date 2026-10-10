@@ -34,11 +34,21 @@ func New(ctx context.Context, issuerURL, clientID, clientSecret, redirectURL str
 	if err != nil {
 		return nil, fmt.Errorf("oidc: discover issuer %s: %w", issuerURL, err)
 	}
+	endpoint := provider.Endpoint()
+	// A public PKCE client carries no secret: pin the in-params auth
+	// style so the first token request is the RFC 7636 public-client
+	// form (client_id in the body, no Authorization header). Left on
+	// auto-detect, x/oauth2 probes header style first and sends a
+	// username-only Basic header (base64(clientID:)) — one failed
+	// round trip per process before the fallback wins.
+	if clientSecret == "" {
+		endpoint.AuthStyle = oauth2.AuthStyleInParams
+	}
 	return &Client{
 		oauth: oauth2.Config{
 			ClientID:     clientID,
 			ClientSecret: clientSecret,
-			Endpoint:     provider.Endpoint(),
+			Endpoint:     endpoint,
 			RedirectURL:  redirectURL,
 			Scopes:       []string{oidc.ScopeOpenID, "email", "profile"},
 		},

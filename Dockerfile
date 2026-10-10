@@ -7,7 +7,7 @@
 #
 # DEPLOY SAFETY: the image keeps /usr/local/bin/burrow as its ENTRYPOINT and
 # is run with no command override by the StumpCloud edge stack
-# (stumpcloud/ansible, templates/cloud01-edge/compose.yaml.j2), so the
+# (stumpcloud/ansible, playbooks/services/templates/cloud01-edge/compose.yaml.j2), so the
 # entrypoint is the deploy contract; existing deployments start the server
 # unchanged.
 
@@ -26,10 +26,11 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/burrow 
 # taught this.
 FROM alpine:3.24 AS runtime
 RUN apk upgrade --no-cache && apk add --no-cache ca-certificates git wget \
-    && addgroup -S burrow && adduser -S -G burrow burrow
+    && addgroup -S -g 101 burrow && adduser -S -u 100 -G burrow burrow
 COPY --from=build /out/burrow /usr/local/bin/burrow
-# UID/GID 100/101: the deployment creates /volumes/burrow owned by exactly
-# this pair, since the host has no burrow user to name.
+# UID/GID 100/101, pinned above rather than left to busybox allocation
+# order: the deployment creates /volumes/burrow owned by exactly this
+# pair, since the host has no burrow user to name.
 USER burrow
 ENV BURROW_ADDR=:8080
 EXPOSE 8080

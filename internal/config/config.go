@@ -78,9 +78,10 @@ func FromEnv() (*Config, error) {
 	}
 	// OIDC issuer and client id are required; the client secret is not —
 	// the deployment uses a public PKCE client (Pocket ID, like cairn's),
-	// which carries no secret at all. The OAuth2 layer sends none when the
-	// secret is empty, so an empty value is a supported configuration, not
-	// a missing one.
+	// which carries no secret at all. The OAuth2 layer pins the
+	// public-client auth style when the secret is empty (see
+	// internal/oidc), so no client credential is ever sent: an empty
+	// value is a supported configuration, not a missing one.
 	if c.OIDCIssuerURL == "" || c.OIDCClientID == "" {
 		return nil, fmt.Errorf("config: BURROW_OIDC_ISSUER_URL and BURROW_OIDC_CLIENT_ID are required (BURROW_OIDC_CLIENT_SECRET stays empty for a public PKCE client)")
 	}
