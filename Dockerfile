@@ -11,7 +11,7 @@
 # entrypoint is the deploy contract; existing deployments start the server
 # unchanged.
 
-FROM golang:1.26-alpine AS build
+FROM golang:1.27-alpine AS build
 WORKDIR /src
 # Cache module downloads before copying the full tree.
 COPY go.mod go.sum ./
