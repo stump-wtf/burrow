@@ -3,21 +3,17 @@ package store_test
 import (
 	"context"
 	"errors"
-	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"gitea.stump.rocks/stump.wtf/burrow/internal/store"
+	"gitea.stump.rocks/stump.wtf/burrow/internal/store/storetest"
 )
 
 func openTestStore(t *testing.T) *store.Store {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { st.Close() })
-	return st
+	return storetest.Open(t)
 }
 
 func seedUser(t *testing.T, st *store.Store) store.User {
@@ -140,5 +136,42 @@ func TestMCPTokenRoundTrip(t *testing.T) {
 	}
 	if _, _, err := st.LookupMCPToken(ctx, "bogus"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("unknown mcp token must be ErrNotFound, got %v", err)
+	}
+}
+
+// The grant burn is one statement (DELETE … RETURNING), so a burst of
+// concurrent exchanges against the same grant cannot spend it twice. With the
+// SQLite read-then-delete this replaces, the protection came from the single
+// write connection; here it comes from the statement itself.
+func TestGrantSpentOnceUnderConcurrentExchange(t *testing.T) {
+	st := openTestStore(t)
+	user := seedUser(t, st)
+	ctx := context.Background()
+
+	grant, err := st.MintGrant(ctx, user.ID, time.Minute)
+	if err != nil {
+		t.Fatalf("mint grant: %v", err)
+	}
+
+	const attempts = 20
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		winnert int
+	)
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := st.ConsumeGrant(ctx, grant); err == nil {
+				mu.Lock()
+				winnert++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if winnert != 1 {
+		t.Fatalf("exactly one exchange must win, got %d of %d", winnert, attempts)
 	}
 }

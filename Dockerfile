@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 #
-# One static burrow binary: modernc SQLite keeps CGO_ENABLED=0, so the build
-# needs nothing but the Go toolchain. The runtime image adds git, because the
+# One static burrow binary: pgx is pure Go (database/sql with no libpq), so the
+# build needs nothing but the Go toolchain, as with modernc SQLite before
+# ADR-0002 moved the store to Postgres. The runtime image adds git, because the
 # Library source clones and refreshes its skills repo at load time
 # (internal/skills.refreshGit shells out to git).
 #
