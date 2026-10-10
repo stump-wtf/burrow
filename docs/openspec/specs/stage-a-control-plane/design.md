@@ -15,7 +15,7 @@ themselves are fixed by `docs/client-contract.md`; everything here is the
 ```
 cmd/burrow          main: config, store, catalog, OIDC client, HTTP server
 internal/config     BURROW_* environment configuration
-internal/store      SQLite schema + token/grant/session lifecycle
+internal/store      Postgres schema + token/grant/session lifecycle
 internal/oidc       authorization-code + PKCE client (any issuer)
 internal/skills     <name>/SKILL.md loading (dir or git), frontmatter, search
 internal/httpapi    routes: auth pages, /api/den/v1/*, /mcp/agent
@@ -28,15 +28,19 @@ internal/httpapi    routes: auth pages, /api/den/v1/*, /mcp/agent
   surface without a router dependency. All `/v1` routes mount under
   `/api/den` via a subtree + `http.StripPrefix`; the client's odd double-api
   sign-out path (`/api/den/api/auth/sign-out`) falls out naturally.
-- **modernc.org/sqlite** (pure Go, no CGO) with `MaxOpenConns(1)`: SQLite
-  serializes writes anyway, and one connection avoids SQLITE_BUSY under the
-  desktop client's polling. WAL mode on.
+- **Postgres via pgx's database/sql driver.** The store was modernc SQLite with
+  `MaxOpenConns(1)` (SQLite serializes writes, and one connection avoided
+  SQLITE_BUSY under the desktop client's polling); ADR-0002 moved it to the
+  shared Postgres cluster before the access-control schema of #12/#13 landed on
+  it, so that work happens once. Pure Go either way, so the binary is still
+  CGO_ENABLED=0.
 - **Tokens stored hashed.** Grants, sessions, and MCP tokens are 43-char
-  base64url secrets; only their SHA-256 lands in SQLite. The raw value
+  base64url secrets; only their SHA-256 lands in the database. The raw value
   exists exactly once — in the response that hands it over.
-- **Single-use by delete-on-read.** `ConsumeGrant` and `TakeOIDCState` read
-  and delete in one transaction; a replay finds no row. Expiry is checked
-  after the read so a burned grant cannot be resurrected by racing the clock.
+- **Single-use by delete-on-read.** `ConsumeGrant` and `TakeOIDCState` are one
+  `DELETE … RETURNING` each — the delete is the read, so a replay finds no row
+  regardless of interleaving. Expiry is checked after the read so a burned
+  grant cannot be resurrected by racing the clock.
 - **401 code mapping.** missing header → `unauthorized`; unknown token →
   `invalid_session`; expired → `session_expired`. Exchange failures use
   `invalid_grant`, which the client does not treat as session-terminating —

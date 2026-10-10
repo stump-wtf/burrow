@@ -21,10 +21,11 @@ import (
 	"gitea.stump.rocks/stump.wtf/burrow/internal/httpapi"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/skills"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/store"
+	"gitea.stump.rocks/stump.wtf/burrow/internal/store/storetest"
 )
 
-// testEnv is one burrow server under test: temp SQLite, a temp skills
-// directory with two skills, and a seeded session for alice.
+// testEnv is one burrow server under test: a private Postgres schema, a temp
+// skills directory with two skills, and a seeded session for alice.
 type testEnv struct {
 	t      *testing.T
 	srv    *httptest.Server
@@ -48,7 +49,6 @@ func newTestEnv(t *testing.T) *testEnv {
 
 	cfg := &config.Config{
 		BaseURL:      "", // derive from request
-		DBPath:       filepath.Join(t.TempDir(), "test.db"),
 		OrgName:      "Stump Labs",
 		OrgSlug:      "stump-labs",
 		SkillsDir:    skillsDir,
@@ -58,11 +58,7 @@ func newTestEnv(t *testing.T) *testEnv {
 		OIDCStateTTL: 10 * time.Minute,
 	}
 
-	st, err := store.Open(cfg.DBPath)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { st.Close() })
+	st := storetest.Open(t)
 
 	ctx := context.Background()
 	if err := st.UpsertUser(ctx, store.User{ID: aliceSub, Email: aliceEmail, Name: "Alice"}); err != nil {

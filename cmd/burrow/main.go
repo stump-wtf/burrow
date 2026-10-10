@@ -27,7 +27,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	st, err := store.Open(cfg.DBPath)
+	st, err := store.Open(context.Background(), cfg.DatabaseURL)
 	if err != nil {
 		slog.Error("open database", "error", err)
 		os.Exit(1)

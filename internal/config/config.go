@@ -22,7 +22,10 @@ type Config struct {
 	// then http) so loopback dev and proxied production both work.
 	BaseURL string
 
-	DBPath string
+	// DatabaseURL is the Postgres connection string (BURROW_DATABASE_URL),
+	// required. The deployment renders it from OpenBao at the edge; it never
+	// lives in the repo or the container image (ADR-0002).
+	DatabaseURL string
 
 	// OIDC sign-in: any compliant issuer, Pocket ID first.
 	OIDCIssuerURL    string
@@ -59,7 +62,7 @@ func FromEnv() (*Config, error) {
 	c := &Config{
 		Addr:             env("BURROW_ADDR", ":8080"),
 		BaseURL:          strings.TrimRight(os.Getenv("BURROW_BASE_URL"), "/"),
-		DBPath:           env("BURROW_DB_PATH", "burrow.db"),
+		DatabaseURL:      strings.TrimSpace(os.Getenv("BURROW_DATABASE_URL")),
 		OIDCIssuerURL:    strings.TrimRight(os.Getenv("BURROW_OIDC_ISSUER_URL"), "/"),
 		OIDCClientID:     os.Getenv("BURROW_OIDC_CLIENT_ID"),
 		OIDCClientSecret: os.Getenv("BURROW_OIDC_CLIENT_SECRET"),
@@ -82,6 +85,9 @@ func FromEnv() (*Config, error) {
 	// public-client auth style when the secret is empty (see
 	// internal/oidc), so no client credential is ever sent: an empty
 	// value is a supported configuration, not a missing one.
+	if c.DatabaseURL == "" {
+		return nil, fmt.Errorf("config: BURROW_DATABASE_URL is required (a postgres:// URL — burrow keeps its state in the shared Postgres cluster, ADR-0002)")
+	}
 	if c.OIDCIssuerURL == "" || c.OIDCClientID == "" {
 		return nil, fmt.Errorf("config: BURROW_OIDC_ISSUER_URL and BURROW_OIDC_CLIENT_ID are required (BURROW_OIDC_CLIENT_SECRET stays empty for a public PKCE client)")
 	}

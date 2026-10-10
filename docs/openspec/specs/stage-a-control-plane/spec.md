@@ -37,7 +37,8 @@ that is deliberately not in the client's session-termination set.
 
 `POST /v1/auth/desktop-handoff/exchange` (no auth header) SHALL return
 `{token, user{id,email,name}, organization{id,slug,name}, connectEnabled:true}`.
-Sessions SHALL be Bearer tokens stored hashed in SQLite. The API SHALL answer
+Sessions SHALL be Bearer tokens stored hashed in the database (Postgres since
+ADR-0002). The API SHALL answer
 401 with exactly `unauthorized` (no header), `invalid_session` (unknown
 token), or `session_expired` (expired token) — all three are in the client's
 sign-out set, and no other 401 code may leak into these paths.
