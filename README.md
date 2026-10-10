@@ -11,12 +11,12 @@ single sign-on through the identity provider you already run.
 
 ## Status
 
-**Stage B in progress** (Stage A shipped). The staged plan (ADR-0001):
+**Stage A and B shipped.** The staged plan (ADR-0001):
 
 | Stage | Scope | Status |
 |---|---|---|
 | A | OIDC sign-in, org, Library skills, the MCP endpoint that delivers skills to the agent | shipped |
-| B | Org LLM providers pointing at a LiteLLM gateway | in progress |
+| B | Org LLM providers pointing at a LiteLLM gateway | shipped (unconfigured; set `BURROW_PROVIDERS_FILE` to enable) |
 | C | Shared MCP connections | planned |
 | D | Automations and Dashboard | planned |
 

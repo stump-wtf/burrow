@@ -38,11 +38,15 @@ type Skill struct {
 }
 
 // Source locates the skills directory: Dir directly, or GitURL cloned and
-// refreshed into CacheDir on every Load.
+// refreshed into CacheDir on every Load. SubDir names a directory inside the
+// resolved source to load from instead of its root — the org's skills repo
+// keeps its skills under skills/, and the repo root carries repo plumbing
+// that is not a skill.
 type Source struct {
 	Dir      string
 	GitURL   string
 	CacheDir string
+	SubDir   string
 }
 
 var nameRE = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
@@ -58,6 +62,9 @@ func (s *Source) Load(ctx context.Context) ([]Skill, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+	if s.SubDir != "" {
+		dir = filepath.Join(dir, s.SubDir)
 	}
 	return loadDir(dir)
 }

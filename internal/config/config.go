@@ -36,10 +36,13 @@ type Config struct {
 	OrgSlug string
 
 	// Library skills source: a local directory of <name>/SKILL.md, or a git
-	// URL cloned/refreshed into SkillsCacheDir.
+	// URL cloned/refreshed into SkillsCacheDir. SkillsSubdir names a
+	// directory inside the source (the org's skills repo keeps them under
+	// skills/); empty loads the source root.
 	SkillsDir      string
 	SkillsGitURL   string
 	SkillsCacheDir string
+	SkillsSubdir   string
 
 	// ProvidersFile is the optional JSON file of org LLM provider
 	// definitions (Stage B); empty serves none.
@@ -66,14 +69,21 @@ func FromEnv() (*Config, error) {
 		SkillsDir:        os.Getenv("BURROW_SKILLS_DIR"),
 		SkillsGitURL:     os.Getenv("BURROW_SKILLS_GIT_URL"),
 		SkillsCacheDir:   env("BURROW_SKILLS_CACHE_DIR", ""),
+		SkillsSubdir:     os.Getenv("BURROW_SKILLS_SUBDIR"),
 		ProvidersFile:    os.Getenv("BURROW_PROVIDERS_FILE"),
 		GrantTTL:         envDuration("BURROW_GRANT_TTL", 5*time.Minute),
 		SessionTTL:       envDuration("BURROW_SESSION_TTL", 30*24*time.Hour),
 		MCPTokenTTL:      envDuration("BURROW_MCP_TOKEN_TTL", 24*time.Hour),
 		OIDCStateTTL:     envDuration("BURROW_OIDC_STATE_TTL", 10*time.Minute),
 	}
-	if c.OIDCIssuerURL == "" || c.OIDCClientID == "" || c.OIDCClientSecret == "" {
-		return nil, fmt.Errorf("config: BURROW_OIDC_ISSUER_URL, BURROW_OIDC_CLIENT_ID and BURROW_OIDC_CLIENT_SECRET are required")
+	// OIDC issuer and client id are required; the client secret is not —
+	// the deployment uses a public PKCE client (Pocket ID, like cairn's),
+	// which carries no secret at all. The OAuth2 layer pins the
+	// public-client auth style when the secret is empty (see
+	// internal/oidc), so no client credential is ever sent: an empty
+	// value is a supported configuration, not a missing one.
+	if c.OIDCIssuerURL == "" || c.OIDCClientID == "" {
+		return nil, fmt.Errorf("config: BURROW_OIDC_ISSUER_URL and BURROW_OIDC_CLIENT_ID are required (BURROW_OIDC_CLIENT_SECRET stays empty for a public PKCE client)")
 	}
 	if c.SkillsDir == "" && c.SkillsGitURL == "" {
 		return nil, fmt.Errorf("config: set BURROW_SKILLS_DIR (a directory of <name>/SKILL.md) or BURROW_SKILLS_GIT_URL")

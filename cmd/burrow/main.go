@@ -54,6 +54,7 @@ func main() {
 		Dir:      cfg.SkillsDir,
 		GitURL:   cfg.SkillsGitURL,
 		CacheDir: cfg.SkillsCacheDir,
+		SubDir:   cfg.SkillsSubdir,
 	})
 
 	redirectURL := cfg.OIDCRedirectURL
