@@ -1,0 +1,36 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "timezone": "UTC",
+  "automerge": true,
+  "automergeType": "pr",
+  "automergeStrategy": "squash",
+  "major": {
+    "automerge": false
+  },
+  "minor": {
+    "automerge": true
+  },
+  "patch": {
+    "automerge": true
+  },
+  "pin": {
+    "automerge": true
+  },
+  "lockFileMaintenance": {
+    "enabled": true,
+    "automerge": true
+  },
+  "packageRules": [
+    {
+      "description": "Do not automerge dev dependencies",
+      "matchDepTypes": [
+        "devDependencies",
+        "dev-dependencies"
+      ],
+      "automerge": false
+    }
+  ]
+}
