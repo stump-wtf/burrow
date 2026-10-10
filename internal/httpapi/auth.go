@@ -86,22 +86,24 @@ func randomVerifier() string {
 }
 
 var pageTmpl = template.Must(template.New("page").Parse(`<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>burrow</title>
-<style>
-body{font:16px/1.5 system-ui,sans-serif;max-width:36rem;margin:8vh auto;padding:0 1rem;color:#222}
-code{background:#f4f4f4;padding:.15rem .4rem;border-radius:.3rem;word-break:break-all}
-a.button{display:inline-block;margin-top:1rem;padding:.6rem 1.2rem;background:#5a3e2b;color:#fff;border-radius:.5rem;text-decoration:none}
-</style></head><body>
-<h1>burrow</h1>
-{{range .Notes}}<p>{{.}}</p>{{end}}
+<style>` + pageCSS + `</style></head><body>
+<main class="shell">
+<div class="wordmark">burrow</div>
+<section class="card">
+{{if .SignInURL}}<h1>Sign in to {{.OrgName}}</h1>{{else}}<h1>One-time grant</h1>{{end}}
+{{range .Notes}}<p class="note">{{.}}</p>{{end}}
 {{if .Grant}}
-<p>Copy this grant into the OpenWork desktop app's manual sign-in, or let the link below hand it over:</p>
-<p><code id="grant">{{.Grant}}</code></p>
-{{if .DeepLink}}<p><a class="button" href="{{.DeepLink}}">Open OpenWork</a> (or <a href="{{.DeepLink}}">{{.DeepLink}}</a>)</p>{{end}}
-<script>if ({{.AutoRedirect}}) { try { location.replace({{.DeepLink}}) } catch (e) {} }</script>
+<p class="note">Copy this grant into the OpenWork desktop app's manual sign-in, or let the button below hand it over.</p>
+<code id="grant">{{.Grant}}</code>
+{{if .DeepLink}}<a class="button" href="{{.DeepLink}}">Open OpenWork</a>
+<p class="alt">or open <a href="{{.DeepLink}}">{{.DeepLink}}</a></p>{{end}}
 {{end}}
-{{if .SignInURL}}<p><a class="button href-signin" href="{{.SignInURL}}">Sign in with {{.OrgName}}</a></p>{{end}}
+{{if .SignInURL}}<a class="button href-signin" href="{{.SignInURL}}">Sign in with {{.OrgName}}</a>{{end}}
+</section>
+</main>
+<script>if ({{.AutoRedirect}}) { try { location.replace({{.DeepLink}}) } catch (e) {} }</script>
 </body></html>`))
 
 type pageData struct {
