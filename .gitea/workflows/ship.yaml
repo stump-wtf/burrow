@@ -1,0 +1,161 @@
+# ship — build, scan and publish the burrow container image, then (once the
+# repo is configured for it) deploy the result to cloud01 through
+# stumpcloud/ansible's ansible-runner action.
+#
+# TL;DR: `gitea.stump.rocks/stump.wtf/burrow:latest` is the tag cloud01's edge
+# stack pulls, so the image job below is the thing that actually moves
+# production. burrow's PR gate stays in ci.yaml (lint, test, gitleaks);
+# nothing in this workflow runs on pull_request.
+#
+# Why a separate workflow rather than stump.wtf/ci's go-service publish: the
+# shared image job gates its registry push on `github.event_name` INSIDE a
+# workflow_call callee, where that field is always the literal
+# "workflow_call" — the gate is permanently false and the image never
+# publishes (stump.wtf/ci#8 documents the callee blindness; go-service's copy
+# was still live on main 2026-08-30). stump.wtf/cairn keeps its own image job
+# for the same reason; this file copies that job, including the Trivy gate
+# that fails closed on HIGH/CRITICAL and the registry build cache.
+#
+# Deploy is opt-in and inert until the repo variable DEPLOY_ON_MERGE is
+# "true" AND the deploy secrets exist (VAULT_ROLE_ID, VAULT_SECRET_ID,
+# SSH_PRIVATE_KEY, GIT_AUTH_TOKEN — the same set cairn's deploy job reads).
+# Until then, app deploys ride the ansible converge lane instead: a
+# stumpcloud/ansible merge re-runs playbooks/services/burrow.yaml, whose
+# compose apply pulls this image.
+#
+# @joestump-agent 10/10/2026 - Added for stump.wtf/burrow#6 (deploy burrow on
+#   StumpCloud), modeled on cairn's pipeline.yaml image + deploy jobs.
+
+name: ship
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ship-${{ gitea.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: build + scan + push
+    runs-on: ubuntu-latest
+    # Every step is guarded on REGISTRY_TOKEN being set rather than the job
+    # being guarded as a whole: secrets are not available in a job-level
+    # `if:`, so the env-var indirection is the only way to make an
+    # unconfigured repo skip quietly instead of failing red. REGISTRY_TOKEN
+    # itself is inherited from the stump.wtf org-level secret; the per-run
+    # token is rejected by the container registry (stumpcloud-ci trap 3).
+    env:
+      REG: ${{ secrets.REGISTRY_TOKEN }}
+    steps:
+      - if: ${{ env.REG != '' }}
+        uses: actions/checkout@v4
+
+      - if: ${{ env.REG != '' }}
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - if: ${{ env.REG != '' }}
+        name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: gitea.stump.rocks/stump.wtf/burrow
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+
+      - if: ${{ env.REG != '' }}
+        name: Log in to Gitea container registry
+        uses: docker/login-action@v3
+        with:
+          registry: gitea.stump.rocks
+          username: joestump-agent
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - if: ${{ env.REG != '' }}
+        name: Build amd64 image for Trivy scan
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: gitea.stump.rocks/stump.wtf/burrow:scan-${{ gitea.run_id }}
+          # The runtime stage's `apk upgrade` layer must never come from the
+          # cache: a cached layer pins whatever package snapshot was current
+          # when it was first built, so the Trivy gate below scans (and the
+          # push publishes) stale packages. Keep the Go build cached; keep
+          # the apk layer live.
+          no-cache-filters: runtime
+          cache-from: type=registry,ref=gitea.stump.rocks/stump.wtf/burrow:buildcache
+
+      - if: ${{ env.REG != '' }}
+        name: Trivy image scan
+        # Pinned, not :latest — act_runner pulls a Docker action's image with
+        # forcePull=false, so a runner holding a cached :latest never sees a
+        # rebuild (stumpcloud-ci trap 6). Bump this tag deliberately.
+        uses: docker://aquasec/trivy:0.75.0
+        with:
+          args: image --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 --format table gitea.stump.rocks/stump.wtf/burrow:scan-${{ gitea.run_id }}
+
+      - if: ${{ env.REG != '' }}
+        name: Build and push (amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          no-cache-filters: runtime
+          cache-from: type=registry,ref=gitea.stump.rocks/stump.wtf/burrow:buildcache
+          cache-to: type=registry,ref=gitea.stump.rocks/stump.wtf/burrow:buildcache,mode=max
+
+  # Deploy to cloud01 (ansible). Inert until DEPLOY_ON_MERGE=true and the
+  # deploy secrets are set; the variable gate is repo VARIABLES (readable in
+  # a job-level `if:`), not secrets. Needs the ansible-runner v2.1.1 floor:
+  # the first release where ssh_private_key is a real, delivered input.
+  deploy:
+    name: deploy to cloud01 (ansible)
+    needs: [image]
+    if: ${{ vars.DEPLOY_ON_MERGE == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      ANSIBLE_FORCE_COLOR: 'true'
+      DOCKER_TIMEOUT: 600
+      # AppRole rather than a static token: a static VAULT_TOKEN repo secret
+      # cannot re-authenticate and dies at max TTL, silently taking every
+      # later deploy with it (the 2026-07-01 vault-agent OMG).
+      VAULT_ROLE_ID: ${{ secrets.VAULT_ROLE_ID }}
+      VAULT_SECRET_ID: ${{ secrets.VAULT_SECRET_ID }}
+    steps:
+      - name: Checkout stumpcloud/ansible (playbooks + inventory)
+        uses: actions/checkout@v4
+        with:
+          repository: stumpcloud/ansible
+          ref: main
+          token: ${{ secrets.GIT_AUTH_TOKEN }}
+
+      - name: Log in to Gitea (pull the ansible-runner action image)
+        uses: docker/login-action@v3
+        with:
+          registry: gitea.stump.rocks
+          username: joestump-agent
+          password: ${{ secrets.GIT_AUTH_TOKEN }}
+
+      - name: Deploy burrow to cloud01
+        uses: https://gitea.stump.rocks/stumpcloud/ansible-runner@v2.1.1
+        with:
+          playbook: playbooks/services/burrow.yaml
+          inventory: gva.yaml
+          ssh_hosts: cloud01.stump.rocks
+          ssh_private_key: ${{ secrets.SSH_PRIVATE_KEY }}
