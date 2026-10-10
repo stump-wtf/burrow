@@ -77,7 +77,7 @@ log the outcome and the identifiers, not the value.
 - Log with `log/slog` structured fields, the way `internal/skills` does. A
   refused or failed request must be visible in production logs at Info/Warn,
   not Debug.
-- HTTP responses go through the `respond` helpers so error shape stays uniform.
+- HTTP responses go through the `writeJSON` helpers so error shape stays uniform.
 - Comments that carry governance use the house format, e.g.
   `// Governing: ADR-0002 (store is Postgres), SPEC-0001 REQ "Single-use grants"`,
   and block comments are a header plus an append-only dated log — no ASCII
