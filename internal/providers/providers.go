@@ -23,6 +23,10 @@ type Model struct {
 	ID     string         `json:"id"`
 	Name   string         `json:"name"`
 	Config map[string]any `json:"config,omitempty"`
+	// Groups narrows this model's audience below its provider's (SPEC-0003
+	// REQ "Visibility"). It does not narrow the row's key; see the
+	// key-scope warning.
+	Groups []string `json:"groups,omitempty"`
 }
 
 // Provider is one validated provider definition.
@@ -33,6 +37,9 @@ type Provider struct {
 	BaseURL    string  `json:"baseURL"`
 	APIKeyEnv  string  `json:"apiKeyEnv"`
 	Models     []Model `json:"models"`
+	// Groups is the row's audience: members holding any of these OIDC
+	// groups. Absent means every member (SPEC-0003 REQ "Visibility").
+	Groups []string `json:"groups,omitempty"`
 }
 
 // file is the on-disk shape of the providers file.
@@ -88,12 +95,33 @@ func validate(p Provider) error {
 	if !envNameRE.MatchString(p.APIKeyEnv) {
 		return fmt.Errorf("apiKeyEnv %q must be an environment variable name", p.APIKeyEnv)
 	}
+	if err := validateGroups(p.Groups); err != nil {
+		return err
+	}
 	for i, m := range p.Models {
 		if strings.TrimSpace(m.ID) == "" {
 			return fmt.Errorf("model %d: id must not be empty", i)
 		}
 		if strings.TrimSpace(m.Name) == "" {
 			return fmt.Errorf("model %q: name must not be empty", m.ID)
+		}
+		if err := validateGroups(m.Groups); err != nil {
+			return fmt.Errorf("model %q: %w", m.ID, err)
+		}
+	}
+	return nil
+}
+
+// validateGroups rejects an explicit empty list and empty entries (SPEC-0003
+// REQ "Group declarations"): "visible to nobody" written as [] cannot be told
+// apart from a mistake. An absent list (nil) means everyone.
+func validateGroups(groups []string) error {
+	if groups != nil && len(groups) == 0 {
+		return fmt.Errorf("groups must not be an empty list; omit it to mean every member")
+	}
+	for _, g := range groups {
+		if strings.TrimSpace(g) == "" {
+			return fmt.Errorf("groups must not contain an empty name")
 		}
 	}
 	return nil
@@ -188,45 +216,159 @@ func modelRows(models []Model) []ModelRow {
 	return rows
 }
 
-// Rows returns every provider row. Nil-safe: no configured file means none.
-func (r *Runtime) Rows() []Row {
+// audience returns the model's effective audience: its own groups, else its
+// provider's, else nil (every member).
+func audience(p Provider, m Model) []string {
+	if m.Groups != nil {
+		return m.Groups
+	}
+	return p.Groups
+}
+
+// allowed reports whether a member holding memberGroups may see something
+// whose audience is aud. A nil audience is open to every member.
+func allowed(aud, memberGroups []string) bool {
+	if aud == nil {
+		return true
+	}
+	for _, want := range aud {
+		for _, have := range memberGroups {
+			if want == have {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// visible returns p with only the models the member may see, and whether the
+// row is served at all: a row is served when at least one model is visible,
+// or, having no models, when the provider's own audience allows the member.
+func visible(p Provider, memberGroups []string) (Provider, bool) {
+	if len(p.Models) == 0 {
+		return p, allowed(p.Groups, memberGroups)
+	}
+	shown := make([]Model, 0, len(p.Models))
+	for _, m := range p.Models {
+		if allowed(audience(p, m), memberGroups) {
+			shown = append(shown, m)
+		}
+	}
+	if len(shown) == 0 {
+		return Provider{}, false
+	}
+	p.Models = shown
+	return p, true
+}
+
+// UsesGroups reports whether any provider or model declares groups, which is
+// when sign-in must request the groups scope (SPEC-0003 REQ "Compatibility").
+func (r *Runtime) UsesGroups() bool {
+	if r == nil {
+		return false
+	}
+	for _, p := range r.providers {
+		if p.Groups != nil {
+			return true
+		}
+		for _, m := range p.Models {
+			if m.Groups != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// MixedAudienceRows returns the ids of rows whose models do not all share one
+// audience. Such a row's single key reaches every model in it, so the narrower
+// models are hidden from listing but not from the key (SPEC-0003 REQ
+// "Key-scope warning").
+func (r *Runtime) MixedAudienceRows() []string {
+	if r == nil {
+		return nil
+	}
+	var ids []string
+	for _, p := range r.providers {
+		for _, m := range p.Models {
+			if !sameGroups(audience(p, m), audience(p, p.Models[0])) {
+				ids = append(ids, p.ID)
+				break
+			}
+		}
+	}
+	return ids
+}
+
+func sameGroups(a, b []string) bool {
+	if (a == nil) != (b == nil) || len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]int, len(a))
+	for _, g := range a {
+		seen[g]++
+	}
+	for _, g := range b {
+		seen[g]--
+	}
+	for _, n := range seen {
+		if n != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// RowsFor returns the rows a member holding memberGroups may see, each listing
+// only its visible models (SPEC-0003 REQ "Visibility").
+func (r *Runtime) RowsFor(memberGroups []string) []Row {
 	if r == nil {
 		return []Row{}
 	}
 	rows := make([]Row, 0, len(r.providers))
 	for _, p := range r.providers {
-		rows = append(rows, r.Row(p))
+		if shown, ok := visible(p, memberGroups); ok {
+			rows = append(rows, r.Row(shown))
+		}
 	}
 	return rows
 }
 
-// Snapshot returns the id→updatedAt map the /v1/resources resource snapshot
-// carries so the client notices provider changes.
-func (r *Runtime) Snapshot() map[string]string {
+// SnapshotFor is Snapshot restricted to the rows the member may see
+// (SPEC-0003 REQ "Resource snapshot follows visibility").
+func (r *Runtime) SnapshotFor(memberGroups []string) map[string]string {
 	if r == nil {
 		return map[string]string{}
 	}
-	snapshot := make(map[string]string, len(r.providers))
+	snapshot := map[string]string{}
 	updatedAt := r.UpdatedAt()
 	for _, p := range r.providers {
-		snapshot[p.ID] = updatedAt
+		if _, ok := visible(p, memberGroups); ok {
+			snapshot[p.ID] = updatedAt
+		}
 	}
 	return snapshot
 }
 
-// Connect returns the provider row plus the API key when its environment
-// variable is set (nil key means "not provisioned").
-func (r *Runtime) Connect(id string) (Row, *string, bool) {
+// ConnectFor is Connect for a member: a row the member cannot see answers
+// exactly like an unknown id, so its key is never handed out and its
+// existence is not revealed (SPEC-0003 REQ "Connect follows visibility").
+func (r *Runtime) ConnectFor(id string, memberGroups []string) (Row, *string, bool) {
 	if r == nil {
 		return Row{}, nil, false
 	}
 	for _, p := range r.providers {
-		if p.ID == id {
-			if key, ok := lookupKey(p.APIKeyEnv); ok {
-				return r.Row(p), &key, true
-			}
-			return r.Row(p), nil, true
+		if p.ID != id {
+			continue
 		}
+		shown, ok := visible(p, memberGroups)
+		if !ok {
+			return Row{}, nil, false
+		}
+		if key, ok := lookupKey(p.APIKeyEnv); ok {
+			return r.Row(shown), &key, true
+		}
+		return r.Row(shown), nil, true
 	}
 	return Row{}, nil, false
 }

@@ -69,6 +69,16 @@ func userID(r *http.Request) string {
 	return id
 }
 
+// memberGroups returns the session member's OIDC groups as of their last
+// sign-in (SPEC-0003 REQ "Groups claim").
+func (s *Server) memberGroups(r *http.Request) ([]string, error) {
+	user, err := s.store.GetUser(r.Context(), userID(r))
+	if err != nil {
+		return nil, err
+	}
+	return user.Groups, nil
+}
+
 func randomState() string {
 	buf := make([]byte, 24)
 	if _, err := rand.Read(buf); err != nil {
@@ -169,7 +179,9 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "oidc_verification_failed", "the identity token did not verify")
 		return
 	}
-	user := store.User{ID: claims.Subject, Email: claims.Email, Name: claims.Name}
+	// Groups are recorded at every sign-in and read from the user record on
+	// later requests (SPEC-0003 REQ "Groups claim").
+	user := store.User{ID: claims.Subject, Email: claims.Email, Name: claims.Name, Groups: claims.Groups}
 	if err := s.store.UpsertUser(r.Context(), user); err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "could not record the user")
 		return

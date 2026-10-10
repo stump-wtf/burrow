@@ -47,7 +47,12 @@ func main() {
 			os.Exit(1)
 		}
 		llmRuntime = providers.NewRuntime(providerList, info.ModTime())
-		slog.Info("llm providers loaded", "count", len(providerList))
+		slog.Info("llm providers loaded", "count", len(providerList), "groups", llmRuntime.UsesGroups())
+		// SPEC-0003 REQ "Key-scope warning": a row's single key reaches every
+		// model in it, so model-level groups hide models from listing only.
+		for _, id := range llmRuntime.MixedAudienceRows() {
+			slog.Warn("llm provider row mixes audiences; its key still reaches the models it hides from some members — split the row per audience to enforce at the gateway", "provider", id)
+		}
 	}
 
 	catalog := skills.NewCatalog(skills.Source{
@@ -65,7 +70,7 @@ func main() {
 		slog.Error("configuration: set BURROW_BASE_URL or BURROW_OIDC_REDIRECT_URL so the OIDC redirect is absolute")
 		os.Exit(1)
 	}
-	client, err := oidc.New(context.Background(), cfg.OIDCIssuerURL, cfg.OIDCClientID, cfg.OIDCClientSecret, redirectURL)
+	client, err := oidc.New(context.Background(), cfg.OIDCIssuerURL, cfg.OIDCClientID, cfg.OIDCClientSecret, redirectURL, llmRuntime.UsesGroups())
 	if err != nil {
 		slog.Error("connect to OIDC issuer", "error", err)
 		os.Exit(1)

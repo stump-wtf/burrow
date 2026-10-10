@@ -167,6 +167,8 @@ type fakeIssuer struct {
 	key       *rsa.PrivateKey
 	clientID  string
 	claimsSub func() string
+	// groups, when non-nil, is emitted as the ID token's groups claim.
+	groups any
 }
 
 func newFakeIssuer(t *testing.T, clientID string) *fakeIssuer {
@@ -224,7 +226,7 @@ func (fi *fakeIssuer) mintIDToken() (string, error) {
 		sub = fi.claimsSub()
 	}
 	header := `{"alg":"RS256","kid":"k1"}`
-	payload, err := json.Marshal(map[string]any{
+	claims := map[string]any{
 		"iss":            fi.srv.URL,
 		"sub":            sub,
 		"aud":            fi.clientID,
@@ -233,7 +235,11 @@ func (fi *fakeIssuer) mintIDToken() (string, error) {
 		"email":          "signer@example.com",
 		"email_verified": true,
 		"name":           name,
-	})
+	}
+	if fi.groups != nil {
+		claims["groups"] = fi.groups
+	}
+	payload, err := json.Marshal(claims)
 	if err != nil {
 		return "", err
 	}

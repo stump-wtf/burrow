@@ -19,6 +19,9 @@ type Claims struct {
 	Subject string
 	Email   string
 	Name    string
+	// Groups is the groups claim, empty when the token carries none
+	// (SPEC-0003 REQ "Groups claim").
+	Groups []string
 }
 
 // Client performs the authorization-code-with-PKCE dance against the issuer.
@@ -28,8 +31,11 @@ type Client struct {
 }
 
 // New discovers the issuer and builds the client. The issuer must be
-// reachable at startup.
-func New(ctx context.Context, issuerURL, clientID, clientSecret, redirectURL string) (*Client, error) {
+// reachable at startup. requestGroups adds the "groups" scope, which Pocket ID
+// and most issuers need before they release the groups claim; it is asked for
+// only when something uses groups, so an issuer that rejects unknown scopes
+// is unaffected otherwise (SPEC-0003 REQ "Compatibility").
+func New(ctx context.Context, issuerURL, clientID, clientSecret, redirectURL string, requestGroups bool) (*Client, error) {
 	provider, err := oidc.NewProvider(ctx, issuerURL)
 	if err != nil {
 		return nil, fmt.Errorf("oidc: discover issuer %s: %w", issuerURL, err)
@@ -44,13 +50,17 @@ func New(ctx context.Context, issuerURL, clientID, clientSecret, redirectURL str
 	if clientSecret == "" {
 		endpoint.AuthStyle = oauth2.AuthStyleInParams
 	}
+	scopes := []string{oidc.ScopeOpenID, "email", "profile"}
+	if requestGroups {
+		scopes = append(scopes, "groups")
+	}
 	return &Client{
 		oauth: oauth2.Config{
 			ClientID:     clientID,
 			ClientSecret: clientSecret,
 			Endpoint:     endpoint,
 			RedirectURL:  redirectURL,
-			Scopes:       []string{oidc.ScopeOpenID, "email", "profile"},
+			Scopes:       scopes,
 		},
 		verifier: provider.Verifier(&oidc.Config{ClientID: clientID}),
 	}, nil
@@ -87,6 +97,7 @@ func (c *Client) Verify(ctx context.Context, rawIDToken string) (Claims, error) 
 		Email             string `json:"email"`
 		Name              string `json:"name"`
 		PreferredUsername string `json:"preferred_username"`
+		Groups            any    `json:"groups"`
 	}
 	if err := idToken.Claims(&payload); err != nil {
 		return Claims{}, fmt.Errorf("oidc: parse claims: %w", err)
@@ -95,5 +106,25 @@ func (c *Client) Verify(ctx context.Context, rawIDToken string) (Claims, error) 
 	if name == "" {
 		name = payload.PreferredUsername
 	}
-	return Claims{Subject: payload.Sub, Email: payload.Email, Name: name}, nil
+	return Claims{Subject: payload.Sub, Email: payload.Email, Name: name, Groups: GroupsFromClaim(payload.Groups)}, nil
+}
+
+// GroupsFromClaim normalizes a groups claim: a JSON array of strings, or a
+// single string from issuers that collapse a one-element array. Anything else,
+// and empty entries, yield nothing; the result is never nil.
+func GroupsFromClaim(v any) []string {
+	groups := []string{}
+	switch claim := v.(type) {
+	case string:
+		if claim != "" {
+			groups = append(groups, claim)
+		}
+	case []any:
+		for _, item := range claim {
+			if g, ok := item.(string); ok && g != "" {
+				groups = append(groups, g)
+			}
+		}
+	}
+	return groups
 }
