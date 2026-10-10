@@ -5,3 +5,5 @@
 *.db-wal
 *.db-shm
 .env
+# Agent worktrees (Claude Code); must never be visible to git or the build.
+.claude/worktrees/
