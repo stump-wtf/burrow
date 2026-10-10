@@ -1,6 +1,7 @@
 ---
 status: proposed
 date: 2026-10-09
+amended: 2026-10-10 (store: SQLite → Postgres, superseded in that part by ADR-0002)
 decision-makers: [Joe Stump]
 ---
 
@@ -44,7 +45,9 @@ compatibility statements.
 * **A Go single binary** — matches the rest of the `stump.wtf` products,
   deploys as one artifact, standard library HTTP.
 * **SQLite** — one file, no separate database to operate for an
-  org-sized control plane.
+  org-sized control plane. *Superseded 2026-10-10 by ADR-0002: the store is the
+  shared Postgres cluster. Everything else here stands, including the clean-room
+  rule and the staging.*
 * **OIDC sign-in (authorization code + PKCE)** — Pocket ID first, any OIDC
   issuer by configuration. Credentials come from the environment at runtime,
   never from the repo.
