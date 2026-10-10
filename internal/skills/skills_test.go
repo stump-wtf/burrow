@@ -3,6 +3,7 @@ package skills_test
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -111,4 +112,55 @@ func TestFindAndClamp(t *testing.T) {
 		t.Fatalf("clamp split a rune or exceeded the cap: valid=%v len=%d", utf8.ValidString(got), len(got))
 	}
 	_ = time.Now()
+}
+
+// The org's skills repo keeps its skills under skills/, with repo plumbing at
+// the root. SubDir must point the loader at that directory; without it the
+// root scan finds nothing.
+func TestLoadFromGitSubDir(t *testing.T) {
+	repo := t.TempDir()
+	skillDir := filepath.Join(repo, "skills", "code-review")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "---\ntitle: Code Review\ndescription: Review code carefully.\n---\n\nDo the thing.\n"
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	readme := filepath.Join(repo, "README.md")
+	if err := os.WriteFile(readme, []byte("# skills\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git := func(args ...string) {
+		t.Helper()
+		out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	git("init", "--initial-branch=main")
+	git("config", "user.email", "test@example.com")
+	git("config", "user.name", "Test")
+	git("add", "-A")
+	git("commit", "-m", "seed")
+
+	cache := t.TempDir()
+	src := &skills.Source{GitURL: repo, CacheDir: cache, SubDir: "skills"}
+	got, err := src.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "code-review" {
+		t.Fatalf("want code-review from the skills/ subdir, got %+v", got)
+	}
+
+	// Without SubDir the root scan must not mistake the repo root for a
+	// skills directory.
+	root, err := (&skills.Source{GitURL: repo, CacheDir: cache}).Load(context.Background())
+	if err != nil {
+		t.Fatalf("root load: %v", err)
+	}
+	if len(root) != 0 {
+		t.Fatalf("root scan must find no skills, got %+v", root)
+	}
 }
