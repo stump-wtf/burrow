@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -47,9 +48,29 @@ type Config struct {
 	SkillsCacheDir string
 	SkillsSubdir   string
 
-	// ProvidersFile is the optional JSON file of org LLM provider
-	// definitions (Stage B); empty serves none.
+	// ProvidersFile is the first-boot seed of org LLM provider definitions
+	// (SPEC-0004): consulted only while the llm_providers table is empty;
+	// afterwards the store is the source of truth and the file is ignored.
 	ProvidersFile string
+
+	// ModelsTTL bounds how long a row's gateway-derived model menu is
+	// trusted before the gateway is asked again (BURROW_MODELS_TTL, 60s).
+	ModelsTTL time.Duration
+
+	// AdminGroups names the OIDC groups whose members may reach the admin
+	// surface (BURROW_ADMIN_GROUPS, comma list, default empty — which closes
+	// group-based administration; API tokens still work, SPEC-0004).
+	AdminGroups []string
+
+	// APITokenTTL is the lifetime of a minted admin API token
+	// (BURROW_API_TOKEN_TTL, default 90 days).
+	APITokenTTL time.Duration
+
+	// OIDCGroupsScope requests the "groups" scope at sign-in
+	// (BURROW_OIDC_GROUPS_SCOPE, default true). Rows are mutable at runtime,
+	// so the need can no longer be decided at boot (ADR-0004); an issuer
+	// that rejects unknown scopes opts out by setting this false.
+	OIDCGroupsScope bool
 
 	GrantTTL     time.Duration
 	SessionTTL   time.Duration
@@ -74,6 +95,10 @@ func FromEnv() (*Config, error) {
 		SkillsCacheDir:   env("BURROW_SKILLS_CACHE_DIR", ""),
 		SkillsSubdir:     os.Getenv("BURROW_SKILLS_SUBDIR"),
 		ProvidersFile:    os.Getenv("BURROW_PROVIDERS_FILE"),
+		ModelsTTL:        envDuration("BURROW_MODELS_TTL", 60*time.Second),
+		AdminGroups:      envList("BURROW_ADMIN_GROUPS"),
+		APITokenTTL:      envDuration("BURROW_API_TOKEN_TTL", 90*24*time.Hour),
+		OIDCGroupsScope:  envBool("BURROW_OIDC_GROUPS_SCOPE", true),
 		GrantTTL:         envDuration("BURROW_GRANT_TTL", 5*time.Minute),
 		SessionTTL:       envDuration("BURROW_SESSION_TTL", 30*24*time.Hour),
 		MCPTokenTTL:      envDuration("BURROW_MCP_TOKEN_TTL", 24*time.Hour),
@@ -115,6 +140,31 @@ func envDuration(key string, def time.Duration) time.Duration {
 	if v := os.Getenv(key); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			return d
+		}
+	}
+	return def
+}
+
+// envList parses a comma-separated list, trimming entries and dropping
+// empty ones; unset means the empty list, not a missing configuration.
+func envList(key string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, item := range strings.Split(raw, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func envBool(key string, def bool) bool {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
 		}
 	}
 	return def

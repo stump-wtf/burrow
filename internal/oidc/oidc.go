@@ -31,10 +31,11 @@ type Client struct {
 }
 
 // New discovers the issuer and builds the client. The issuer must be
-// reachable at startup. requestGroups adds the "groups" scope, which Pocket ID
-// and most issuers need before they release the groups claim; it is asked for
-// only when something uses groups, so an issuer that rejects unknown scopes
-// is unaffected otherwise (SPEC-0003 REQ "Compatibility").
+// reachable at startup. requestGroups adds the "groups" scope, which Pocket
+// ID and most issuers need before they release the groups claim. Since
+// SPEC-0004 provider rows are mutable at runtime, burrow requests the scope
+// always — main.go passes false only when BURROW_OIDC_GROUPS_SCOPE=false
+// marks an issuer that rejects unknown scopes.
 func New(ctx context.Context, issuerURL, clientID, clientSecret, redirectURL string, requestGroups bool) (*Client, error) {
 	provider, err := oidc.NewProvider(ctx, issuerURL)
 	if err != nil {

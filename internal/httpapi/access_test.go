@@ -4,64 +4,63 @@ import (
 	"context"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 
 	"gitea.stump.rocks/stump.wtf/burrow/internal/httpapi"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/oidc"
-	"gitea.stump.rocks/stump.wtf/burrow/internal/providers"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/skills"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/store"
 )
 
-// Governing: SPEC-0003 (org-access-control) — each member sees only the rows
-// and models their OIDC groups allow, and /connect hands out only those keys.
+// Governing: SPEC-0003 (org-access-control), carried onto store rows by
+// SPEC-0004 — each member sees only the rows their OIDC groups allow, and
+// /connect hands out only those keys. A row's menu is what the gateway
+// answers for that row's own key (ADR-0004), so this fixture declares models
+// per key rather than per row.
 
-// accessProviders is the deployment the spec was written for: one row per
-// audience, each with its own key (the enforceable pattern), plus a row with
-// one model narrowed below its provider for the model-level rule.
-const accessProviders = `{
-  "providers": [
-    {"id": "lpr_local", "providerId": "litellm", "name": "Local", "baseURL": "https://gw.example/v1",
-     "apiKeyEnv": "KEY_LOCAL", "groups": ["family", "friends"],
-     "models": [{"id": "qwen-27b", "name": "Qwen 27B"}, {"id": "qwen-flash", "name": "Qwen Flash"}]},
-    {"id": "lpr_family", "providerId": "litellm", "name": "Family", "baseURL": "https://gw.example/v1",
-     "apiKeyEnv": "KEY_FAMILY", "groups": ["family"],
-     "models": [{"id": "gpt-oss", "name": "gpt-oss"}, {"id": "glm", "name": "GLM"}]},
-    {"id": "lpr_owner", "providerId": "litellm", "name": "Owner", "baseURL": "https://gw.example/v1",
-     "apiKeyEnv": "KEY_OWNER", "groups": ["owner"],
-     "models": [{"id": "gpt-5", "name": "GPT-5"}]},
-    {"id": "lpr_mixed", "providerId": "litellm", "name": "Mixed", "baseURL": "https://gw.example/v1",
-     "apiKeyEnv": "KEY_MIXED",
-     "models": [{"id": "open", "name": "Open"}, {"id": "narrow", "name": "Narrow", "groups": ["owner"]}]}
-  ]
-}`
+// accessKeys is the deployment the spec was written for: one row per
+// audience, each with its own key (the enforceable pattern). lpr_mixed names
+// no groups, so it is open to every member — under ADR-0004 a derived
+// model's audience is its row's audience, so there is no narrowed model
+// inside an open row any more.
+func accessKeys() map[string][]string {
+	return map[string][]string{
+		"sk-key_local":  {"qwen-27b", "qwen-flash"},
+		"sk-key_family": {"gpt-oss", "glm"},
+		"sk-key_owner":  {"gpt-5"},
+		"sk-key_mixed":  {"open", "narrow"},
+	}
+}
 
 func newAccessTestEnv(t *testing.T) *testEnv {
 	t.Helper()
+
+	gw := newFakeLLMGateway(t, accessKeys())
+	for env, key := range map[string]string{
+		"KEY_LOCAL":  "sk-key_local",
+		"KEY_FAMILY": "sk-key_family",
+		"KEY_OWNER":  "sk-key_owner",
+		"KEY_MIXED":  "sk-key_mixed",
+	} {
+		t.Setenv(env, key)
+	}
+
 	e := newTestEnv(t)
-	path := filepath.Join(t.TempDir(), "providers.json")
-	if err := os.WriteFile(path, []byte(accessProviders), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	list, err := providers.Load(path)
-	if err != nil {
-		t.Fatalf("load providers fixture: %v", err)
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, env := range []string{"KEY_LOCAL", "KEY_FAMILY", "KEY_OWNER", "KEY_MIXED"} {
-		t.Setenv(env, "sk-"+strings.ToLower(env))
-	}
-	runtime := providers.NewRuntime(list, info.ModTime())
-	e.srv.Config.Handler = httpapi.New(e.cfg, e.st,
-		skills.NewCatalog(skills.Source{Dir: e.cfg.SkillsDir}), runtime, nil).Routes()
-	return e
+	seedProviders(t, e,
+		store.ProviderRow{ID: "lpr_local", ProviderID: "litellm", Name: "Local",
+			BaseURL: gw.baseURL(), APIKeyEnv: "KEY_LOCAL",
+			Groups: []string{"family", "friends"}},
+		store.ProviderRow{ID: "lpr_family", ProviderID: "litellm", Name: "Family",
+			BaseURL: gw.baseURL(), APIKeyEnv: "KEY_FAMILY",
+			Groups: []string{"family"}},
+		store.ProviderRow{ID: "lpr_owner", ProviderID: "litellm", Name: "Owner",
+			BaseURL: gw.baseURL(), APIKeyEnv: "KEY_OWNER",
+			Groups: []string{"owner"}},
+		store.ProviderRow{ID: "lpr_mixed", ProviderID: "litellm", Name: "Mixed",
+			BaseURL: gw.baseURL(), APIKeyEnv: "KEY_MIXED"})
+	return withProviderRuntime(e)
 }
 
 // signInAs records alice's groups the way the OIDC callback does at sign-in.
@@ -102,12 +101,13 @@ func TestAccessRowsFollowGroups(t *testing.T) {
 		groups []string
 		want   []string
 	}{
-		{"no groups: only open models", nil,
-			[]string{"lpr_mixed:open"}},
-		{"friends: local only", []string{"friends"},
-			[]string{"lpr_local:qwen-27b", "lpr_local:qwen-flash", "lpr_mixed:open"}},
+		{"no groups: only open rows", nil,
+			[]string{"lpr_mixed:narrow", "lpr_mixed:open"}},
+		{"friends: local plus open", []string{"friends"},
+			[]string{"lpr_local:qwen-27b", "lpr_local:qwen-flash", "lpr_mixed:narrow", "lpr_mixed:open"}},
 		{"family: local and family", []string{"family"},
-			[]string{"lpr_family:glm", "lpr_family:gpt-oss", "lpr_local:qwen-27b", "lpr_local:qwen-flash", "lpr_mixed:open"}},
+			[]string{"lpr_family:glm", "lpr_family:gpt-oss", "lpr_local:qwen-27b", "lpr_local:qwen-flash",
+				"lpr_mixed:narrow", "lpr_mixed:open"}},
 		{"owner and family: everything", []string{"family", "owner"},
 			[]string{"lpr_family:glm", "lpr_family:gpt-oss", "lpr_local:qwen-27b", "lpr_local:qwen-flash",
 				"lpr_mixed:narrow", "lpr_mixed:open", "lpr_owner:gpt-5"}},
@@ -192,7 +192,7 @@ func TestAccessGroupsClaimRecordedAtSignIn(t *testing.T) {
 			t.Fatal(err)
 		}
 		if !strings.Contains(" "+loc.Query().Get("scope")+" ", " groups ") {
-			t.Fatalf("sign-in must request the groups scope when groups are used: %q", loc.Query().Get("scope"))
+			t.Fatalf("sign-in must request the groups scope: %q", loc.Query().Get("scope"))
 		}
 		cb, err := noRedirect.Get(e.srv.URL + "/auth/oidc/callback?code=c&state=" + url.QueryEscape(loc.Query().Get("state")))
 		if err != nil {
@@ -220,14 +220,35 @@ func TestAccessGroupsClaimRecordedAtSignIn(t *testing.T) {
 	}
 }
 
-// Compatibility: with no groups declared, the scope is not requested.
-func TestAccessNoGroupsScopeWhenUnused(t *testing.T) {
+// The escape hatch: burrow requests the groups scope by default (ADR-0004 —
+// row audiences and the admin surface are both group-based), but an issuer
+// that rejects unknown scopes is served by turning the request off with
+// BURROW_OIDC_GROUPS_SCOPE=false.
+func TestAccessGroupsScopeIsOnUnlessDisabled(t *testing.T) {
+	t.Run("default: requested", func(t *testing.T) {
+		scope := signStartScope(t, true)
+		if !strings.Contains(" "+scope+" ", " groups ") {
+			t.Fatalf("sign-in must request the groups scope by default: %q", scope)
+		}
+	})
+	t.Run("disabled: not requested", func(t *testing.T) {
+		scope := signStartScope(t, false)
+		if strings.Contains(scope, "groups") {
+			t.Fatalf("the escape hatch must not request groups: %q", scope)
+		}
+	})
+}
+
+// signStartScope returns the scope sign-in asks for with the given
+// BURROW_OIDC_GROUPS_SCOPE value.
+func signStartScope(t *testing.T, requestGroups bool) string {
+	t.Helper()
 	e := newTestEnv(t)
 	issuer := newFakeIssuer(t, "burrow-desktop")
 	client, err := oidc.New(context.Background(), issuer.srv.URL, "burrow-desktop", "secret",
-		e.srv.URL+"/auth/oidc/callback", false)
+		e.srv.URL+"/auth/oidc/callback", requestGroups)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("oidc client against fake issuer: %v", err)
 	}
 	e.srv.Config.Handler = httpapi.New(e.cfg, e.st, skills.NewCatalog(skills.Source{Dir: e.cfg.SkillsDir}), nil, client).Routes()
 	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
@@ -236,8 +257,9 @@ func TestAccessNoGroupsScopeWhenUnused(t *testing.T) {
 		t.Fatal(err)
 	}
 	start.Body.Close()
-	loc, _ := url.Parse(start.Header.Get("Location"))
-	if strings.Contains(loc.Query().Get("scope"), "groups") {
-		t.Fatalf("groups scope must not be requested when nothing uses groups: %q", loc.Query().Get("scope"))
+	loc, err := url.Parse(start.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
 	}
+	return loc.Query().Get("scope")
 }

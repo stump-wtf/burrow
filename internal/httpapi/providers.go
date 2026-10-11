@@ -13,15 +13,20 @@ import (
 
 // handleLLMProviders answers GET /v1/llm-providers (and ?scope=usable —
 // every provider a member can see is usable). Each member gets only the rows
-// and models their groups allow (SPEC-0003 REQ "Visibility"). With no
-// providers file configured this returns an empty list, the Stage A behavior.
+// their groups allow (SPEC-0003 REQ "Visibility", applied to store rows by
+// SPEC-0004); each row's menu is derived from its own gateway key.
 func (s *Server) handleLLMProviders(w http.ResponseWriter, r *http.Request) {
 	groups, err := s.memberGroups(r)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "could not load the member")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"llmProviders": s.providers.RowsFor(groups)})
+	rows, err := s.providers.RowsFor(r.Context(), groups)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "could not load the providers")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"llmProviders": rows})
 }
 
 // handleLLMProviderConnect answers GET /v1/llm-providers/:id/connect:
@@ -35,7 +40,11 @@ func (s *Server) handleLLMProviderConnect(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, "server_error", "could not load the member")
 		return
 	}
-	row, apiKey, ok := s.providers.ConnectFor(r.PathValue("id"), groups)
+	row, apiKey, ok, err := s.providers.ConnectFor(r.Context(), r.PathValue("id"), groups)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "could not load the provider")
+		return
+	}
 	if !ok {
 		writeError(w, http.StatusNotFound, "not_found", "no such llm provider")
 		return

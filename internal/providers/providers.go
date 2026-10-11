@@ -1,35 +1,43 @@
-// Package providers loads the org's LLM provider definitions and serves the
-// rows the OpenWork desktop client syncs (contract, Stage B).
+// Package providers serves the org's LLM provider rows to the OpenWork
+// desktop client (contract, Stage B). Rows live in the Postgres store; each
+// row's model menu is derived from the row's own gateway key via
+// GET {baseURL}/models, cached, and served stale when the gateway is
+// unreachable.
 //
-// Governing: ADR-0001 (org LLM providers pointing at LiteLLM), SPEC
-// stage-b-org-models. Definitions live in a JSON file named by
-// BURROW_PROVIDERS_FILE; API keys are never in that file — each provider
-// names an environment variable (OpenBao-fed in deployment) whose value is
-// read at request time and only ever served on /connect.
+// Governing: ADR-0001 (org LLM providers pointing at LiteLLM), ADR-0004
+// (gateway-derived model menus, store-backed rows), SPEC-0004. API keys are
+// never in the store — each row names an environment variable (OpenBao-fed in
+// deployment) whose value is read at request time and only ever served on
+// /connect or sent to the gateway as that row's bearer token.
 package providers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
+
+	"gitea.stump.rocks/stump.wtf/burrow/internal/store"
 )
 
-// Model is one model served through a provider.
+// Model is one model listed in the seed file. Derived menus carry no model
+// audience: SPEC-0004 supersedes SPEC-0003's model-level groups — a derived
+// model's audience is its row's audience (ADR-0004).
 type Model struct {
 	ID     string         `json:"id"`
 	Name   string         `json:"name"`
 	Config map[string]any `json:"config,omitempty"`
-	// Groups narrows this model's audience below its provider's (SPEC-0003
-	// REQ "Visibility"). It does not narrow the row's key; see the
-	// key-scope warning.
-	Groups []string `json:"groups,omitempty"`
 }
 
-// Provider is one validated provider definition.
+// Provider is one validated provider definition as the seed file carries it.
 type Provider struct {
 	ID         string  `json:"id"`
 	ProviderID string  `json:"providerId"`
@@ -42,9 +50,28 @@ type Provider struct {
 	Groups []string `json:"groups,omitempty"`
 }
 
-// file is the on-disk shape of the providers file.
+// file is the on-disk shape of the seed file. ModelGroups exists only to
+// notice model-level groups so the seed can warn about dropping them
+// (SPEC-0004 REQ "Rows in the store", scenario "First-boot seed").
 type file struct {
-	Providers []Provider `json:"providers"`
+	Providers []fileProvider `json:"providers"`
+}
+
+type fileProvider struct {
+	ID         string      `json:"id"`
+	ProviderID string      `json:"providerId"`
+	Name       string      `json:"name"`
+	BaseURL    string      `json:"baseURL"`
+	APIKeyEnv  string      `json:"apiKeyEnv"`
+	Models     []fileModel `json:"models"`
+	Groups     []string    `json:"groups,omitempty"`
+}
+
+type fileModel struct {
+	ID     string          `json:"id"`
+	Name   string          `json:"name"`
+	Config map[string]any  `json:"config,omitempty"`
+	Groups json.RawMessage `json:"groups,omitempty"`
 }
 
 var (
@@ -52,10 +79,10 @@ var (
 	envNameRE  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
-// Load reads and validates the providers file. Validation is deliberately
-// strict and fails the whole load: the client's sync drops the entire
-// provider list on one bad row (contract, Stage B, "strict rules"), so a bad
-// definition must stop burrow at boot rather than poison every poll.
+// Load reads and validates the seed file. Validation is deliberately strict
+// and fails the whole load: the client's sync drops the entire provider list
+// on one bad row (contract, Stage B, "strict rules"), so a bad definition
+// must stop burrow at boot rather than poison every poll.
 func Load(path string) ([]Provider, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -66,7 +93,15 @@ func Load(path string) ([]Provider, error) {
 		return nil, fmt.Errorf("providers: parse %s: %w", path, err)
 	}
 	seen := map[string]bool{}
-	for i, p := range f.Providers {
+	list := make([]Provider, 0, len(f.Providers))
+	for i, fp := range f.Providers {
+		p := Provider{
+			ID: fp.ID, ProviderID: fp.ProviderID, Name: fp.Name,
+			BaseURL: fp.BaseURL, APIKeyEnv: fp.APIKeyEnv, Groups: fp.Groups,
+		}
+		for _, m := range fp.Models {
+			p.Models = append(p.Models, Model{ID: m.ID, Name: m.Name, Config: m.Config})
+		}
 		if err := validate(p); err != nil {
 			return nil, fmt.Errorf("providers: file %s: provider %d: %w", path, i, err)
 		}
@@ -74,28 +109,37 @@ func Load(path string) ([]Provider, error) {
 			return nil, fmt.Errorf("providers: file %s: duplicate provider id %s", path, p.ID)
 		}
 		seen[p.ID] = true
+		list = append(list, p)
 	}
-	return f.Providers, nil
+	return list, nil
 }
 
+// modelGroupRows returns the ids of file rows whose models declare groups.
+// Those declarations are dropped at seed (ADR-0004); main.go logs the warning.
+func modelGroupRows(path string) ([]string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var f file
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, fp := range f.Providers {
+		for _, m := range fp.Models {
+			if len(m.Groups) > 0 {
+				ids = append(ids, fp.ID)
+				break
+			}
+		}
+	}
+	return ids, nil
+}
+
+// validate checks a file provider against the contract's strict rules.
 func validate(p Provider) error {
-	if !idPrefixRE.MatchString(p.ID) {
-		return fmt.Errorf("id %q must match /^lpr_/i", p.ID)
-	}
-	if strings.TrimSpace(p.ProviderID) == "" {
-		return fmt.Errorf("providerId must not be empty")
-	}
-	if strings.TrimSpace(p.Name) == "" {
-		return fmt.Errorf("name must not be empty")
-	}
-	u, err := url.Parse(p.BaseURL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return fmt.Errorf("baseURL %q must be an absolute http(s) URL", p.BaseURL)
-	}
-	if !envNameRE.MatchString(p.APIKeyEnv) {
-		return fmt.Errorf("apiKeyEnv %q must be an environment variable name", p.APIKeyEnv)
-	}
-	if err := validateGroups(p.Groups); err != nil {
+	if err := validateIdentity(p.ID, p.ProviderID, p.Name, p.BaseURL, p.APIKeyEnv, p.Groups); err != nil {
 		return err
 	}
 	for i, m := range p.Models {
@@ -105,8 +149,44 @@ func validate(p Provider) error {
 		if strings.TrimSpace(m.Name) == "" {
 			return fmt.Errorf("model %q: name must not be empty", m.ID)
 		}
-		if err := validateGroups(m.Groups); err != nil {
-			return fmt.Errorf("model %q: %w", m.ID, err)
+	}
+	return nil
+}
+
+// validateIdentity checks the fields every row — file or store — carries.
+func validateIdentity(id, providerID, name, baseURL, apiKeyEnv string, groups []string) error {
+	if !idPrefixRE.MatchString(id) {
+		return fmt.Errorf("id %q must match /^lpr_/i", id)
+	}
+	if strings.TrimSpace(providerID) == "" {
+		return fmt.Errorf("providerId must not be empty")
+	}
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("name must not be empty")
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("baseURL %q must be an absolute http(s) URL", baseURL)
+	}
+	if !envNameRE.MatchString(apiKeyEnv) {
+		return fmt.Errorf("apiKeyEnv %q must be an environment variable name", apiKeyEnv)
+	}
+	return validateGroups(groups)
+}
+
+// validateStoreRow applies the same validation a file Load performed
+// (SPEC-0004 REQ "Rows in the store"): an invalid write is rejected before
+// it can touch the served set.
+func validateStoreRow(p store.ProviderRow) error {
+	if err := validateIdentity(p.ID, p.ProviderID, p.Name, p.BaseURL, p.APIKeyEnv, p.Groups); err != nil {
+		return err
+	}
+	for id, name := range p.NameOverrides {
+		if strings.TrimSpace(id) == "" {
+			return fmt.Errorf("nameOverrides: key must not be empty")
+		}
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("nameOverrides[%q]: display name must not be empty", id)
 		}
 	}
 	return nil
@@ -155,23 +235,14 @@ const SourceCustom = "custom"
 // for a LiteLLM-style gateway.
 const NpmPackage = "@ai-sdk/openai-compatible"
 
-// Runtime serves the loaded provider set. A nil Runtime serves none.
-type Runtime struct {
-	providers []Provider
-	updatedAt time.Time
-}
-
-// NewRuntime wraps validated providers with their definition file's mtime.
-func NewRuntime(list []Provider, updatedAt time.Time) *Runtime {
-	return &Runtime{providers: list, updatedAt: updatedAt}
-}
-
-// UpdatedAt is when the definition file last changed.
-func (r *Runtime) UpdatedAt() string {
-	if r == nil || r.updatedAt.IsZero() {
-		return time.Unix(0, 0).UTC().Format(time.RFC3339)
+// FormatUpdatedAt is the one timestamp format for a row's updatedAt: the
+// desktop field, the resource snapshot value, and the admin etag (quoted)
+// must agree exactly, or If-Match comparisons drift from what rows carry.
+func FormatUpdatedAt(t time.Time) string {
+	if t.IsZero() {
+		t = time.Unix(0, 0)
 	}
-	return r.updatedAt.UTC().Format(time.RFC3339)
+	return t.UTC().Format(time.RFC3339Nano)
 }
 
 // lookupKey reads the provider's key from the environment; a set-but-empty
@@ -184,10 +255,134 @@ func lookupKey(env string) (string, bool) {
 	return value, ok
 }
 
-// Row builds the client-facing row for one provider, computing hasApiKey
-// from the live environment.
-func (r *Runtime) Row(p Provider) Row {
+// menuEntry is the per-row derived-menu cache (SPEC-0004 REQ "Gateway-derived
+// model menus"). known distinguishes "never fetched" from "fetched empty";
+// nextTryAt is the failure cooldown (~TTL/4) that keeps a downed gateway
+// from being re-queried once per request.
+type menuEntry struct {
+	mu        sync.Mutex
+	known     bool
+	ids       []string
+	fetchedAt time.Time
+	nextTryAt time.Time
+}
+
+// Runtime serves the store's provider rows with gateway-derived menus. A nil
+// Runtime serves none.
+type Runtime struct {
+	st   *store.Store
+	ttl  time.Duration
+	http *http.Client
+
+	mu    sync.Mutex
+	cache map[string]*menuEntry
+}
+
+// NewRuntime builds the store-backed runtime. modelsTTL bounds how long a
+// derived menu is trusted before the gateway is asked again.
+func NewRuntime(st *store.Store, modelsTTL time.Duration) *Runtime {
+	if modelsTTL <= 0 {
+		modelsTTL = time.Minute
+	}
+	return &Runtime{
+		st:    st,
+		ttl:   modelsTTL,
+		http:  &http.Client{Timeout: 10 * time.Second},
+		cache: map[string]*menuEntry{},
+	}
+}
+
+// RowsFor returns the rows a member holding memberGroups may see (SPEC-0003
+// REQ "Visibility", unchanged by SPEC-0004 except that a model's audience is
+// now always its row's audience).
+func (r *Runtime) RowsFor(ctx context.Context, memberGroups []string) ([]Row, error) {
+	if r == nil {
+		return []Row{}, nil
+	}
+	rows, err := r.st.ListProviders(ctx)
+	if err != nil {
+		return nil, err
+	}
+	r.prune(rows)
+	out := make([]Row, 0, len(rows))
+	for _, p := range rows {
+		if !allowed(p.Groups, memberGroups) {
+			continue
+		}
+		out = append(out, r.row(ctx, p))
+	}
+	return out, nil
+}
+
+// SnapshotFor is the resource snapshot for one member: id→updatedAt for the
+// rows they may see (SPEC-0003 REQ "Resource snapshot follows visibility").
+// Deriving each row's menu is what advances updated_at when the gateway's
+// scope changed, so the snapshot must run the same freshness check a listing
+// would — otherwise a model added at the gateway would never be noticed by a
+// client that only polls /v1/resources.
+func (r *Runtime) SnapshotFor(ctx context.Context, memberGroups []string) (map[string]string, error) {
+	if r == nil {
+		return map[string]string{}, nil
+	}
+	rows, err := r.st.ListProviders(ctx)
+	if err != nil {
+		return nil, err
+	}
+	snapshot := map[string]string{}
+	for _, p := range rows {
+		if !allowed(p.Groups, memberGroups) {
+			continue
+		}
+		_, bumpedAt := r.menuIDs(ctx, p) // may advance updated_at (ADR-0004)
+		if !bumpedAt.IsZero() {
+			p.UpdatedAt = bumpedAt
+		}
+		snapshot[p.ID] = FormatUpdatedAt(p.UpdatedAt)
+	}
+	return snapshot, nil
+}
+
+// ConnectFor is /connect for a member: a row the member cannot see answers
+// exactly like an unknown id, so its key is never handed out and its
+// existence is not revealed (SPEC-0003 REQ "Connect follows visibility").
+func (r *Runtime) ConnectFor(ctx context.Context, id string, memberGroups []string) (Row, *string, bool, error) {
+	if r == nil {
+		return Row{}, nil, false, nil
+	}
+	p, err := r.st.GetProvider(ctx, id)
+	if err != nil {
+		if err == store.ErrNotFound {
+			return Row{}, nil, false, nil
+		}
+		return Row{}, nil, false, err
+	}
+	if !allowed(p.Groups, memberGroups) {
+		return Row{}, nil, false, nil
+	}
+	row := r.row(ctx, p)
+	var key *string
+	if value, ok := lookupKey(p.APIKeyEnv); ok {
+		key = &value
+	}
+	return row, key, true, nil
+}
+
+// row builds the client-facing row for one stored provider, deriving its
+// menu and computing hasApiKey from the live environment.
+func (r *Runtime) row(ctx context.Context, p store.ProviderRow) Row {
 	_, hasKey := lookupKey(p.APIKeyEnv)
+	ids, bumpedAt := r.menuIDs(ctx, p)
+	if !bumpedAt.IsZero() {
+		p.UpdatedAt = bumpedAt
+	}
+	models := make([]ModelRow, 0, len(ids))
+	for _, id := range ids {
+		name := id
+		if override, ok := p.NameOverrides[id]; ok && override != "" {
+			name = override
+		}
+		models = append(models, ModelRow{ID: id, Name: name, Config: map[string]any{}})
+	}
 	return Row{
 		ID:         p.ID,
 		ProviderID: p.ProviderID,
@@ -199,30 +394,139 @@ func (r *Runtime) Row(p Provider) Row {
 			"env":     []string{p.APIKeyEnv},
 		},
 		HasAPIKey: hasKey,
-		Models:    modelRows(p.Models),
-		UpdatedAt: r.UpdatedAt(),
+		Models:    models,
+		UpdatedAt: FormatUpdatedAt(p.UpdatedAt),
 	}
 }
 
-func modelRows(models []Model) []ModelRow {
-	rows := make([]ModelRow, 0, len(models))
-	for _, m := range models {
-		config := m.Config
-		if config == nil {
-			config = map[string]any{}
+// entry returns the row's cache entry, creating it on first need.
+func (r *Runtime) entry(id string) *menuEntry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e := r.cache[id]
+	if e == nil {
+		e = &menuEntry{}
+		r.cache[id] = e
+	}
+	return e
+}
+
+// prune drops cache entries for rows that no longer exist, so a deleted row
+// cannot pin its menu in memory.
+func (r *Runtime) prune(rows []store.ProviderRow) {
+	seen := make(map[string]bool, len(rows))
+	for _, p := range rows {
+		seen[p.ID] = true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for id := range r.cache {
+		if !seen[id] {
+			delete(r.cache, id)
 		}
-		rows = append(rows, ModelRow{ID: m.ID, Name: m.Name, Config: config})
 	}
-	return rows
 }
 
-// audience returns the model's effective audience: its own groups, else its
-// provider's, else nil (every member).
-func audience(p Provider, m Model) []string {
-	if m.Groups != nil {
-		return m.Groups
+// menuIDs returns the row's derived model ids, beside the moment its stored
+// updated_at was advanced because the derived set changed (zero when it was
+// not). Fresh menus come straight from cache; expired ones from the gateway;
+// failures serve last-known ids with a cooldown so a downed gateway is
+// retried at most once per TTL/4 (SPEC-0004 REQ "Gateway-derived model
+// menus", scenario "Gateway unreachable"). A row whose key is not
+// provisioned serves no models and never calls out.
+func (r *Runtime) menuIDs(ctx context.Context, p store.ProviderRow) ([]string, time.Time) {
+	e := r.entry(p.ID)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	now := time.Now()
+	if now.Before(e.nextTryAt) {
+		return e.ids, time.Time{} // cooling down after a failure; serve last-known
 	}
-	return p.Groups
+	if e.known && now.Before(e.fetchedAt.Add(r.ttl)) {
+		return e.ids, time.Time{} // fresh cache: no gateway call
+	}
+	key, ok := lookupKey(p.APIKeyEnv)
+	if !ok {
+		return e.ids, time.Time{} // no key: no menu, and nothing to fetch
+	}
+	ids, err := r.fetch(ctx, p.BaseURL, key)
+	if err != nil {
+		e.nextTryAt = now.Add(r.ttl / 4)
+		if !e.nextTryAt.After(now) {
+			e.nextTryAt = now.Add(time.Second)
+		}
+		return e.ids, time.Time{} // serve stale
+	}
+	changed := e.known && !sameIDSet(e.ids, ids)
+	e.ids, e.known, e.fetchedAt, e.nextTryAt = ids, true, now, time.Time{}
+	if !changed {
+		return ids, time.Time{}
+	}
+	// The derived set changed since this process last served it: advance
+	// the stored updated_at so resource snapshots trigger a re-sync
+	// (ADR-0004). The first fetch after boot never bumps — there is no
+	// previously served set to differ from.
+	bumpedAt, err := r.st.BumpProviderUpdatedAt(ctx, p.ID)
+	if err != nil {
+		// The menu is still correct; the snapshot just stays quiet.
+		slog.Warn("advance provider updated_at after menu change", "provider", p.ID, "error", err)
+		return ids, time.Time{}
+	}
+	return ids, bumpedAt
+}
+
+// fetch asks the gateway what the key may use: the OpenAI-compatible
+// GET {baseURL}/models, answered as {"data":[{"id":…}]}.
+func (r *Runtime) fetch(ctx context.Context, baseURL, key string) ([]string, error) {
+	endpoint := strings.TrimRight(baseURL, "/") + "/models"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	resp, err := r.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("providers: gateway %s returned %s", endpoint, resp.Status)
+	}
+	var body struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&body); err != nil {
+		return nil, fmt.Errorf("providers: gateway %s sent unparseable models: %w", endpoint, err)
+	}
+	ids := make([]string, 0, len(body.Data))
+	seen := map[string]bool{}
+	for _, m := range body.Data {
+		if m.ID != "" && !seen[m.ID] {
+			seen[m.ID] = true
+			ids = append(ids, m.ID)
+		}
+	}
+	return ids, nil
+}
+
+func sameIDSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	count := make(map[string]int, len(a))
+	for _, id := range a {
+		count[id]++
+	}
+	for _, id := range b {
+		count[id]--
+		if count[id] < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // allowed reports whether a member holding memberGroups may see something
@@ -241,134 +545,8 @@ func allowed(aud, memberGroups []string) bool {
 	return false
 }
 
-// visible returns p with only the models the member may see, and whether the
-// row is served at all: a row is served when at least one model is visible,
-// or, having no models, when the provider's own audience allows the member.
-func visible(p Provider, memberGroups []string) (Provider, bool) {
-	if len(p.Models) == 0 {
-		return p, allowed(p.Groups, memberGroups)
-	}
-	shown := make([]Model, 0, len(p.Models))
-	for _, m := range p.Models {
-		if allowed(audience(p, m), memberGroups) {
-			shown = append(shown, m)
-		}
-	}
-	if len(shown) == 0 {
-		return Provider{}, false
-	}
-	p.Models = shown
-	return p, true
-}
-
-// UsesGroups reports whether any provider or model declares groups, which is
-// when sign-in must request the groups scope (SPEC-0003 REQ "Compatibility").
-func (r *Runtime) UsesGroups() bool {
-	if r == nil {
-		return false
-	}
-	for _, p := range r.providers {
-		if p.Groups != nil {
-			return true
-		}
-		for _, m := range p.Models {
-			if m.Groups != nil {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// MixedAudienceRows returns the ids of rows whose models do not all share one
-// audience. Such a row's single key reaches every model in it, so the narrower
-// models are hidden from listing but not from the key (SPEC-0003 REQ
-// "Key-scope warning").
-func (r *Runtime) MixedAudienceRows() []string {
-	if r == nil {
-		return nil
-	}
-	var ids []string
-	for _, p := range r.providers {
-		for _, m := range p.Models {
-			if !sameGroups(audience(p, m), audience(p, p.Models[0])) {
-				ids = append(ids, p.ID)
-				break
-			}
-		}
-	}
-	return ids
-}
-
-func sameGroups(a, b []string) bool {
-	if (a == nil) != (b == nil) || len(a) != len(b) {
-		return false
-	}
-	seen := make(map[string]int, len(a))
-	for _, g := range a {
-		seen[g]++
-	}
-	for _, g := range b {
-		seen[g]--
-	}
-	for _, n := range seen {
-		if n != 0 {
-			return false
-		}
-	}
-	return true
-}
-
-// RowsFor returns the rows a member holding memberGroups may see, each listing
-// only its visible models (SPEC-0003 REQ "Visibility").
-func (r *Runtime) RowsFor(memberGroups []string) []Row {
-	if r == nil {
-		return []Row{}
-	}
-	rows := make([]Row, 0, len(r.providers))
-	for _, p := range r.providers {
-		if shown, ok := visible(p, memberGroups); ok {
-			rows = append(rows, r.Row(shown))
-		}
-	}
-	return rows
-}
-
-// SnapshotFor is Snapshot restricted to the rows the member may see
-// (SPEC-0003 REQ "Resource snapshot follows visibility").
-func (r *Runtime) SnapshotFor(memberGroups []string) map[string]string {
-	if r == nil {
-		return map[string]string{}
-	}
-	snapshot := map[string]string{}
-	updatedAt := r.UpdatedAt()
-	for _, p := range r.providers {
-		if _, ok := visible(p, memberGroups); ok {
-			snapshot[p.ID] = updatedAt
-		}
-	}
-	return snapshot
-}
-
-// ConnectFor is Connect for a member: a row the member cannot see answers
-// exactly like an unknown id, so its key is never handed out and its
-// existence is not revealed (SPEC-0003 REQ "Connect follows visibility").
-func (r *Runtime) ConnectFor(id string, memberGroups []string) (Row, *string, bool) {
-	if r == nil {
-		return Row{}, nil, false
-	}
-	for _, p := range r.providers {
-		if p.ID != id {
-			continue
-		}
-		shown, ok := visible(p, memberGroups)
-		if !ok {
-			return Row{}, nil, false
-		}
-		if key, ok := lookupKey(p.APIKeyEnv); ok {
-			return r.Row(shown), &key, true
-		}
-		return r.Row(shown), nil, true
-	}
-	return Row{}, nil, false
+// ValidateStoreRow is the exported write gate for the admin API: the same
+// validation a file Load applied, on one candidate row.
+func ValidateStoreRow(p store.ProviderRow) error {
+	return validateStoreRow(p)
 }

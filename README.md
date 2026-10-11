@@ -16,10 +16,31 @@ single sign-on through the identity provider you already run.
 | Stage | Scope | Status |
 |---|---|---|
 | A | OIDC sign-in, org, Library skills, the MCP endpoint that delivers skills to the agent | shipped |
-| B | Org LLM providers pointing at a LiteLLM gateway | shipped (unconfigured; set `BURROW_PROVIDERS_FILE` to enable) |
-| B+ | Per-member provider and model access by OIDC group (`groups` on a provider row or model; SPEC-0003) | in review |
+| B | Org LLM providers pointing at a LiteLLM gateway | shipped |
+| B+ | Per-member provider access by OIDC group (SPEC-0003; model-level groups retired by SPEC-0004) | shipped |
+| B++ | Provider rows in the store, model menus derived from each row's gateway key, admin API (SPEC-0004, ADR-0004) | in review |
 | C | Shared MCP connections | planned |
 | D | Automations and Dashboard | planned |
+
+## Administering LLM providers
+
+Provider rows live in Postgres and are what the desktop client lists. Each
+row's model menu is **derived**, not stored: burrow asks the row's own gateway
+key with `GET {baseURL}/models` and caches the answer for
+`BURROW_MODELS_TTL` (60s), serving the last-known menu while a gateway is
+unreachable. The menu is therefore the key's scope by construction, and
+cannot drift from it (ADR-0004).
+
+Rows are managed at `/api/den/v1/admin/llm-providers` — burrow's own routes,
+outside the client contract — which a member of a `BURROW_ADMIN_GROUPS` group
+or an `llm-admin` API token may reach. `PUT` requires `If-Match` with the
+row's `etag`, so automation cannot clobber a concurrent change, and every
+write is audited in `llm_provider_audit`.
+
+`BURROW_PROVIDERS_FILE` is a **first-boot seed**: consulted only while the
+table is empty, after which the store is the source of truth and the file is
+ignored. Sign-in requests the OIDC `groups` scope unless
+`BURROW_OIDC_GROUPS_SCOPE=false` (an issuer that rejects unknown scopes).
 
 ## Pointing the OpenWork desktop app at burrow
 

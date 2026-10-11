@@ -14,6 +14,11 @@ org's LiteLLM gateway through the openai-compatible adapter; credentials are
 served only on `/connect` and come from the environment (OpenBao in
 deployment), never from a file in the repo.
 
+SPEC-0004 later moved these rows into the store and derived each row's model
+menu from the row's own gateway key. The row shape described here is what the
+client reads, unchanged; where the models come from is not part of the
+contract.
+
 ## Requirements
 
 ### Requirement: Provider definitions

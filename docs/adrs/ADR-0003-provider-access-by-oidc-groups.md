@@ -2,7 +2,7 @@
 status: proposed
 date: 2026-10-10
 decision-makers: [Joe Stump]
-related: ADR-0001 (org LLM providers), ADR-0002 (Postgres store), SPEC-0003 (org-access-control)
+related: ADR-0001 (org LLM providers), ADR-0002 (Postgres store), ADR-0004 (derived model menus), SPEC-0003 (org-access-control), SPEC-0004 (provider-admin)
 ---
 
 # ADR-0003: Provider and model access is declared in the providers file, by OIDC group
