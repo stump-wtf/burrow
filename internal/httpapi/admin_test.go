@@ -238,6 +238,11 @@ func TestAdminWriteValidation(t *testing.T) {
 		{"id without the lpr_ prefix", providerBody("admin", "X", "https://gw.example/v1", "K"), "invalid_row"},
 		{"relative baseURL", providerBody("lpr_x", "X", "gw.example:4000", "K"), "invalid_row"},
 		{"apiKeyEnv is not an env name", providerBody("lpr_x", "X", "https://gw.example/v1", "not an env"), "invalid_row"},
+		// burrow's own configuration, secrets included, must never be
+		// nameable as a key: /connect would hand it to members and the menu
+		// fetch would send it to whatever baseURL the writer chose.
+		{"apiKeyEnv names burrow's database URL", providerBody("lpr_x", "X", "https://gw.example/v1", "BURROW_DATABASE_URL"), "invalid_row"},
+		{"apiKeyEnv names burrow's OIDC secret", providerBody("lpr_x", "X", "https://gw.example/v1", "BURROW_OIDC_CLIENT_SECRET"), "invalid_row"},
 		{"empty groups list", func() map[string]any {
 			m := providerBody("lpr_x", "X", "https://gw.example/v1", "K")
 			m["groups"] = []string{}

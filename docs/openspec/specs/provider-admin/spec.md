@@ -21,7 +21,7 @@ menu's source moves.
 
 The store SHALL carry an `llm_providers` table: `id` (matching `/^lpr_/i`,
 unique), `providerId`, `name`, `baseURL` (absolute http(s)), `apiKeyEnv` (an
-environment-variable name), `groups` (NULL for every member; otherwise a
+environment-variable name, never one in burrow's own `BURROW_` namespace), `groups` (NULL for every member; otherwise a
 non-empty JSON array of non-empty strings — an empty array is invalid, per
 SPEC-0003), `nameOverrides` (JSON object, model id to display name),
 `created_at`, `updated_at`. Writes SHALL apply the same validation

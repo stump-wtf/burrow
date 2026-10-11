@@ -79,6 +79,10 @@ var (
 	envNameRE  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
+// reservedEnvPrefix is burrow's configuration namespace (internal/config),
+// which apiKeyEnv may never name.
+const reservedEnvPrefix = "BURROW_"
+
 // Load reads and validates the seed file. Validation is deliberately strict
 // and fails the whole load: the client's sync drops the entire provider list
 // on one bad row (contract, Stage B, "strict rules"), so a bad definition
@@ -170,6 +174,13 @@ func validateIdentity(id, providerID, name, baseURL, apiKeyEnv string, groups []
 	}
 	if !envNameRE.MatchString(apiKeyEnv) {
 		return fmt.Errorf("apiKeyEnv %q must be an environment variable name", apiKeyEnv)
+	}
+	// A row's key is handed to members on /connect and sent to the row's
+	// baseURL as a bearer, and rows are now writable at runtime: naming one
+	// of burrow's own variables (the database URL, the OIDC client secret)
+	// would turn an admin write into reading burrow's credentials.
+	if strings.HasPrefix(strings.ToUpper(apiKeyEnv), reservedEnvPrefix) {
+		return fmt.Errorf("apiKeyEnv %q is in burrow's own %s namespace; name the provider key's own variable", apiKeyEnv, reservedEnvPrefix)
 	}
 	return validateGroups(groups)
 }
