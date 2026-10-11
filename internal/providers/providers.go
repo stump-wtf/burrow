@@ -266,6 +266,15 @@ func lookupKey(env string) (string, bool) {
 	return value, ok
 }
 
+// KeyProvisioned is the console's key-presence light (SPEC-0004 REQ "Admin
+// console surface"): whether the row's key is present in the environment.
+// The value never leaves this function; the light is the only projection of
+// the key a page may carry.
+func KeyProvisioned(env string) bool {
+	_, ok := lookupKey(env)
+	return ok
+}
+
 // menuEntry is the per-row derived-menu cache (SPEC-0004 REQ "Gateway-derived
 // model menus"). known distinguishes "never fetched" from "fetched empty";
 // nextTryAt is the failure cooldown (~TTL/4) that keeps a downed gateway
@@ -421,6 +430,26 @@ func (r *Runtime) entry(id string) *menuEntry {
 		r.cache[id] = e
 	}
 	return e
+}
+
+// CachedMenuCount reports the row's derived menu size from the cache alone:
+// the count and true when a menu is known, 0 and false when none is cached
+// yet (the console renders "deriving…" in that case, SPEC-0004 REQ "Admin
+// console surface"). It never calls the gateway and never advances the row's
+// updated_at — a console page stays as cheap as the spec's rule that a
+// listing is never blocked on a live gateway call. A row repointed at another
+// gateway or key has no menu of record: the old ids are another key's scope.
+func (r *Runtime) CachedMenuCount(p store.ProviderRow) (int, bool) {
+	if r == nil {
+		return 0, false
+	}
+	e := r.entry(p.ID)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.known || p.BaseURL+"\x00"+p.APIKeyEnv != e.source {
+		return 0, false
+	}
+	return len(e.ids), true
 }
 
 // prune drops cache entries for rows that no longer exist, so a deleted row

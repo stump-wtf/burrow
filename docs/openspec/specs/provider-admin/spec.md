@@ -91,6 +91,31 @@ days), and every use SHALL update `last_used_at`.
 - **THEN** the row is replaced and the audit records the token's name as the
   actor
 
+### Requirement: Admin console surface
+
+The `/admin` shell SHALL be server-rendered pages in burrow's own web app
+(embedding the shared design-language tokens, `docs/design-language.md`),
+gated by the same decision as the admin routes: a session whose recorded
+OIDC groups include any of `BURROW_ADMIN_GROUPS` (or an `llm-admin` API
+token, as the write API admits) may see it. With no groups configured the
+surface is closed and SHALL answer a plain "not enabled" page, not a 404;
+a signed-in non-admin SHALL get a plain refusal page. The index SHALL list
+the store's provider rows read-only — display name, id, `baseURL`, the
+key-presence light (`hasApiKey`), the row's `groups` (org-wide when null),
+and the derived menu's model count ("deriving…" while no menu is cached —
+the console is never blocked on a live gateway call) — with no edit
+controls: all mutations SHALL go through the admin API. Key values SHALL
+never be rendered: the light is the only projection of a key a page may
+carry.
+
+#### Scenario: Admin opens the console
+
+- **GIVEN** `BURROW_ADMIN_GROUPS` is configured and a member in one of the
+  groups holds a session
+- **WHEN** they open `/admin`
+- **THEN** they see the provider list with each key shown as a light only,
+  and editing a row requires the admin API
+
 ### Requirement: Audit
 
 Every create, update, and delete SHALL append a row to `llm_provider_audit`
@@ -112,7 +137,8 @@ boot; ADR-0004).
 
 ## Out of scope
 
-The console UI (stump.wtf/burrow#23) — this spec's API is its backend.
+The remaining console UI (stump.wtf/burrow#23): the editor and the read-side
+pages build on this spec's `/admin` shell (shard 1 of the issue split).
 Skills and MCP administration (#12, #4). Skill of the gateway's own admin API
 — burrow never calls it. Ansible-side retirement of the providers-file render
 (tracked in stump.wtf/burrow#22; the seed makes the transition safe in either

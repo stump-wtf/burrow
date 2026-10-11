@@ -47,6 +47,10 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/runtime-config", s.handleRuntimeConfig)
 	mux.HandleFunc("POST /mcp/agent", s.handleMCPAgent)
 
+	// The /admin console (SPEC-0004 REQ "Admin console surface"):
+	// server-rendered, gated by the admin API's own decision, read-only.
+	mux.HandleFunc("GET /admin", s.handleAdminConsole)
+
 	api := http.NewServeMux()
 	api.HandleFunc("POST /v1/auth/desktop-handoff", s.requireSession(s.handleMintHandoff))
 	api.HandleFunc("POST /v1/auth/desktop-handoff/exchange", s.handleExchange)

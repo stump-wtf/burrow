@@ -70,6 +70,12 @@ Chosen: **option 2**.
   WHICH key a member receives remains burrow's (the groups gate on
   `/connect`). The two halves still cannot drift because one row is one key
   and the menu is that key's scope.
+- The `/admin` console (shard 1 of stump.wtf/burrow#23) is a server-rendered
+  shell in burrow's own web app, gated by the admin API's own decision (a
+  session in an admin group, closed by default; a plain "not enabled" page
+  rather than a 404 while closed). It lists the store's rows read-only;
+  every mutation goes through the admin API, and no key value is ever
+  rendered — a page may show the key's presence light and nothing more.
 
 ### Consequences
 

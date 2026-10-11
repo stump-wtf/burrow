@@ -41,6 +41,9 @@ mode. Focus: 2px solid `--ink`, offset 2px, via `:focus-visible` only.
   `user-select: all` so a click selects the whole value.
 - **Alt link** — 13px muted, breaks long URLs, darkens on hover.
 - **Wordmark** — "burrow", 14px/600, muted, sits outside the card.
+- **Row (console)** — the `/admin` list row: hairline-bottomed table rows on
+  the gray ramp; the key-presence light (`●` in `--ink`, `○` in `--faint`)
+  is the only state mark a row carries.
 
 ## Rules
 

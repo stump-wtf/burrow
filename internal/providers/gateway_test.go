@@ -414,3 +414,60 @@ func TestMenuFollowsARepointedRow(t *testing.T) {
 		t.Fatalf("a repointed row must serve its new gateway's menu at once, got %s", got)
 	}
 }
+
+// The console reads the derived menu's count from the cache alone (SPEC-0004
+// REQ "Admin console surface"): no menu yet is "deriving…", the read never
+// reaches the gateway, and a repointed row has no menu of record.
+func TestCachedMenuCountServesTheConsole(t *testing.T) {
+	st := storetest.Open(t)
+	gw := newFakeGateway(t)
+	gw.add("gpt-5", "claude-opus-5")
+	row := gatewayRow(gw.URL())
+	seedRow(t, st, row)
+	runtime := providers.NewRuntime(st, time.Minute)
+
+	// No menu cached yet: the console renders "deriving…", and answering
+	// it must not have cost a gateway call.
+	if n, ok := runtime.CachedMenuCount(row); ok || n != 0 {
+		t.Fatalf("no menu cached yet must report unknown, got %d,%v", n, ok)
+	}
+	if n := gw.count(); n != 0 {
+		t.Fatalf("the console read must not reach the gateway, got %d calls", n)
+	}
+
+	// A desktop poll derives the menu; the console then reads the count.
+	t.Setenv("GW_KEY", "sk-gateway-secret")
+	if _, err := runtime.RowsFor(context.Background(), nil); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if n, ok := runtime.CachedMenuCount(row); !ok || n != 2 {
+		t.Fatalf("cached count must be 2, got %d,%v", n, ok)
+	}
+	if n := gw.count(); n != 1 {
+		t.Fatalf("the count read must stay a cache hit, got %d calls", n)
+	}
+
+	// A row repointed at another gateway has no menu of record: the old ids
+	// are another key's scope.
+	repointed := row
+	repointed.BaseURL = row.BaseURL + "-elsewhere"
+	if n, ok := runtime.CachedMenuCount(repointed); ok || n != 0 {
+		t.Fatalf("a repointed row has no menu of record, got %d,%v", n, ok)
+	}
+}
+
+// KeyProvisioned is the console's light: presence, never the value; a
+// set-but-empty variable counts as not provisioned.
+func TestKeyProvisionedIsPresenceOnly(t *testing.T) {
+	if providers.KeyProvisioned("CONSOLE_TEST_UNSET") {
+		t.Fatal("an unset variable is not provisioned")
+	}
+	t.Setenv("CONSOLE_TEST_SET", "a-value-no-page-sees")
+	if !providers.KeyProvisioned("CONSOLE_TEST_SET") {
+		t.Fatal("a set variable is provisioned")
+	}
+	t.Setenv("CONSOLE_TEST_EMPTY", "")
+	if providers.KeyProvisioned("CONSOLE_TEST_EMPTY") {
+		t.Fatal("a set-but-empty variable is not provisioned")
+	}
+}
