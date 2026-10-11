@@ -59,6 +59,7 @@ func TestLoadRejectsStrictRuleViolations(t *testing.T) {
 		"empty name":             `{"providers":[{"id":"lpr_x","providerId":"x","name":"","baseURL":"https://x.example/v1","apiKeyEnv":"K"}]}`,
 		"relative baseURL":       `{"providers":[{"id":"lpr_x","providerId":"x","name":"X","baseURL":"litellm.internal:4000","apiKeyEnv":"K"}]}`,
 		"invalid apiKeyEnv":      `{"providers":[{"id":"lpr_x","providerId":"x","name":"X","baseURL":"https://x.example/v1","apiKeyEnv":"not an env"}]}`,
+		"burrow's own env var":   `{"providers":[{"id":"lpr_x","providerId":"x","name":"X","baseURL":"https://x.example/v1","apiKeyEnv":"BURROW_OIDC_CLIENT_SECRET"}]}`,
 		"model without name":     `{"providers":[{"id":"lpr_x","providerId":"x","name":"X","baseURL":"https://x.example/v1","apiKeyEnv":"K","models":[{"id":"m"}]}]}`,
 		"model without id":       `{"providers":[{"id":"lpr_x","providerId":"x","name":"X","baseURL":"https://x.example/v1","apiKeyEnv":"K","models":[{"name":"M"}]}]}`,
 		"duplicate ids":          `{"providers":[{"id":"lpr_x","providerId":"x","name":"X","baseURL":"https://x.example/v1","apiKeyEnv":"K"},{"id":"lpr_x","providerId":"x","name":"Y","baseURL":"https://y.example/v1","apiKeyEnv":"K"}]}`,
