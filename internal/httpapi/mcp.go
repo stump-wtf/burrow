@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -94,7 +95,8 @@ func (s *Server) handleMCPAgent(w http.ResponseWriter, r *http.Request) {
 		s.writeMCPError(w, http.StatusUnauthorized, nil, -32001, "missing_mcp_token", map[string]string{"code": "missing_mcp_token"})
 		return
 	}
-	if _, _, err := s.store.LookupMCPToken(r.Context(), token); err != nil {
+	mcpUser, _, err := s.store.LookupMCPToken(r.Context(), token)
+	if err != nil {
 		code := "invalid_mcp_token"
 		if errors.Is(err, store.ErrExpired) {
 			code = "expired_mcp_token"
@@ -103,6 +105,9 @@ func (s *Server) handleMCPAgent(w http.ResponseWriter, r *http.Request) {
 		s.writeMCPError(w, http.StatusUnauthorized, nil, -32001, code, map[string]string{"code": code})
 		return
 	}
+	// The token's member goes onto the request context, so the Library filter
+	// in library.go serves the agent exactly what that member sees signed in.
+	r = r.WithContext(context.WithValue(r.Context(), userIDKey, mcpUser))
 
 	var msg jsonrpcMessage
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&msg); err != nil {
@@ -253,11 +258,12 @@ func (s *Server) callTool(r *http.Request, name string, args json.RawMessage) (a
 			Query string `json:"query"`
 		}
 		_ = json.Unmarshal(args, &params)
-		matches, err := s.skills.Search(r.Context(), params.Query)
+		visible, err := s.library(r)
 		if err != nil {
 			slog.Error("mcp: Library search failed", "error", err)
 			return nil, &jsonrpcError{Code: -32003, Message: "could not load the Library"}
 		}
+		matches := skills.Search(visible, params.Query)
 		entries := make([]map[string]any, 0, len(matches))
 		for _, skill := range matches {
 			entries = append(entries, map[string]any{
@@ -299,7 +305,7 @@ func (s *Server) callTool(r *http.Request, name string, args json.RawMessage) (a
 		if err := json.Unmarshal(args, &params); err != nil || params.Name == "" {
 			return nil, &jsonrpcError{Code: -32602, Message: "get_skill requires a name"}
 		}
-		skill, ok, err := s.skills.Find(r.Context(), params.Name)
+		skill, ok, err := s.skillByName(r, params.Name)
 		if err != nil {
 			slog.Error("mcp: skill read failed", "skill", params.Name, "error", err)
 			return nil, &jsonrpcError{Code: -32003, Message: "could not load the Library"}
@@ -329,7 +335,7 @@ func textResult(entries []map[string]any, count int) (any, *jsonrpcError) {
 // skillByCapability resolves a capability string from the discovery index:
 // skill:<name> or plugin:<pluginId>:<configObjectId>.
 func (s *Server) skillByCapability(r *http.Request, capability string) (skills.Skill, bool, error) {
-	list, err := s.skills.All(r.Context())
+	list, err := s.library(r)
 	if err != nil {
 		return skills.Skill{}, false, err
 	}
@@ -363,7 +369,7 @@ func cutPrefix(s, prefix string) (string, bool) {
 // agentskills.io discovery schema the client enforces (name kebab-case ≤64,
 // type skill-md, description ≤1024, url skill://, capability skill:/plugin:).
 func (s *Server) skillIndex(r *http.Request) ([]byte, error) {
-	list, err := s.skills.All(r.Context())
+	list, err := s.library(r)
 	if err != nil {
 		return nil, err
 	}

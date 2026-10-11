@@ -154,6 +154,7 @@ type consolePage struct {
 	IsNew        bool
 	Etag         string
 	Audit        []auditLine
+	Matrix       *skillMatrix
 }
 
 const consoleCSS = `
@@ -194,6 +195,10 @@ details pre{margin:6px 0;padding:10px 12px;background:var(--surface);border:1px 
   border-radius:var(--radius-control);font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;
   overflow-x:auto;white-space:pre-wrap;word-break:break-all}
 .keys-light{font-size:12.5px}
+td.c,th.c{text-align:center}
+input[type=checkbox]{width:16px;height:16px;accent-color:var(--ink);vertical-align:-3px}
+th label.pack{display:inline;margin:0;font:600 12px system-ui,sans-serif;color:var(--muted);
+  text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
 a.plain{color:var(--ink);text-decoration:none}
 a.plain:hover{text-decoration:underline}
 `
@@ -206,7 +211,7 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 <main class="shell" style="width:100%">
 <header class="console-head">
 <div class="wordmark">burrow · admin</div>
-<nav><a href="/admin">Providers</a> &middot; <a href="/admin/audit">Audit</a></nav>
+<nav><a href="/admin">Providers</a> &middot; <a href="/admin/skills">Skill packs</a> &middot; <a href="/admin/audit">Audit</a></nav>
 </header>
 {{if .Flash}}<p class="flash">{{.Flash}}</p>{{end}}
 {{range .Errors}}<p class="error">{{.}}</p>{{end}}
@@ -312,6 +317,29 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 </tr>
 {{end}}
 </tbody></table>
+{{end}}
+
+{{if .Matrix}}
+<h1 style="font-size:19px;font-weight:600;margin:0 0 16px">Skill packs</h1>
+{{if .Matrix.NoRules}}<p class="note">Nothing configured yet, so every member sees the whole catalog. Switch a group on and check the skills its members may see; nobody else changes.</p>{{else}}<p class="note">A group sees the skills checked in its column. A column switched off carries no rule, so its members keep the whole catalog; switched on with nothing checked, they see no skills.</p>{{end}}
+{{if .Matrix.UntaggedGroups}}<p class="note">A rule names {{range .Matrix.UntaggedGroups}}<span class="badge">{{.}}</span> {{end}}but no member has signed in with that group yet — check the spelling in the identity provider.</p>{{end}}
+<form method="post" action="/admin/skills">
+<input type="hidden" name="groupCount" value="{{len .Matrix.Groups}}">
+{{range $column, $group := .Matrix.Groups}}<input type="hidden" name="group.{{$column}}" value="{{$group}}">
+{{end}}{{range $row, $skill := .Matrix.Rows}}<input type="hidden" name="skill.{{$row}}" value="{{$skill.Name}}">
+{{end}}<table class="matrix">
+<thead><tr><th>Skill</th>{{range $column, $group := .Matrix.Groups}}<th class="c"><label class="pack"><input type="checkbox" name="declare.{{$column}}" value="1"{{if index $.Matrix.Declared $column}} checked{{end}}> {{$group}}</label></th>{{end}}</tr></thead>
+<tbody>
+{{range $row, $skill := .Matrix.Rows}}
+<tr>
+<td><strong>{{$skill.Title}}</strong><div class="sub">{{$skill.Name}}</div></td>
+{{range $column, $checked := $skill.Cells}}<td class="c"><input type="checkbox" name="cell.{{$column}}.{{$row}}" value="1"{{if $checked}} checked{{end}} aria-label="{{$skill.Name}} for {{index $.Matrix.Groups $column}}"></td>{{end}}
+</tr>
+{{end}}
+</tbody></table>
+<div class="actions"><button class="button inline" type="submit">Save</button></div>
+</form>
+{{if not .Matrix.Groups}}<p class="note">No group has reached burrow yet. A group's column appears after one of its members signs in, or once a rule names it.</p>{{end}}
 {{end}}
 </main>
 </body></html>`))
