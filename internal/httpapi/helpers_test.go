@@ -48,13 +48,18 @@ func newTestEnv(t *testing.T) *testEnv {
 	writeSkillFixture(t, skillsDir, "deploy-helper", "Deploy Helper", "Help deploy services.")
 
 	cfg := &config.Config{
-		BaseURL:      "", // derive from request
-		OrgName:      "Stump Labs",
-		OrgSlug:      "stump-labs",
-		SkillsDir:    skillsDir,
-		GrantTTL:     5 * time.Minute,
-		SessionTTL:   24 * time.Hour,
-		MCPTokenTTL:  time.Hour,
+		BaseURL:     "", // derive from request
+		OrgName:     "Stump Labs",
+		OrgSlug:     "stump-labs",
+		SkillsDir:   skillsDir,
+		GrantTTL:    5 * time.Minute,
+		SessionTTL:  24 * time.Hour,
+		MCPTokenTTL: time.Hour,
+		// Deployment takes these from config.FromEnv. A zero APITokenTTL
+		// would mint an already-expired token, and a zero ModelsTTL would
+		// ask the gateway on every request.
+		ModelsTTL:    time.Minute,
+		APITokenTTL:  90 * 24 * time.Hour,
 		OIDCStateTTL: 10 * time.Minute,
 	}
 
