@@ -375,3 +375,42 @@ func TestRejectedKeyServesNoModelsButConnects(t *testing.T) {
 		t.Fatalf("connect must not be blocked by the gateway: %v %v", key, ok)
 	}
 }
+
+// Repointing a row at another gateway or key must not keep serving the old
+// key's menu for the rest of the TTL: the cache belongs to the row's source,
+// not just its id.
+func TestMenuFollowsARepointedRow(t *testing.T) {
+	st := storetest.Open(t)
+	oldGW := newFakeGateway(t)
+	oldGW.add("gpt-5")
+	newGW := newFakeGateway(t)
+	newGW.add("qwen-27b")
+	t.Setenv("GW_KEY", "sk-gateway-secret")
+	row := gatewayRow(oldGW.URL())
+	seedRow(t, st, row)
+	runtime := providers.NewRuntime(st, time.Hour)
+
+	rows, err := runtime.RowsFor(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := menuIDs(rows[0].Models); got != "gpt-5" {
+		t.Fatalf("old gateway menu: %s", got)
+	}
+
+	read, err := st.GetProvider(context.Background(), row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row.BaseURL = newGW.URL() + "/v1"
+	if _, err := st.UpdateProvider(context.Background(), row, read.UpdatedAt, "test"); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = runtime.RowsFor(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := menuIDs(rows[0].Models); got != "qwen-27b" {
+		t.Fatalf("a repointed row must serve its new gateway's menu at once, got %s", got)
+	}
+}

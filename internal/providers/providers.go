@@ -272,6 +272,7 @@ func lookupKey(env string) (string, bool) {
 // from being re-queried once per request.
 type menuEntry struct {
 	mu        sync.Mutex
+	source    string // baseURL and apiKeyEnv the cached ids came from
 	known     bool
 	ids       []string
 	fetchedAt time.Time
@@ -449,6 +450,13 @@ func (r *Runtime) menuIDs(ctx context.Context, p store.ProviderRow) ([]string, t
 	e := r.entry(p.ID)
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	// A row repointed at another gateway or key starts over: the old ids
+	// are another key's scope. The admin write already advanced updated_at,
+	// so the first fetch from the new source need not bump it again.
+	if source := p.BaseURL + "\x00" + p.APIKeyEnv; e.source != source {
+		e.source, e.known, e.ids, e.fetchedAt, e.nextTryAt = source, false, nil, time.Time{}, time.Time{}
+	}
 
 	now := time.Now()
 	if now.Before(e.nextTryAt) {
