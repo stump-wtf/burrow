@@ -34,24 +34,26 @@ func main() {
 	}
 	defer st.Close()
 
-	var llmRuntime *providers.Runtime
+	// Provider rows live in the store (SPEC-0004); the model menus are
+	// derived from each row's own gateway key at request time (ADR-0004).
+	llmRuntime := providers.NewRuntime(st, cfg.ModelsTTL)
 	if cfg.ProvidersFile != "" {
-		providerList, err := providers.Load(cfg.ProvidersFile)
+		seeded, warnings, skipped, err := providers.SeedIfEmpty(context.Background(), st, cfg.ProvidersFile)
 		if err != nil {
-			slog.Error("load llm providers", "error", err)
+			slog.Error("seed llm providers", "error", err)
 			os.Exit(1)
 		}
-		info, err := os.Stat(cfg.ProvidersFile)
-		if err != nil {
-			slog.Error("stat llm providers file", "error", err)
-			os.Exit(1)
-		}
-		llmRuntime = providers.NewRuntime(providerList, info.ModTime())
-		slog.Info("llm providers loaded", "count", len(providerList), "groups", llmRuntime.UsesGroups())
-		// SPEC-0003 REQ "Key-scope warning": a row's single key reaches every
-		// model in it, so model-level groups hide models from listing only.
-		for _, id := range llmRuntime.MixedAudienceRows() {
-			slog.Warn("llm provider row mixes audiences; its key still reaches the models it hides from some members — split the row per audience to enforce at the gateway", "provider", id)
+		switch {
+		case skipped:
+			// The store is the source of truth; the file is history.
+			slog.Info("llm providers file ignored: store already has rows", "file", cfg.ProvidersFile)
+		default:
+			// First boot: the file seeds the table once, then the store is
+			// the source of truth and the file is never consulted again.
+			slog.Info("llm providers seeded from file", "count", seeded, "file", cfg.ProvidersFile)
+			for _, id := range warnings {
+				slog.Warn("dropped model-level groups while seeding; a derived model's audience is its row's — move the audience to the row", "provider", id)
+			}
 		}
 	}
 
@@ -70,7 +72,10 @@ func main() {
 		slog.Error("configuration: set BURROW_BASE_URL or BURROW_OIDC_REDIRECT_URL so the OIDC redirect is absolute")
 		os.Exit(1)
 	}
-	client, err := oidc.New(context.Background(), cfg.OIDCIssuerURL, cfg.OIDCClientID, cfg.OIDCClientSecret, redirectURL, llmRuntime.UsesGroups())
+	// Rows are mutable at runtime, so the need for the groups claim cannot
+	// be decided at boot: request the scope unless the issuer rejects
+	// unknown scopes (BURROW_OIDC_GROUPS_SCOPE=false, SPEC-0004).
+	client, err := oidc.New(context.Background(), cfg.OIDCIssuerURL, cfg.OIDCClientID, cfg.OIDCClientSecret, redirectURL, cfg.OIDCGroupsScope)
 	if err != nil {
 		slog.Error("connect to OIDC issuer", "error", err)
 		os.Exit(1)
