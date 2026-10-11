@@ -65,6 +65,20 @@ func (s *Server) Routes() http.Handler {
 	api.HandleFunc("GET /v1/config-objects/{id}/versions/latest", s.requireSession(s.handleConfigObjectLatest))
 	api.HandleFunc("GET /v1/llm-providers", s.requireSession(s.handleLLMProviders))
 	api.HandleFunc("GET /v1/llm-providers/{id}/connect", s.requireSession(s.handleLLMProviderConnect))
+
+	// Admin surface (SPEC-0004): burrow-designed routes, outside the client
+	// contract. requireAdmin accepts an llm-admin API token or a session in
+	// an BURROW_ADMIN_GROUPS group; with neither configured it is closed.
+	api.HandleFunc("GET /v1/admin/llm-providers", s.requireAdmin(s.handleAdminListProviders))
+	api.HandleFunc("POST /v1/admin/llm-providers", s.requireAdmin(s.handleAdminCreateProvider))
+	api.HandleFunc("GET /v1/admin/llm-providers/{id}", s.requireAdmin(s.handleAdminGetProvider))
+	api.HandleFunc("PUT /v1/admin/llm-providers/{id}", s.requireAdmin(s.handleAdminUpdateProvider))
+	api.HandleFunc("DELETE /v1/admin/llm-providers/{id}", s.requireAdmin(s.handleAdminDeleteProvider))
+	api.HandleFunc("GET /v1/admin/audit", s.requireAdmin(s.handleAdminAudit))
+	api.HandleFunc("GET /v1/admin/api-tokens", s.requireAdmin(s.handleAdminListTokens))
+	api.HandleFunc("POST /v1/admin/api-tokens", s.requireAdmin(s.handleAdminMintToken))
+	api.HandleFunc("DELETE /v1/admin/api-tokens/{hashOrToken}", s.requireAdmin(s.handleAdminRevokeToken))
+
 	api.HandleFunc("GET /v1/mcp-connections", s.requireSession(s.handleMCPConnections))
 	api.HandleFunc("GET /v1/inference-providers", s.requireSession(s.handleInferenceProviders))
 	api.HandleFunc("POST /v1/mcp/token", s.requireSession(s.handleMCPToken))

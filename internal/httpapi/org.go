@@ -86,12 +86,17 @@ func (s *Server) handleResources(w http.ResponseWriter, r *http.Request) {
 			}},
 		})
 	}
+	llmProviders, err := s.providers.SnapshotFor(r.Context(), groups)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "could not snapshot the providers")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"organizationId": s.cfg.OrgID(),
 		"orgMemberId":    memberID(userID(r)),
 		"teamIds":        []string{},
 		"resources": map[string]any{
-			"llmProviders": s.providers.SnapshotFor(groups),
+			"llmProviders": llmProviders,
 			"marketplaces": map[string]any{
 				marketplaceID(s.cfg): map[string]any{
 					"lastUpdatedAt": isoOrEpoch(catalogUpdatedAt(list)),
