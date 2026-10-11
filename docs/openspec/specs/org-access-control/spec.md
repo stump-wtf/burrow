@@ -14,6 +14,9 @@ from the identity provider's `groups` claim at sign-in. Access is declared in
 the providers file (SPEC-0002), next to the models and key each row serves
 (ADR-0003). An org that declares no groups behaves exactly as Stage B.
 
+SPEC-0004 moved these declarations from the file onto store rows, and retired
+model-level groups for derived menus: a derived model's audience is its row's.
+
 Skills (the Library) and shared MCP connections are out of scope here; they
 follow in later sections of this spec (stump.wtf/burrow#12, #4).
 
