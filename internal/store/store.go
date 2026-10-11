@@ -428,6 +428,12 @@ type AuditEntry struct {
 // ErrDuplicate marks a create whose id already exists.
 var ErrDuplicate = errors.New("store: row already exists")
 
+// ErrStale marks an update whose precondition failed: the row changed since
+// the caller last read it, so its expected updated_at no longer matches. The
+// admin surface answers this 412 with the current row (SPEC-0004 design:
+// "ETag = quoted updated_at").
+var ErrStale = errors.New("store: row changed since it was read")
+
 const providerColumns = `id, provider_id, name, base_url, api_key_env, provider_groups, name_overrides, created_at, updated_at`
 
 func scanProvider(row rowScanner) (ProviderRow, error) {
@@ -537,9 +543,12 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8) ON CONFLICT (id) DO NOTHING`,
 }
 
 // UpdateProvider replaces every mutable field of one row and appends its
-// audit entry in one transaction, returning the new updated_at. It returns
-// ErrNotFound when the row does not exist.
-func (s *Store) UpdateProvider(ctx context.Context, p ProviderRow, actor string) (time.Time, error) {
+// audit entry in one transaction, returning the new updated_at. A non-zero
+// expectUpdatedAt is the precondition behind the admin surface's etag: the
+// check runs inside the row lock, so two writers racing on the same stale
+// etag cannot both land — the loser gets ErrStale instead of clobbering the
+// winner. It returns ErrNotFound when the row does not exist.
+func (s *Store) UpdateProvider(ctx context.Context, p ProviderRow, expectUpdatedAt time.Time, actor string) (time.Time, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("store: begin update provider: %w", err)
@@ -548,6 +557,9 @@ func (s *Store) UpdateProvider(ctx context.Context, p ProviderRow, actor string)
 	before, err := getProviderTx(ctx, tx, p.ID)
 	if err != nil {
 		return time.Time{}, err
+	}
+	if !expectUpdatedAt.IsZero() && !before.UpdatedAt.Equal(expectUpdatedAt) {
+		return time.Time{}, ErrStale
 	}
 	updated := now()
 	if err := tx.QueryRowContext(ctx, `

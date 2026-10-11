@@ -257,12 +257,13 @@ func (s *Server) handleAdminUpdateProvider(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusPreconditionRequired, "precondition_required", "PUT must carry If-Match with the row's current etag")
 		return
 	}
-	if unquoteETag(ifMatch) != providers.FormatUpdatedAt(current.UpdatedAt) {
-		writeJSON(w, http.StatusPreconditionFailed, map[string]any{
-			"error":       "precondition_failed",
-			"message":     "If-Match does not match the row's current etag; body carries the current row",
-			"llmProvider": adminRowOf(current),
-		})
+	expected, err := time.Parse(time.RFC3339Nano, unquoteETag(ifMatch))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "If-Match must be the row's etag: the quoted RFC3339Nano updated_at")
+		return
+	}
+	if !expected.Equal(current.UpdatedAt) {
+		writeETagStale(w, current)
 		return
 	}
 	if body.ID != "" && body.ID != current.ID {
@@ -275,9 +276,21 @@ func (s *Server) handleAdminUpdateProvider(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "invalid_row", err.Error())
 		return
 	}
-	if _, err := s.store.UpdateProvider(r.Context(), row, adminActor(r)); err != nil {
+	// The store re-checks the precondition inside its row lock, so a write
+	// that raced between this handler's read and its transaction still
+	// answers 412 rather than clobbering the winner.
+	if _, err := s.store.UpdateProvider(r.Context(), row, expected, adminActor(r)); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", "no such llm provider")
+			return
+		}
+		if errors.Is(err, store.ErrStale) {
+			current, err = s.store.GetProvider(r.Context(), current.ID)
+			if err != nil {
+				s.adminStoreError(w, "read current provider", err)
+				return
+			}
+			writeETagStale(w, current)
 			return
 		}
 		s.adminStoreError(w, "update provider", err)
@@ -291,6 +304,16 @@ func (s *Server) handleAdminUpdateProvider(w http.ResponseWriter, r *http.Reques
 	out := adminRowOf(updated)
 	w.Header().Set("ETag", out.Etag)
 	writeJSON(w, http.StatusOK, map[string]any{"llmProvider": out})
+}
+
+// writeETagStale answers 412 with the current row in the body so the caller
+// can rebase in one round trip (SPEC-0004 design: "ETag = quoted updated_at").
+func writeETagStale(w http.ResponseWriter, current store.ProviderRow) {
+	writeJSON(w, http.StatusPreconditionFailed, map[string]any{
+		"error":       "precondition_failed",
+		"message":     "If-Match does not match the row's current etag; body carries the current row",
+		"llmProvider": adminRowOf(current),
+	})
 }
 
 func (s *Server) handleAdminDeleteProvider(w http.ResponseWriter, r *http.Request) {

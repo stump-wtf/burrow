@@ -106,7 +106,7 @@ func TestUpdateProviderIsFullReplace(t *testing.T) {
 		ID: "lpr_u", ProviderID: "other", Name: "Renamed",
 		BaseURL: "https://gw2.example/v1", APIKeyEnv: "GW2_KEY",
 	}
-	updated, err := st.UpdateProvider(ctx, replacement, "tester")
+	updated, err := st.UpdateProvider(ctx, replacement, time.Time{}, "tester")
 	if err != nil {
 		t.Fatalf("update: %v", err)
 	}
@@ -130,8 +130,39 @@ func TestUpdateProviderIsFullReplace(t *testing.T) {
 		t.Fatalf("created_at must survive a replace: %v vs %v", got.CreatedAt, created.CreatedAt)
 	}
 
-	if _, err := st.UpdateProvider(ctx, testProviderRow("lpr_missing"), "tester"); !errors.Is(err, store.ErrNotFound) {
+	if _, err := st.UpdateProvider(ctx, testProviderRow("lpr_missing"), time.Time{}, "tester"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("update of an unknown row must be ErrNotFound, got %v", err)
+	}
+}
+
+func TestUpdateProviderStalePrecondition(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	if err := st.CreateProvider(ctx, testProviderRow("lpr_s"), "tester"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	first, err := st.GetProvider(ctx, "lpr_s")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	// A racing writer lands first; the second writer's expectation — read
+	// before the race — must fail inside the row lock, not clobber it.
+	winner := testProviderRow("lpr_s")
+	winner.Name = "Winner"
+	if _, err := st.UpdateProvider(ctx, winner, first.UpdatedAt, "winner"); err != nil {
+		t.Fatalf("first update: %v", err)
+	}
+	loser := testProviderRow("lpr_s")
+	loser.Name = "Loser"
+	if _, err := st.UpdateProvider(ctx, loser, first.UpdatedAt, "loser"); !errors.Is(err, store.ErrStale) {
+		t.Fatalf("stale expectation must be ErrStale, got %v", err)
+	}
+	got, err := st.GetProvider(ctx, "lpr_s")
+	if err != nil {
+		t.Fatalf("get after race: %v", err)
+	}
+	if got.Name != "Winner" {
+		t.Fatalf("the stale writer must not clobber the winner, got %q", got.Name)
 	}
 }
 
@@ -144,7 +175,7 @@ func TestDeleteAndAuditTrail(t *testing.T) {
 	row := testProviderRow("lpr_a")
 	row.Name = "Renamed"
 	row.Groups = []string{"g"}
-	if _, err := st.UpdateProvider(ctx, row, "ci-token"); err != nil {
+	if _, err := st.UpdateProvider(ctx, row, time.Time{}, "ci-token"); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 	if err := st.DeleteProvider(ctx, "lpr_a", "alice"); err != nil {
