@@ -60,7 +60,7 @@ implements: [ADR-0004]
   token; the desktop deep-link flow is untouched. A member who can sign in
   could already mint a session by exchanging the page's grant, so this adds
   no capability.
-- **Etas on forms.** The editor carries the fetched etag in a hidden field;
+- **Etags on forms.** The editor carries the fetched etag in a hidden field;
   a 412 re-renders with the API's current row, a 409/400 re-renders the
   typed values with the API's message.
 - **Preview is the runtime's own answer.** `/admin/preview?group=` calls
