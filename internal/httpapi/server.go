@@ -29,6 +29,7 @@ type Server struct {
 	skills    *skills.Catalog
 	providers *providers.Runtime // nil serves none
 	oidc      OIDCClient
+	adminAPI  *http.ServeMux // the /api/den/v1/admin subtree, driven in-process by the /admin console
 }
 
 // New builds the server.
@@ -46,6 +47,18 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /auth/oidc/callback", s.handleOIDCCallback)
 	mux.HandleFunc("GET /api/runtime-config", s.handleRuntimeConfig)
 	mux.HandleFunc("POST /mcp/agent", s.handleMCPAgent)
+
+	// The /admin console (SPEC-0004 REQ "Admin console"): server-rendered
+	// pages over the write API, gated by the same BURROW_ADMIN_GROUPS check.
+	mux.HandleFunc("GET /admin/{$}", s.requireAdminPage(s.handleConsoleList))
+	mux.HandleFunc("GET /admin", s.requireAdminPage(s.handleConsoleList))
+	mux.HandleFunc("GET /admin/audit", s.requireAdminPage(s.handleConsoleAudit))
+	mux.HandleFunc("GET /admin/preview", s.requireAdminPage(s.handleConsolePreview))
+	mux.HandleFunc("GET /admin/providers/new", s.requireAdminPage(s.handleConsoleNew))
+	mux.HandleFunc("POST /admin/providers", s.requireAdminPage(s.handleConsoleCreate))
+	mux.HandleFunc("GET /admin/providers/{id}", s.requireAdminPage(s.handleConsoleEdit))
+	mux.HandleFunc("POST /admin/providers/{id}", s.requireAdminPage(s.handleConsoleUpdate))
+	mux.HandleFunc("POST /admin/providers/{id}/delete", s.requireAdminPage(s.handleConsoleDelete))
 
 	api := http.NewServeMux()
 	api.HandleFunc("POST /v1/auth/desktop-handoff", s.requireSession(s.handleMintHandoff))
@@ -78,6 +91,10 @@ func (s *Server) Routes() http.Handler {
 	api.HandleFunc("GET /v1/admin/api-tokens", s.requireAdmin(s.handleAdminListTokens))
 	api.HandleFunc("POST /v1/admin/api-tokens", s.requireAdmin(s.handleAdminMintToken))
 	api.HandleFunc("DELETE /v1/admin/api-tokens/{hashOrToken}", s.requireAdmin(s.handleAdminRevokeToken))
+
+	// The console drives these exact handlers in-process (consoleCall), so
+	// there is exactly one management path for provider rows.
+	s.adminAPI = api
 
 	api.HandleFunc("GET /v1/mcp-connections", s.requireSession(s.handleMCPConnections))
 	api.HandleFunc("GET /v1/inference-providers", s.requireSession(s.handleInferenceProviders))

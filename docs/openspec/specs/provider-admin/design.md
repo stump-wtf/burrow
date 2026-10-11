@@ -42,3 +42,30 @@ implements: [ADR-0004]
 - **Config additions.** `BURROW_MODELS_TTL` (60s), `BURROW_ADMIN_GROUPS`
   (comma list, default empty), `BURROW_API_TOKEN_TTL` (2160h),
   `BURROW_OIDC_GROUPS_SCOPE` (true).
+
+## Console (2026-10-11, stump.wtf/burrow#23)
+
+- **Pages over the API, in-process.** `requireAdminPage` gates `/admin` with
+  the same `holdsAny(user.Groups, BURROW_ADMIN_GROUPS)` check `requireAdmin`
+  applies. Mutations build the write API's JSON body and drive the API's own
+  handlers through the same mux (`consoleCall`), carrying the member's
+  session token as the bearer, so the API's own middleware re-checks the
+  gate and wires the audit actor; reads call the same store functions the
+  API's handlers call. No loopback HTTP hop: the edge proxy owns the public
+  origin, so a self-call could not reliably reach the process.
+- **Browser session = the session token in a cookie.** The non-desktop OIDC
+  callback mints a session and sets `burrow_session` (HttpOnly,
+  SameSite=Lax, Secure on https, `SessionTTL`). Lax keeps the cookie off
+  cross-site POSTs, so the console's POST-only mutations need no CSRF
+  token; the desktop deep-link flow is untouched. A member who can sign in
+  could already mint a session by exchanging the page's grant, so this adds
+  no capability.
+- **Etas on forms.** The editor carries the fetched etag in a hidden field;
+  a 412 re-renders with the API's current row, a 409/400 re-renders the
+  typed values with the API's message.
+- **Preview is the runtime's own answer.** `/admin/preview?group=` calls
+  `RowsFor` with that single group; there is no second matching rule to
+  drift.
+- **Menus come from `Runtime.MenuFor`.** The same cache a listing serves, so
+  counts and display names match what members see. Overrides for ids the
+  current menu lacks ride as hidden inputs: a PUT is a full replace.

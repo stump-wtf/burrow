@@ -101,6 +101,42 @@ the change. `GET /v1/admin/audit?limit=` SHALL return them newest-first
 never stored or logged: rows name environment variables, and audit rows
 repeat only those names.
 
+### Requirement: Admin console
+
+Burrow SHALL serve a server-rendered console under `/admin` (no JS build
+step; the shared design tokens) for provider rows, gated by the API's own
+admin check: a session whose member holds any of `BURROW_ADMIN_GROUPS`
+(closed to everyone when unset). The console SHALL offer: a provider list
+(name, baseURL, key presence, audience, model count), a row editor for
+create/edit/delete (per-model display-name overrides on the derived menu,
+row-level `groups`, and the `apiKeyEnv` NAME with a set/unset light - a key
+VALUE is never rendered, accepted, or stored), a visibility preview (pick a
+group; exactly the rows a member of it would get, computed by the runtime's
+own SPEC-0003 group matching), and an audit view (actor, action, provider,
+before/after detail). Every console mutation SHALL go through the write
+API's own handlers - its validation, its `If-Match` etag handling (412 shows
+the carried current row; 409 surfaces duplicate_id; 400 shows the field
+errors) and its audit records - so the console is a client of the API, never
+a second management path. A web (non-desktop) OIDC sign-in SHALL establish
+the browser session the console reads: an HttpOnly, SameSite=Lax cookie
+carrying the session token (the desktop grant flow is unchanged). The
+console SHALL say that audience edits take effect at each member's next
+sign-in, and SHALL warn when a row's audience is null (visible org-wide);
+key rotation stays an OpenBao/LiteLLM operation outside burrow.
+
+#### Scenario: Edit races another admin
+
+- **GIVEN** one admin editing a row while another admin saves it
+- **WHEN** the first admin saves with the stale etag
+- **THEN** the editor re-renders with the API's current row and an
+  explanation, and no change is lost silently
+
+#### Scenario: Console closed by default
+
+- **GIVEN** a deployment with `BURROW_ADMIN_GROUPS` unset
+- **WHEN** any member opens `/admin`
+- **THEN** the console answers 403, exactly like the API
+
 ### Requirement: Visibility unchanged
 
 Desktop-facing visibility rules (SPEC-0003 REQ "Visibility", "Connect
@@ -112,8 +148,8 @@ boot; ADR-0004).
 
 ## Out of scope
 
-The console UI (stump.wtf/burrow#23) — this spec's API is its backend.
-Skills and MCP administration (#12, #4). Skill of the gateway's own admin API
+The console UI was in scope of this spec as of 2026-10-11: see REQ "Admin console"
+(stump.wtf/burrow#23). Skills and MCP administration (#12, #4). Skill of the gateway's own admin API
 — burrow never calls it. Ansible-side retirement of the providers-file render
 (tracked in stump.wtf/burrow#22; the seed makes the transition safe in either
 order).

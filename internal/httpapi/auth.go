@@ -111,6 +111,7 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!doctype html>
 <p class="alt">or open <a href="{{.DeepLink}}">{{.DeepLink}}</a></p>{{end}}
 {{end}}
 {{if .SignInURL}}<a class="button href-signin" href="{{.SignInURL}}">Sign in with {{.OrgName}}</a>{{end}}
+{{if .AdminLink}}<a class="button" href="/admin">Open the admin console</a>{{end}}
 </section>
 </main>
 <script>if ({{.AutoRedirect}}) { try { location.replace({{.DeepLink}}) } catch (e) {} }</script>
@@ -123,6 +124,7 @@ type pageData struct {
 	AutoRedirect bool
 	SignInURL    string
 	OrgName      string
+	AdminLink    bool
 }
 
 // handleRoot serves burrow's sign-in page. The desktop app opens it with
@@ -197,6 +199,32 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		Grant: grant,
 		Notes: []string{"Signed in as " + firstNonEmpty(user.Name, user.Email) + "." +
 			" The grant works once and expires in " + s.cfg.GrantTTL.String() + "."},
+	}
+	// A web (non-desktop) sign-in also establishes a browser session for
+	// the /admin console: the cookie carries the same session token the
+	// desktop client holds as a bearer, so the console reuses the session
+	// store, its TTL, and sign-out, and the admin gate stays the API's own
+	// BURROW_ADMIN_GROUPS check (SPEC-0004 REQ "Admin console"). HttpOnly +
+	// SameSite=Lax keeps it out of scripts and off cross-site form posts,
+	// so the console's POST-only mutations are not CSRF-able.
+	if !desktop {
+		token, err := s.store.CreateSession(r.Context(), user.ID, s.cfg.SessionTTL)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "server_error", "could not create a session")
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     sessionCookieName,
+			Value:    token,
+			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+			Secure:   strings.HasPrefix(origin, "https://"),
+			MaxAge:   int(s.cfg.SessionTTL.Seconds()),
+		})
+		if holdsAny(user.Groups, s.cfg.AdminGroups) {
+			data.AdminLink = true
+		}
 	}
 	if desktop {
 		// Always include denBaseUrl, URL-encoded, per the client contract.

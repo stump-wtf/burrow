@@ -95,4 +95,7 @@ Chosen: **option 2**.
 Requirements: `docs/openspec/specs/provider-admin/spec.md` (SPEC-0004);
 amends SPEC-0002 REQ "Provider definitions"/"Provider rows" and SPEC-0003 REQ
 "Group declarations" (model-level `groups`) and REQ "Compatibility".
-Issue: stump.wtf/burrow#22.
+Issue: stump.wtf/burrow#22. The `/admin` console (SPEC-0004 REQ "Admin
+console", stump.wtf/burrow#23) is a client of this write API: it drives the
+API's handlers in-process with the admin member's session, so there is no
+second management path for provider rows.

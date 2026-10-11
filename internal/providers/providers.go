@@ -326,6 +326,20 @@ func (r *Runtime) RowsFor(ctx context.Context, memberGroups []string) ([]Row, er
 	return out, nil
 }
 
+// MenuFor returns the row's current derived model ids and whether its key is
+// provisioned in this process's environment — the admin console's model
+// counts and editor view (SPEC-0004 REQ "Admin console"). It runs the same
+// cache/TTL path a desktop listing would, so the count is the menu the
+// runtime serves. A nil Runtime answers no menu and no key.
+func (r *Runtime) MenuFor(ctx context.Context, p store.ProviderRow) ([]string, bool) {
+	if r == nil {
+		return nil, false
+	}
+	_, hasKey := lookupKey(p.APIKeyEnv)
+	ids, _ := r.menuIDs(ctx, p)
+	return ids, hasKey
+}
+
 // SnapshotFor is the resource snapshot for one member: id→updatedAt for the
 // rows they may see (SPEC-0003 REQ "Resource snapshot follows visibility").
 // Deriving each row's menu is what advances updated_at when the gateway's
