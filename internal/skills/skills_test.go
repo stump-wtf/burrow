@@ -78,17 +78,17 @@ func TestSearchMatchesTermsCaseInsensitively(t *testing.T) {
 	writeSkill(t, dir, "deploy-helper", "description: Help deploy things.")
 
 	cat := skills.NewCatalog(skills.Source{Dir: dir})
-	hits, err := cat.Search(context.Background(), "REVIEW code")
+	list, err := cat.All(context.Background())
 	if err != nil {
-		t.Fatalf("search: %v", err)
+		t.Fatalf("load: %v", err)
 	}
+	hits := skills.Search(list, "REVIEW code")
 	if len(hits) != 1 || hits[0].Name != "code-review" {
 		t.Fatalf("want code-review, got %+v", hits)
 	}
 
-	all, err := cat.Search(context.Background(), "")
-	if err != nil || len(all) != 2 {
-		t.Fatalf("empty query must return the whole catalog: %v %+v", err, all)
+	if all := skills.Search(list, ""); len(all) != 2 {
+		t.Fatalf("empty query must return the whole list: %+v", all)
 	}
 }
 
@@ -97,10 +97,14 @@ func TestFindAndClamp(t *testing.T) {
 	writeSkill(t, dir, "code-review", "description: short")
 
 	cat := skills.NewCatalog(skills.Source{Dir: dir})
-	if s, ok, _ := cat.Find(context.Background(), "code-review"); !ok || s.Name != "code-review" {
+	list, err := cat.All(context.Background())
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if s, ok := skills.Find(list, "code-review"); !ok || s.Name != "code-review" {
 		t.Fatalf("find: %v %+v", ok, s)
 	}
-	if _, ok, _ := cat.Find(context.Background(), "missing"); ok {
+	if _, ok := skills.Find(list, "missing"); ok {
 		t.Fatalf("missing skill must not be found")
 	}
 	if got := skills.ClampDescription(string(make([]byte, 2048))); len(got) != skills.MaxDescription {

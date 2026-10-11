@@ -5,9 +5,9 @@
 // (provider rows live here; model menus are derived from the gateway). Everything
 // the control plane must remember across restarts lives here: users, sessions,
 // sign-in grants, OIDC flow states, MCP tokens, LLM provider rows with their
-// audit trail, and admin API tokens. Tokens and grants are stored only as
-// SHA-256 hashes; the raw values exist once, in the response that carries them
-// to the client.
+// audit trail, admin API tokens, and the Library's group-to-skill mappings.
+// Tokens and grants are stored only as SHA-256 hashes; the raw values exist
+// once, in the response that carries them to the client.
 package store
 
 import (
@@ -148,6 +148,21 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 	created_at   TIMESTAMPTZ NOT NULL,
 	expires_at   TIMESTAMPTZ NOT NULL,
 	last_used_at TIMESTAMPTZ
+);
+-- SPEC-0003 REQ "Library audience": group to skill mappings. A row in
+-- skill_packs is a group that has declared a rule; its allowance is the rows in
+-- skill_pack_skills. A group with no row in skill_packs has no rule, which is
+-- exactly the behavior before this feature — every member sees the whole
+-- catalog. Named pack_group because GROUP is a reserved word.
+CREATE TABLE IF NOT EXISTS skill_packs (
+	pack_group TEXT PRIMARY KEY,
+	created_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS skill_pack_skills (
+	pack_group TEXT NOT NULL REFERENCES skill_packs(pack_group) ON DELETE CASCADE,
+	skill      TEXT NOT NULL,
+	created_at TIMESTAMPTZ NOT NULL,
+	PRIMARY KEY (pack_group, skill)
 );
 `
 	if _, err := s.db.Exec(schema); err != nil {

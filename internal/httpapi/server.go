@@ -50,9 +50,15 @@ func (s *Server) Routes() http.Handler {
 
 	// The /admin console (SPEC-0004 REQ "Admin console"): server-rendered
 	// pages over the write API, gated by the same BURROW_ADMIN_GROUPS check.
+	// Provider rows go through the write API itself; the skill-pack matrix
+	// writes the Library's mapping directly (SPEC-0003 REQ "Library audience"),
+	// which has no API surface of its own — the mapping is burrow's, not the
+	// client contract's.
 	mux.HandleFunc("GET /admin/{$}", s.requireAdminPage(s.handleConsoleList))
 	mux.HandleFunc("GET /admin", s.requireAdminPage(s.handleConsoleList))
 	mux.HandleFunc("GET /admin/audit", s.requireAdminPage(s.handleConsoleAudit))
+	mux.HandleFunc("GET /admin/skills", s.requireAdminPage(s.handleConsoleSkills))
+	mux.HandleFunc("POST /admin/skills", s.requireAdminPage(s.handleConsoleSkillsSave))
 	mux.HandleFunc("GET /admin/preview", s.requireAdminPage(s.handleConsolePreview))
 	mux.HandleFunc("GET /admin/providers/new", s.requireAdminPage(s.handleConsoleNew))
 	mux.HandleFunc("POST /admin/providers", s.requireAdminPage(s.handleConsoleCreate))

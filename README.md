@@ -18,7 +18,8 @@ single sign-on through the identity provider you already run.
 | A | OIDC sign-in, org, Library skills, the MCP endpoint that delivers skills to the agent | shipped |
 | B | Org LLM providers pointing at a LiteLLM gateway | shipped |
 | B+ | Per-member provider access by OIDC group (SPEC-0003; model-level groups retired by SPEC-0004) | shipped |
-| B++ | Provider rows in the store, model menus derived from each row's gateway key, admin API (SPEC-0004, ADR-0004) | in review |
+| B++ | Provider rows in the store, model menus derived from each row's gateway key, admin API (SPEC-0004, ADR-0004) | shipped |
+| B+++ | Library skill packs by OIDC group, edited at `/admin/skills` (SPEC-0003) | shipped |
 | C | Shared MCP connections | planned |
 | D | Automations and Dashboard | planned |
 
@@ -41,6 +42,16 @@ write is audited in `llm_provider_audit`.
 table is empty, after which the store is the source of truth and the file is
 ignored. Sign-in requests the OIDC `groups` scope unless
 `BURROW_OIDC_GROUPS_SCOPE=false` (an issuer that rejects unknown scopes).
+
+## Administering the Library
+
+Library skill packs are managed at `/admin/skills`, gated by the same
+`BURROW_ADMIN_GROUPS` groups as the provider surface: a matrix of groups and
+skills where a group with no rule leaves its members the whole catalog and a
+group with a rule shows its members only the checked skills. The mapping takes
+effect on the next request. Membership itself stays in the identity provider —
+burrow stores a group's skill list, never a member list — so adding someone to
+a pack is adding them to the group where they already belong.
 
 ## Pointing the OpenWork desktop app at burrow
 

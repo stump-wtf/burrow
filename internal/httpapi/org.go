@@ -70,7 +70,7 @@ func (s *Server) handleResources(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "server_error", "could not load the member")
 		return
 	}
-	list, err := s.skills.All(r.Context())
+	list, err := s.libraryFor(r, groups)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "could not load the Library")
 		return
@@ -109,7 +109,7 @@ func (s *Server) handleResources(w http.ResponseWriter, r *http.Request) {
 
 // handleMarketplaceCapabilities answers GET /v1/resources/marketplace-capabilities.
 func (s *Server) handleMarketplaceCapabilities(w http.ResponseWriter, r *http.Request) {
-	list, err := s.skills.All(r.Context())
+	list, err := s.library(r)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "could not load the Library")
 		return
@@ -128,7 +128,7 @@ func (s *Server) handleMarketplaceCapabilities(w http.ResponseWriter, r *http.Re
 
 // handleMarketplaces answers GET /v1/marketplaces.
 func (s *Server) handleMarketplaces(w http.ResponseWriter, r *http.Request) {
-	list, err := s.skills.All(r.Context())
+	list, err := s.library(r)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "could not load the Library")
 		return
@@ -151,7 +151,7 @@ func (s *Server) handleMarketplaceResolved(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusNotFound, "not_found", "no such marketplace")
 		return
 	}
-	list, err := s.skills.All(r.Context())
+	list, err := s.library(r)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "could not load the Library")
 		return
@@ -246,7 +246,7 @@ func (s *Server) handlePluginConfigObjects(w http.ResponseWriter, r *http.Reques
 // handleConfigObjectLatest answers GET /v1/config-objects/:id/versions/latest.
 func (s *Server) handleConfigObjectLatest(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	list, err := s.skills.All(r.Context())
+	list, err := s.library(r)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "could not load the Library")
 		return
@@ -268,7 +268,7 @@ func (s *Server) handleConfigObjectLatest(w http.ResponseWriter, r *http.Request
 // pluginByPluginID resolves a plg_<name> identifier to its skill, writing the
 // 404 itself when it does not exist.
 func (s *Server) pluginByPluginID(r *http.Request, w http.ResponseWriter, id string) (skills.Skill, bool) {
-	list, err := s.skills.All(r.Context())
+	list, err := s.library(r)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "could not load the Library")
 		return skills.Skill{}, false
@@ -284,7 +284,7 @@ func (s *Server) pluginByPluginID(r *http.Request, w http.ResponseWriter, id str
 
 // handleLibrary answers GET /v1/me/library: every skill as a plugin item.
 func (s *Server) handleLibrary(w http.ResponseWriter, r *http.Request) {
-	list, err := s.skills.All(r.Context())
+	list, err := s.library(r)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "could not load the Library")
 		return

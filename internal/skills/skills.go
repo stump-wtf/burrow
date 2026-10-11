@@ -1,10 +1,12 @@
 // Package skills loads burrow's Library content: a directory of
 // <name>/SKILL.md files, either a local path or a git repository refreshed on
 // load. Each directory becomes one skill; the SKILL.md body is served
-// verbatim as the skill's source.
+// verbatim as the skill's source. The catalog is global; which member sees
+// which part of it is the audience filter in access.go.
 //
 // Governing: ADR-0001 (Library content from a git repository of SKILL.md
-// skills), SPEC stage-a-control-plane REQ "Skills mapping".
+// skills), SPEC stage-a-control-plane REQ "Skills mapping", SPEC-0003
+// REQ "Library audience" (the filter).
 package skills
 
 import (
@@ -228,48 +230,9 @@ func (c *Catalog) All(ctx context.Context) ([]Skill, error) {
 	return skills, nil
 }
 
-// Find returns the skill with exactly name.
-func (c *Catalog) Find(ctx context.Context, name string) (Skill, bool, error) {
-	skills, err := c.All(ctx)
-	if err != nil {
-		return Skill{}, false, err
-	}
-	for _, s := range skills {
-		if s.Name == name {
-			return s, true, nil
-		}
-	}
-	return Skill{}, false, nil
-}
-
-// Search returns skills whose name, title, or description contain every
-// whitespace-separated term of query, case-insensitively. An empty query
-// returns the whole catalog.
-func (c *Catalog) Search(ctx context.Context, query string) ([]Skill, error) {
-	skills, err := c.All(ctx)
-	if err != nil {
-		return nil, err
-	}
-	terms := strings.Fields(strings.ToLower(query))
-	if len(terms) == 0 {
-		return skills, nil
-	}
-	var out []Skill
-	for _, s := range skills {
-		haystack := strings.ToLower(s.Name + " " + s.Title + " " + s.Description)
-		matched := true
-		for _, term := range terms {
-			if !strings.Contains(haystack, term) {
-				matched = false
-				break
-			}
-		}
-		if matched {
-			out = append(out, s)
-		}
-	}
-	return out, nil
-}
+// All is the catalog's only accessor: search, lookup, and audience filtering
+// are functions over the slice it returns (see access.go), so no surface can
+// reach the catalog by a route that skips the filter.
 
 // MaxDescription is the discovery schema's cap on a skill description.
 const MaxDescription = 1024

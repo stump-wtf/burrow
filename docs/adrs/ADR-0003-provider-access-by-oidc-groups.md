@@ -51,9 +51,11 @@ member only what their groups allow. Provider access lives in the same file the
 deployment derives each row's key scope from, so the menu and the key are
 changed together, in one reviewed edit.
 
-The admin console (option 2) remains the plan for skills in #12, where there is
-no key to keep in step. Option 3 would make burrow hold the gateway's admin
-credential and manage key lifecycle; nothing here needs that yet.
+The admin console (option 2) has since landed for skills (#12), where there is
+no key to keep in step: the group-to-skill mapping lives in the store and is
+edited at `/admin/skills`, specified as the Library section of SPEC-0003.
+Option 3 would make burrow hold the gateway's admin credential and manage key
+lifecycle; nothing here needs that yet.
 
 ### Consequences
 
@@ -71,5 +73,8 @@ credential and manage key lifecycle; nothing here needs that yet.
 
 ## More Information
 
-Requirements: `docs/openspec/specs/org-access-control/spec.md` (SPEC-0003).
-Issues: stump.wtf/burrow#12 (foundation), stump.wtf/burrow#13 (providers).
+Requirements: `docs/openspec/specs/org-access-control/spec.md` (SPEC-0003),
+including its Library section — the skills console half of option 2, which
+#12 shipped.
+Issues: stump.wtf/burrow#12 (foundation and Library skill packs),
+stump.wtf/burrow#13 (providers).
