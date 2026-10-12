@@ -50,8 +50,9 @@ type Config struct {
 	SkillsSubdir   string
 
 	// ProvidersFile is the first-boot seed of org LLM provider definitions
-	// (SPEC-0004): consulted only while the llm_providers table is empty;
-	// afterwards the store is the source of truth and the file is ignored.
+	// (SPEC-0004): consulted only while the provider store has never been
+	// written; afterwards the store is the source of truth and the file is
+	// ignored, even if every row is later deleted.
 	ProvidersFile string
 
 	// ModelsTTL bounds how long a row's gateway-derived model menu is

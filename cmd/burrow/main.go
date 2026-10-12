@@ -131,8 +131,10 @@ func main() {
 		}
 		switch {
 		case skipped:
-			// The store is the source of truth; the file is history.
-			slog.Info("llm providers file ignored: store already has rows", "file", cfg.ProvidersFile)
+			// The store is the source of truth; the file is history —
+			// also when an admin has since deleted every row. SeedIfEmpty
+			// has already warned about each row where the two differ.
+			slog.Info("llm providers file ignored: the store was already seeded or written", "file", cfg.ProvidersFile)
 		default:
 			// First boot: the file seeds the table once, then the store is
 			// the source of truth and the file is never consulted again.

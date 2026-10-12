@@ -40,8 +40,12 @@ honors `If-Match` when it is sent (`412` if the row changed) and deletes by
 id without it. Every write is audited in `llm_provider_audit`.
 
 `BURROW_PROVIDERS_FILE` is a **first-boot seed**: consulted only while the
-table is empty, after which the store is the source of truth and the file is
-ignored. Sign-in requests the OIDC `groups` scope unless
+store has never been written, after which the store is the source of truth
+and the file is ignored — deleting every row does not bring the file back at
+the next restart. Editing the file after first boot changes nothing; each
+boot logs a warning naming every row where the file and the store differ, so
+change rows through the admin routes and retire the file once it has seeded.
+Sign-in requests the OIDC `groups` scope unless
 `BURROW_OIDC_GROUPS_SCOPE=false` (an issuer that rejects unknown scopes).
 
 ## Administering the Library

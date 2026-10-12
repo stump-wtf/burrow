@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -348,6 +349,134 @@ func TestListAndCountProviders(t *testing.T) {
 	}
 	if len(rows) != 2 || rows[0].ID != "lpr_1" || rows[1].ID != "lpr_2" {
 		t.Fatalf("list must be stable order: %+v", rows)
+	}
+}
+
+// ProvidersSeeded must outlive the rows: it is what keeps a restart from
+// re-seeding a table an admin emptied on purpose.
+func TestProvidersSeededSurvivesDeletes(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	if seeded, err := st.ProvidersSeeded(ctx); err != nil || seeded {
+		t.Fatalf("a fresh store has never been written: %v %v", seeded, err)
+	}
+	if err := st.CreateProvider(ctx, testProviderRow("lpr_1"), "tester"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if seeded, err := st.ProvidersSeeded(ctx); err != nil || !seeded {
+		t.Fatalf("a store with a row is seeded: %v %v", seeded, err)
+	}
+	if err := st.DeleteProvider(ctx, "lpr_1", time.Time{}, "tester"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if n, err := st.CountProviders(ctx); err != nil || n != 0 {
+		t.Fatalf("the table is empty again: %d %v", n, err)
+	}
+	if seeded, err := st.ProvidersSeeded(ctx); err != nil || !seeded {
+		t.Fatalf("an emptied table must still read as seeded: %v %v", seeded, err)
+	}
+}
+
+func TestSeedProvidersLandsEveryRowWithItsAudit(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	rows := []store.ProviderRow{testProviderRow("lpr_1"), testProviderRow("lpr_2")}
+	if err := st.SeedProviders(ctx, rows, "seed"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if n, err := st.CountProviders(ctx); err != nil || n != 2 {
+		t.Fatalf("both rows land: %d %v", n, err)
+	}
+	for _, id := range []string{"lpr_1", "lpr_2"} {
+		entries := auditFor(t, st, id)
+		if len(entries) != 1 || entries[0].Action != "create" || entries[0].Actor != "seed" {
+			t.Fatalf("%s must be audited as a create by the seed actor, got %+v", id, entries)
+		}
+	}
+}
+
+// A seed that fails on a later row must leave nothing behind — no row and
+// no audit entry — or the next boot reads the leftovers as "already seeded"
+// and serves a partial provider set for good.
+func TestSeedProvidersIsAllOrNothing(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	rows := []store.ProviderRow{testProviderRow("lpr_1"), testProviderRow("lpr_2"), testProviderRow("lpr_1")}
+	if err := st.SeedProviders(ctx, rows, "seed"); !errors.Is(err, store.ErrDuplicate) {
+		t.Fatalf("the repeated id must fail the seed, got %v", err)
+	}
+	if n, err := st.CountProviders(ctx); err != nil || n != 0 {
+		t.Fatalf("a failed seed must store no rows: %d %v", n, err)
+	}
+	if entries, err := st.ListAudit(ctx, 10); err != nil || len(entries) != 0 {
+		t.Fatalf("a failed seed must store no audit entries: %d %v", len(entries), err)
+	}
+	if seeded, err := st.ProvidersSeeded(ctx); err != nil || seeded {
+		t.Fatalf("a failed seed must leave the store unseeded: %v %v", seeded, err)
+	}
+	// The next boot's seed, with the file repaired, lands whole.
+	if err := st.SeedProviders(ctx, rows[:2], "seed"); err != nil {
+		t.Fatalf("seed after the failure: %v", err)
+	}
+	if n, err := st.CountProviders(ctx); err != nil || n != 2 {
+		t.Fatalf("the retried seed lands whole: %d %v", n, err)
+	}
+}
+
+func TestSeedProvidersRefusesAWrittenStore(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	if err := st.CreateProvider(ctx, testProviderRow("lpr_admin"), "tester"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := st.DeleteProvider(ctx, "lpr_admin", time.Time{}, "tester"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	err := st.SeedProviders(ctx, []store.ProviderRow{testProviderRow("lpr_1")}, "seed")
+	if !errors.Is(err, store.ErrAlreadySeeded) {
+		t.Fatalf("a store an admin wrote and emptied must refuse the seed, got %v", err)
+	}
+	if n, err := st.CountProviders(ctx); err != nil || n != 0 {
+		t.Fatalf("a refused seed inserts nothing: %d %v", n, err)
+	}
+}
+
+// The already-seeded check and the inserts are one atomic step: of several
+// processes seeding one empty database, exactly one lands the rows and the
+// rest are told the store is seeded — none collides on a row id.
+func TestSeedProvidersConcurrentSeeders(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	rows := []store.ProviderRow{testProviderRow("lpr_1"), testProviderRow("lpr_2")}
+
+	errs := make([]error, 8)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range errs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs[i] = st.SeedProviders(ctx, rows, "seed")
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	landed := 0
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			landed++
+		case !errors.Is(err, store.ErrAlreadySeeded):
+			t.Errorf("seeder %d must land or see a seeded store, got %v", i, err)
+		}
+	}
+	if landed != 1 {
+		t.Errorf("exactly one seeder must land, got %d", landed)
+	}
+	if entries, err := st.ListAudit(ctx, 50); err != nil || len(entries) != 2 {
+		t.Errorf("the seed must be audited exactly once: %d entries %v", len(entries), err)
 	}
 }
 

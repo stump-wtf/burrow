@@ -54,8 +54,13 @@ Chosen: **option 2**.
 - The Postgres store's `llm_providers` table is the source of truth for
   provider rows (id, providerId, name, baseURL, apiKeyEnv, `groups`, name
   overrides). `BURROW_PROVIDERS_FILE` becomes a first-boot seed, consulted
-  only when the table is empty, so an existing deployment adopts this with no
-  behavior change and no data migration.
+  only while the store has never been written, so an existing deployment
+  adopts this with no behavior change and no data migration. "Never written"
+  means no row and no audit entry: a table an admin has emptied is still the
+  source of truth, and a restart does not re-seed it from the file. A later
+  edit to the file changes nothing; boot warns, per row, where the file and
+  the store have drifted apart, because the deployment's inventory may still
+  present the file as the control.
 - A row's menu is its key's view of itself, cached per row (default 60s TTL,
   serve-stale-on-error). When the derived set changes, the row's `updated_at`
   advances so the client's resource-snapshot poll notices the new menu — the
