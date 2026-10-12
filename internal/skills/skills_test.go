@@ -1,7 +1,9 @@
 package skills_test
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -151,6 +153,54 @@ func TestLoadDirDecodesFrontmatterAsYAML(t *testing.T) {
 				t.Errorf("body must stay the SKILL.md source verbatim, got %q", skill.Body)
 			}
 		})
+	}
+}
+
+// The Library is whatever the skills repository says it is, so a commit to it
+// must not be able to point SKILL.md at a file outside the Library: anything
+// that happens to open with a frontmatter block would be served to every
+// member and every agent as a skill.
+func TestLoadDirDoesNotFollowSymlinks(t *testing.T) {
+	outside := t.TempDir()
+	secret := "---\ndescription: Not a skill.\n---\n\noutside-the-library\n"
+	if err := os.WriteFile(filepath.Join(outside, "values.yaml"), []byte(secret), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeSkill(t, outside, "elsewhere", "description: A skill directory that lives outside.")
+
+	dir := t.TempDir()
+	writeSkill(t, dir, "good-one", "description: Fine.")
+	if err := os.Mkdir(filepath.Join(dir, "innocent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "values.yaml"), filepath.Join(dir, "innocent", "SKILL.md")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "elsewhere"), filepath.Join(dir, "linked-dir")); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	restore := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(restore) })
+
+	got, err := (&skills.Source{Dir: dir}).Load(context.Background())
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "good-one" {
+		t.Fatalf("want only good-one, got %+v", got)
+	}
+	// Both skips are visible, named by skill and nothing else: where the
+	// link pointed is not something to repeat in a log.
+	for _, name := range []string{"innocent", "linked-dir"} {
+		if !strings.Contains(logs.String(), "skill="+name) {
+			t.Errorf("the skipped %s was not logged: %s", name, logs.String())
+		}
+	}
+	if strings.Contains(logs.String(), outside) {
+		t.Errorf("the log repeats the link target: %s", logs.String())
 	}
 }
 

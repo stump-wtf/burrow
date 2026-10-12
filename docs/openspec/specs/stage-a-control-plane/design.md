@@ -92,6 +92,8 @@ internal/httpapi    routes: auth pages, /api/den/v1/*, /mcp/agent
   catalog caches for 30s so the client's polling does not hit git. Frontmatter
   is the YAML block between `---` markers, decoded with `gopkg.in/yaml.v3`;
   only `title` and `description` are read.
+  A symlinked skill directory or `SKILL.md` is skipped: Library content
+  cannot point the loader at a file outside the Library.
 - **Marketplace naming.** One marketplace named `<OrgName> Library` with id
   `mkt_<org slug>`; plugin `plg_<skill>`, config object `cfo_<skill>`,
   membership `pm_<skill>`, latest version `cfv_<skill>`. IDs are derived, not

@@ -192,22 +192,42 @@ func loadDir(dir string) ([]Skill, error) {
 	if err != nil {
 		return nil, fmt.Errorf("skills: read dir: %w", err)
 	}
+	// The directory's content is whatever the skills repository commits, and a
+	// commit can add a symlink: innocent/SKILL.md -> /some/outside/values.yaml
+	// would be read and, if it happens to open with a frontmatter block, served
+	// to every member and agent as a skill. So SKILL.md is read through a root
+	// at the Library directory, which refuses any path that leaves it, and only
+	// when both it and its skill directory are the real thing, not a link.
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, fmt.Errorf("skills: read dir: %w", err)
+	}
+	defer root.Close()
 	var skills []Skill
 	for _, entry := range entries {
+		name := entry.Name()
+		if entry.Type()&os.ModeSymlink != 0 {
+			slog.Warn("skills: skipping symlinked entry", "skill", name)
+			continue
+		}
 		if !entry.IsDir() {
 			continue
 		}
-		name := entry.Name()
 		if !nameRE.MatchString(name) || len(name) > 64 {
 			slog.Warn("skills: skipping directory with non-kebab-case name", "dir", name)
 			continue
 		}
 		path := filepath.Join(dir, name, "SKILL.md")
-		info, err := os.Stat(path)
+		inRoot := filepath.Join(name, "SKILL.md")
+		info, err := root.Lstat(inRoot)
 		if err != nil {
 			continue
 		}
-		raw, err := os.ReadFile(path)
+		if !info.Mode().IsRegular() {
+			slog.Warn("skills: skipping SKILL.md that is not a regular file", "skill", name)
+			continue
+		}
+		raw, err := root.ReadFile(inRoot)
 		if err != nil {
 			slog.Warn("skills: skipping unreadable SKILL.md", "path", path, "error", err)
 			continue
