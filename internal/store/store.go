@@ -644,6 +644,10 @@ type AuditEntry struct {
 // ErrDuplicate marks a create whose id already exists.
 var ErrDuplicate = errors.New("store: row already exists")
 
+// ErrAlreadySeeded marks a seed refused because the provider store has
+// already been written: by an earlier seed, a concurrent one, or an admin.
+var ErrAlreadySeeded = errors.New("store: providers already seeded")
+
 // ErrStale marks an update whose precondition failed: the row changed since
 // the caller last read it, so its expected updated_at no longer matches. The
 // admin surface answers this 412 with the current row (SPEC-0004 design:
@@ -732,6 +736,16 @@ func (s *Store) CreateProvider(ctx context.Context, p ProviderRow, actor string)
 		return fmt.Errorf("store: begin create provider: %w", err)
 	}
 	defer tx.Rollback()
+	if err := createProviderTx(ctx, tx, p, actor); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// createProviderTx is one row's insert and its audit entry inside the
+// caller's transaction, shared by CreateProvider and SeedProviders so a
+// seeded row is stored and audited exactly like an admin-created one.
+func createProviderTx(ctx context.Context, tx *sql.Tx, p ProviderRow, actor string) error {
 	created := p.CreatedAt
 	if created.IsZero() {
 		created = now()
@@ -752,8 +766,43 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8) ON CONFLICT (id) DO NOTHING`,
 		return ErrDuplicate
 	}
 	p.CreatedAt, p.UpdatedAt = created, created
-	if err := insertAudit(ctx, tx, actor, "create", p.ID, nil, providerJSON(p)); err != nil {
+	return insertAudit(ctx, tx, actor, "create", p.ID, nil, providerJSON(p))
+}
+
+// SeedProviders inserts the first-boot seed — every row and its audit entry
+// — in one transaction, and only into a store nothing has written (ADR-0004,
+// SPEC-0004 REQ "Rows in the store", scenario "First-boot seed"). A seed
+// therefore lands whole or not at all: were each row its own transaction, a
+// failure after the first insert (a dropped connection, a SIGTERM mid-boot, a
+// value Postgres refuses) would leave rows behind, the next boot would read
+// them as "already seeded", and burrow would serve a partial provider set
+// for good. It returns ErrAlreadySeeded, inserting nothing, when the store
+// has been written.
+func (s *Store) SeedProviders(ctx context.Context, rows []ProviderRow, actor string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin seed providers: %w", err)
+	}
+	defer tx.Rollback()
+	// SHARE ROW EXCLUSIVE conflicts with itself and with the lock every
+	// insert and delete takes, so the already-seeded check below and the
+	// inserts are atomic against a second process booting on the same empty
+	// database and against an admin write: the loser waits here, then sees a
+	// seeded store instead of colliding on a row id.
+	if _, err := tx.ExecContext(ctx, `LOCK TABLE llm_providers IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+		return fmt.Errorf("store: lock providers for seed: %w", err)
+	}
+	seeded, err := providersSeeded(ctx, tx)
+	if err != nil {
 		return err
+	}
+	if seeded {
+		return ErrAlreadySeeded
+	}
+	for _, p := range rows {
+		if err := createProviderTx(ctx, tx, p, actor); err != nil {
+			return fmt.Errorf("store: seed provider %s: %w", p.ID, err)
+		}
 	}
 	return tx.Commit()
 }
@@ -884,14 +933,42 @@ func (s *Store) ListProviders(ctx context.Context) ([]ProviderRow, error) {
 	return out, rows.Err()
 }
 
-// CountProviders reports how many rows exist; main.go consults it to decide
-// whether BURROW_PROVIDERS_FILE is still a seed or already superseded.
+// CountProviders reports how many rows exist. It does not say whether the
+// store was ever seeded — an admin may have deleted every row — so the seed
+// decision is ProvidersSeeded's.
 func (s *Store) CountProviders(ctx context.Context) (int, error) {
 	var n int
 	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM llm_providers`).Scan(&n); err != nil {
 		return 0, fmt.Errorf("store: count providers: %w", err)
 	}
 	return n, nil
+}
+
+// ProvidersSeeded reports whether the provider store has ever been written:
+// a row exists, or the audit trail has an entry. main.go consults it to
+// decide whether BURROW_PROVIDERS_FILE is still a seed or already superseded
+// (ADR-0004). The audit trail is what makes the answer survive deletes: every
+// create, update and delete appends to it in the change's own transaction,
+// so a table an admin emptied on purpose still reads as seeded and the next
+// restart does not hand the file's rows back. The row check covers a table
+// whose audit trail was pruned.
+func (s *Store) ProvidersSeeded(ctx context.Context) (bool, error) {
+	return providersSeeded(ctx, s.db)
+}
+
+// rowQuerier is shared by *sql.DB and *sql.Tx.
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func providersSeeded(ctx context.Context, q rowQuerier) (bool, error) {
+	var seeded bool
+	if err := q.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM llm_providers) OR EXISTS (SELECT 1 FROM llm_provider_audit)`).
+		Scan(&seeded); err != nil {
+		return false, fmt.Errorf("store: providers seeded: %w", err)
+	}
+	return seeded, nil
 }
 
 // BumpProviderUpdatedAt advances one row's updated_at without an audit

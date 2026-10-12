@@ -42,12 +42,48 @@ never a store failure.
 
 #### Scenario: First-boot seed
 
-- **GIVEN** an empty `llm_providers` table and a configured
+- **GIVEN** a provider store that has never been written (no `llm_providers`
+  row and no `llm_provider_audit` entry) and a configured
   `BURROW_PROVIDERS_FILE`
 - **WHEN** burrow starts
 - **THEN** each file row is inserted (model names becoming name overrides;
   model-level `groups` are dropped with a boot warning), and the file is not
-  consulted again while the table is non-empty
+  consulted again
+
+#### Scenario: Seed fails partway
+
+- **GIVEN** a first-boot seed in which a row after the first cannot be
+  stored, or the process dies mid-seed
+- **WHEN** burrow next starts
+- **THEN** no row and no audit entry from the failed seed exists, and the
+  whole file is seeded again: the rows and their audit entries land in one
+  transaction, whole or not at all
+
+#### Scenario: Two processes seed at once
+
+- **GIVEN** two burrow processes starting against the same never-written
+  store
+- **WHEN** both run the first-boot seed
+- **THEN** exactly one inserts the file's rows and the other finds the store
+  already seeded and ignores the file, without a boot failure
+
+#### Scenario: Every row deleted
+
+- **GIVEN** a seeded store whose rows an admin has all deleted
+- **WHEN** burrow restarts with `BURROW_PROVIDERS_FILE` still configured
+- **THEN** the file is ignored and the store stays empty: the audit trail,
+  not the row count, says the store has been written
+
+#### Scenario: File edited after first boot
+
+- **GIVEN** a seeded store and a `BURROW_PROVIDERS_FILE` that no longer
+  matches it — a row present only in the file, a row present only in the
+  store, or a row whose `groups`, `baseURL` or `apiKeyEnv` differ
+- **WHEN** burrow starts
+- **THEN** the store is served unchanged and one warning per drifted row is
+  logged, naming the row id and the differing field and never a value; a file
+  that no longer parses or validates is logged as a warning and does not stop
+  boot
 
 ### Requirement: Gateway-derived model menus
 

@@ -42,9 +42,21 @@ implements: [ADR-0004]
 - **Groups scope at sign-in.** `oidc.New` always adds the `groups` scope
   unless the new `BURROW_OIDC_GROUPS_SCOPE=false`; `UsesGroups()` retires
   (rows are mutable at runtime; boot-time detection is unsound).
-- **Seed.** `main.go`: store empty + `BURROW_PROVIDERS_FILE` set → validate +
-  insert each row (models → nameOverrides; model-level groups dropped with a
-  warning). Store non-empty → file ignored entirely (log once at info level).
+- **Seed.** `main.go`: store never written + `BURROW_PROVIDERS_FILE` set →
+  validate + insert each row (models → nameOverrides; model-level groups
+  dropped with a warning). Store already written → file ignored entirely (log
+  once at info level). "Written" is `store.ProvidersSeeded`: any row, or any
+  audit entry — the audit trail survives deletes, so an admin emptying the
+  table does not make the next boot a first boot. The insert is
+  `store.SeedProviders`: one transaction that takes
+  `LOCK TABLE llm_providers IN SHARE ROW EXCLUSIVE MODE`, re-checks "written"
+  under it, and inserts every row with its audit entry. A seed that fails
+  partway rolls back to a never-written store instead of leaving rows that
+  make the next boot skip the file, and a second process seeding at the same
+  moment waits on the lock and then skips. A skipped file is still loaded
+  once per boot, only to `slog.Warn` per drifted row (`drift=file-only`,
+  `store-only`, or the differing fields among `groups,baseURL,apiKeyEnv`;
+  groups compared as a set); a load error there is a warning, not an exit.
 - **Config additions.** `BURROW_MODELS_TTL` (60s), `BURROW_ADMIN_GROUPS`
   (comma list, default empty), `BURROW_API_TOKEN_TTL` (2160h),
   `BURROW_OIDC_GROUPS_SCOPE` (true).
