@@ -76,8 +76,10 @@ internal/httpapi    routes: auth pages, /api/den/v1/*, /mcp/agent
 - **User id = OIDC subject.** Stable across email changes; email/name claims
   refresh on every sign-in (upsert). Member ids are `mem_<sub>`.
 - **Skills source.** `BURROW_SKILLS_DIR` reads a directory directly;
-  `BURROW_SKILLS_GIT_URL` shallow-clones into the cache dir and `git
-  pull --ff-only`s on refresh (a failed pull serves the cached clone). The
+  `BURROW_SKILLS_GIT_URL` shallow-clones into the cache dir and on refresh
+  re-points origin at the configured URL, fetches the remote's default branch
+  and hard-resets to it, so a changed URL or an upstream force-push is
+  followed (a failed refresh serves the cached clone). The
   catalog caches for 30s so the client's polling does not hit git. Frontmatter
   is parsed by hand — `key: value` lines between `---` markers; no dependency.
 - **Marketplace naming.** One marketplace named `<OrgName> Library` with id

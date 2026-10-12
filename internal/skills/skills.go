@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,13 +44,24 @@ type Skill struct {
 // refreshed into CacheDir on every Load. SubDir names a directory inside the
 // resolved source to load from instead of its root — the org's skills repo
 // keeps its skills under skills/, and the repo root carries repo plumbing
-// that is not a skill.
+// that is not a skill. GitTimeout bounds the git commands of one refresh; zero
+// means DefaultGitTimeout.
 type Source struct {
-	Dir      string
-	GitURL   string
-	CacheDir string
-	SubDir   string
+	Dir        string
+	GitURL     string
+	CacheDir   string
+	SubDir     string
+	GitTimeout time.Duration
 }
+
+// DefaultGitTimeout is how long one refresh may spend in git. A shallow clone
+// of a skills repository is seconds of work, so a minute only ever ends a
+// remote that has stopped answering.
+const DefaultGitTimeout = time.Minute
+
+// gitWaitDelay is how long a git that has exited or been killed may keep its
+// output pipe open before the loader stops reading it.
+const gitWaitDelay = 5 * time.Second
 
 var nameRE = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 
@@ -72,22 +84,105 @@ func (s *Source) Load(ctx context.Context) ([]Skill, error) {
 }
 
 func (s *Source) refreshGit(ctx context.Context) (string, error) {
+	// The refresh is shared: it runs under the refresh lock and its result
+	// serves every member. So it takes its deadline from the loader, not from
+	// the request that happened to trigger it — that member disconnecting must
+	// not kill a clone part-way, and a request with no deadline of its own must
+	// not let a silent remote hold the lock forever.
+	timeout := s.GitTimeout
+	if timeout <= 0 {
+		timeout = DefaultGitTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
+
 	clone := filepath.Join(s.CacheDir, "repo")
 	if _, err := os.Stat(filepath.Join(clone, ".git")); err != nil {
 		if err := os.MkdirAll(s.CacheDir, 0o755); err != nil {
 			return "", fmt.Errorf("skills: cache dir: %w", err)
 		}
-		out, err := exec.CommandContext(ctx, "git", "clone", "--depth", "1", s.GitURL, clone).CombinedOutput()
+		// A clone killed part-way leaves a .git directory behind, and the
+		// check above would take it for a finished checkout from then on.
+		// Whether refreshing such a repository ever recovers depends on where
+		// git died, so the clone is made beside the cache and only a finished
+		// one is renamed into place.
+		tmp, err := os.MkdirTemp(s.CacheDir, "clone-")
 		if err != nil {
-			return "", fmt.Errorf("skills: git clone: %v: %s", err, strings.TrimSpace(string(out)))
+			return "", fmt.Errorf("skills: cache dir: %w", err)
+		}
+		defer os.RemoveAll(tmp)
+		out, err := s.git(ctx, "clone", "--depth", "1", s.GitURL, tmp)
+		if err != nil {
+			return "", fmt.Errorf("skills: git clone: %v: %s", err, out)
+		}
+		// Whatever sits at the path is not a checkout; it would block the rename.
+		if err := os.RemoveAll(clone); err != nil {
+			return "", fmt.Errorf("skills: cache dir: %w", err)
+		}
+		if err := os.Rename(tmp, clone); err != nil {
+			return "", fmt.Errorf("skills: cache dir: %w", err)
 		}
 	} else {
-		out, err := exec.CommandContext(ctx, "git", "-C", clone, "pull", "--ff-only").CombinedOutput()
-		if err != nil {
-			slog.Warn("skills: git pull failed; serving the cached clone", "error", strings.TrimSpace(string(out)))
+		// The cache is a mirror of the remote's default branch, not a branch
+		// of its own: fetch what the remote has now and move to it, whatever
+		// the history between. A fast-forward-only pull freezes the Library
+		// the first time upstream force-pushes, which is how a bad skill gets
+		// retracted. origin is re-pointed first because the clone remembers
+		// the URL it was made from: without that, changing
+		// BURROW_SKILLS_GIT_URL is ignored for as long as the cache exists.
+		for _, args := range [][]string{
+			{"remote", "set-url", "origin", s.GitURL},
+			{"fetch", "--depth", "1", "origin", "HEAD"},
+			{"reset", "--hard", "FETCH_HEAD"},
+		} {
+			out, err := s.git(ctx, append([]string{"-C", clone}, args...)...)
+			if err != nil {
+				slog.Warn("skills: git refresh failed; serving the cached clone", "step", args[0], "error", err, "output", out)
+				break
+			}
 		}
 	}
 	return clone, nil
+}
+
+// git runs one git command and returns its combined output. git reaches a
+// remote through a helper process (git-remote-http, ssh) that inherits the
+// output pipe and survives git itself being killed, so killing git alone
+// leaves CombinedOutput reading a pipe the orphan still holds: the whole
+// process group goes down with the deadline, and WaitDelay stops the read if
+// something escapes that. The output comes back redacted, because it is only
+// ever used in an error or a log line.
+func (s *Source) git(ctx context.Context, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	killGroupOnCancel(cmd)
+	cmd.WaitDelay = gitWaitDelay
+	out, err := cmd.CombinedOutput()
+	if err != nil && ctx.Err() != nil {
+		// "signal: killed" says nothing; the deadline is why.
+		err = ctx.Err()
+	}
+	return s.redact(strings.TrimSpace(string(out))), err
+}
+
+// redact takes the configured URL out of git's output. The URL may carry a
+// credential, and git repeats it: a token in the username position comes back
+// in "could not read Password for 'https://<token>@host'" when the remote
+// answers 401. Current gits strip the userinfo from most other messages, so
+// the URL is matched with and without it, and the userinfo on its own for the
+// messages that print only part of the URL.
+func (s *Source) redact(out string) string {
+	const placeholder = "<BURROW_SKILLS_GIT_URL>"
+	pairs := []string{s.GitURL, placeholder}
+	if u, err := url.Parse(s.GitURL); err == nil && u.User != nil {
+		userinfo := u.User.String()
+		password, _ := u.User.Password()
+		u.User = nil
+		pairs = append(pairs, u.String(), placeholder, userinfo+"@", "***@")
+		if password != "" {
+			pairs = append(pairs, password, "***")
+		}
+	}
+	return strings.NewReplacer(pairs...).Replace(out)
 }
 
 func loadDir(dir string) ([]Skill, error) {
@@ -190,7 +285,7 @@ func NewCatalog(source Source) *Catalog {
 }
 
 // All returns the cached catalog, reloading when stale. The refresh lock is
-// only held across Source.Load, so a slow git pull never stalls cache hits;
+// only held across Source.Load, so a slow git fetch never stalls cache hits;
 // a reader arriving mid-refresh serves the stale catalog instead of waiting.
 func (c *Catalog) All(ctx context.Context) ([]Skill, error) {
 	c.mu.Lock()
