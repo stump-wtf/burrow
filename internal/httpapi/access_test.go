@@ -181,7 +181,7 @@ func TestAccessGroupsClaimRecordedAtSignIn(t *testing.T) {
 	signIn := func(claim any) []string {
 		t.Helper()
 		issuer.groups = claim
-		noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+		noRedirect := newBrowser(t)
 		start, err := noRedirect.Get(e.srv.URL + "/auth/oidc/start")
 		if err != nil {
 			t.Fatal(err)
@@ -194,7 +194,7 @@ func TestAccessGroupsClaimRecordedAtSignIn(t *testing.T) {
 		if !strings.Contains(" "+loc.Query().Get("scope")+" ", " groups ") {
 			t.Fatalf("sign-in must request the groups scope: %q", loc.Query().Get("scope"))
 		}
-		cb, err := noRedirect.Get(e.srv.URL + "/auth/oidc/callback?code=c&state=" + url.QueryEscape(loc.Query().Get("state")))
+		cb, err := noRedirect.Get(approve(t, loc.String()))
 		if err != nil {
 			t.Fatal(err)
 		}

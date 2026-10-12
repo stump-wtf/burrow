@@ -24,7 +24,10 @@ The page at `/` SHALL accept the desktop app's
 through the configured OIDC issuer using the authorization-code flow with
 PKCE (S256). On success burrow SHALL mint a grant, redirect to
 `openwork://den-auth?grant=<grant>&denBaseUrl=<origin>` (denBaseUrl always
-present, URL-encoded), and also render the grant as copyable text.
+present, URL-encoded), and also render the grant as copyable text. The
+callback SHALL complete a sign-in only in the browser that started it: a
+`state` that does not match the one that browser was handed at the start
+SHALL fail with `invalid_state` and leave the pending sign-in usable.
 
 ### Requirement: Grant properties
 

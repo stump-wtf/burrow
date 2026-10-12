@@ -2,6 +2,8 @@ package httpapi_test
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"io"
@@ -15,12 +17,21 @@ import (
 	"gitea.stump.rocks/stump.wtf/burrow/internal/httpapi"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/oidc"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/skills"
+	"gitea.stump.rocks/stump.wtf/burrow/internal/store"
 )
 
 // newOIDCTestEnv builds a burrow server whose OIDC client is the production
 // one pointed at a local fake issuer, so the whole sign-in path — start,
 // callback, exchange, me — runs for real.
 func newOIDCTestEnv(t *testing.T) *testEnv {
+	t.Helper()
+	e, _ := newOIDCTestEnvWithIssuer(t)
+	return e
+}
+
+// newOIDCTestEnvWithIssuer also hands back the fake issuer, for tests that
+// change what it mints.
+func newOIDCTestEnvWithIssuer(t *testing.T) (*testEnv, *fakeIssuer) {
 	t.Helper()
 	e := newTestEnv(t)
 
@@ -31,7 +42,7 @@ func newOIDCTestEnv(t *testing.T) *testEnv {
 		t.Fatalf("oidc client against fake issuer: %v", err)
 	}
 	e.srv.Config.Handler = httpapi.New(e.cfg, e.st, skills.NewCatalog(skills.Source{Dir: e.cfg.SkillsDir}), nil, client).Routes()
-	return e
+	return e, issuer
 }
 
 var grantRE = regexp.MustCompile(`<code id="grant">([^<]+)</code>`)
@@ -40,8 +51,9 @@ var grantRE = regexp.MustCompile(`<code id="grant">([^<]+)</code>`)
 // shown as copyable text and handed over via an openwork:// deep link.
 func TestSignInFlowMintsGrantAndDeepLink(t *testing.T) {
 	e := newOIDCTestEnv(t)
-	client := e.srv.Client()
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }
+	// One browser throughout: the callback only honors a state whose cookie
+	// this client was handed at /auth/oidc/start.
+	client := newBrowser(t)
 
 	// The desktop app opens / with ?desktopAuth=1.
 	resp, err := client.Get(e.srv.URL + "/?mode=sign-in&desktopAuth=1&desktopScheme=openwork")
@@ -72,9 +84,10 @@ func TestSignInFlowMintsGrantAndDeepLink(t *testing.T) {
 		t.Fatalf("authorize URL must carry state and an S256 challenge: %v", authorizeURL)
 	}
 
-	// The callback consumes state+code (the fake issuer's token endpoint
-	// mints the ID token) and renders the grant plus the deep link.
-	resp, err = client.Get(e.srv.URL + "/auth/oidc/callback?state=" + url.QueryEscape(state) + "&code=test-code")
+	// The issuer sends the browser back with a code; the callback consumes
+	// state+code (the fake issuer's token endpoint checks the PKCE verifier
+	// and mints the ID token) and renders the grant plus the deep link.
+	resp, err = client.Get(approve(t, authorizeURL.String()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,16 +260,264 @@ func TestHandoffMintRequiresSession(t *testing.T) {
 	}
 }
 
-// A callback with an unknown state (expired or replayed) is refused.
+// A callback with an unknown state (expired or replayed) is refused. The
+// request carries a matching state cookie, so what refuses it is the missing
+// stored state and not the browser binding.
 func TestCallbackRejectsUnknownState(t *testing.T) {
 	e := newOIDCTestEnv(t)
-	resp, err := e.srv.Client().Get(e.srv.URL + "/auth/oidc/callback?state=bogus&code=x")
+	req, _ := http.NewRequest(http.MethodGet, e.srv.URL+"/auth/oidc/callback?state=bogus&code=x", nil)
+	req.AddCookie(&http.Cookie{Name: "burrow_oidc_state", Value: "bogus"})
+	resp, err := e.srv.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("unknown state must 400, got %d", resp.StatusCode)
+	}
+}
+
+// Login CSRF: a state is only good in the browser that started the flow. An
+// attacker who starts sign-in, authenticates as themselves and stops before
+// the redirect holds a callback URL that would otherwise sign whoever opens
+// it into the attacker's account: a session cookie on the web flow, the
+// desktop app's deep link on the desktop flow.
+func TestCallbackRejectsStateFromAnotherBrowser(t *testing.T) {
+	for _, startPath := range []string{"/auth/oidc/start", "/auth/oidc/start?desktop=1"} {
+		t.Run(startPath, func(t *testing.T) {
+			e := newOIDCTestEnv(t)
+
+			attacker := newBrowser(t)
+			start, err := attacker.Get(e.srv.URL + startPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			start.Body.Close()
+			loc, err := url.Parse(start.Header.Get("Location"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if loc.Query().Get("state") == "" {
+				t.Fatalf("start must carry state: %v", loc)
+			}
+			callback := approve(t, loc.String())
+
+			// The victim opens the attacker's link in a browser that never
+			// visited /auth/oidc/start.
+			victim := newBrowser(t)
+			resp, err := victim.Get(callback)
+			if err != nil {
+				t.Fatal(err)
+			}
+			page, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(page), "invalid_state") {
+				t.Fatalf("a state from another browser must answer 400 invalid_state, got %d", resp.StatusCode)
+			}
+			for _, c := range resp.Cookies() {
+				if c.Name == "burrow_session" {
+					t.Fatal("a state from another browser must not sign the victim in")
+				}
+			}
+			if grantRE.Match(page) || strings.Contains(string(page), "openwork://") {
+				t.Fatal("a state from another browser must not mint a grant")
+			}
+
+			// The refusal consumed nothing: the browser that started the flow
+			// can still finish it, so knowing a state is not enough to burn it.
+			resp, err = attacker.Get(callback)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("the starting browser must still complete sign-in, got %d", resp.StatusCode)
+			}
+		})
+	}
+}
+
+// The state cookie is HttpOnly, scoped to the sign-in routes, lives no longer
+// than the stored state, and is cleared once the callback has used it.
+func TestOIDCStateCookieIsScopedAndCleared(t *testing.T) {
+	e := newOIDCTestEnv(t)
+	browser := newBrowser(t)
+
+	start, err := browser.Get(e.srv.URL + "/auth/oidc/start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start.Body.Close()
+	loc, err := url.Parse(start.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := loc.Query().Get("state")
+	var cookie *http.Cookie
+	for _, c := range start.Cookies() {
+		if c.Name == "burrow_oidc_state" {
+			cookie = c
+		}
+	}
+	if cookie == nil {
+		t.Fatal("start must set the burrow_oidc_state cookie")
+	}
+	if cookie.Value != state {
+		t.Fatal("the state cookie must carry the state sent to the issuer")
+	}
+	if !cookie.HttpOnly || cookie.SameSite != http.SameSiteLaxMode || cookie.Path != "/auth/oidc" ||
+		cookie.MaxAge != int(e.cfg.OIDCStateTTL.Seconds()) || cookie.Secure {
+		t.Fatalf("state cookie must be HttpOnly, SameSite=Lax, Path=/auth/oidc, Max-Age=state TTL, and not Secure over http, got %+v", cookie)
+	}
+
+	// Behind a TLS-terminating proxy the cookie is Secure, decided the way
+	// the session cookie decides it.
+	req, _ := http.NewRequest(http.MethodGet, e.srv.URL+"/auth/oidc/start", nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	proxied, err := newBrowser(t).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxied.Body.Close()
+	secure := false
+	for _, c := range proxied.Cookies() {
+		if c.Name == "burrow_oidc_state" {
+			secure = c.Secure
+		}
+	}
+	if !secure {
+		t.Fatal("state cookie must be Secure on an https origin")
+	}
+
+	// A state that does not match the cookie is refused even in the browser
+	// that holds one.
+	resp, err := browser.Get(e.srv.URL + "/auth/oidc/callback?state=not-the-cookie&code=test-code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("a state that differs from the cookie must 400, got %d", resp.StatusCode)
+	}
+
+	resp, err = browser.Get(approve(t, loc.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("callback status %d", resp.StatusCode)
+	}
+	cleared := false
+	for _, c := range resp.Cookies() {
+		if c.Name == "burrow_oidc_state" && c.MaxAge < 0 && c.Value == "" && c.Path == "/auth/oidc" {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Fatal("callback must clear the burrow_oidc_state cookie")
+	}
+}
+
+// PKCE: the verifier burrow sends is the one it generated for that flow, so a
+// code issued against another flow's challenge does not redeem. Every sign-in
+// test above is the other half: the issuer redeems a code only for the right
+// verifier, so they fail if burrow stops sending it.
+func TestCallbackRefusesCodeIssuedToAnotherFlow(t *testing.T) {
+	e := newOIDCTestEnv(t)
+
+	startFlow := func(browser *http.Client) *url.URL {
+		t.Helper()
+		start, err := browser.Get(e.srv.URL + "/auth/oidc/start")
+		if err != nil {
+			t.Fatal(err)
+		}
+		start.Body.Close()
+		loc, err := url.Parse(start.Header.Get("Location"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return loc
+	}
+
+	otherAuthorize := startFlow(newBrowser(t))
+	otherCallback, err := url.Parse(approve(t, otherAuthorize.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	browser := newBrowser(t)
+	authorize := startFlow(browser)
+	if authorize.Query().Get("code_challenge") == otherAuthorize.Query().Get("code_challenge") {
+		t.Fatal("two flows must not share a code challenge")
+	}
+
+	resp, err := browser.Get(e.srv.URL + "/auth/oidc/callback?state=" + url.QueryEscape(authorize.Query().Get("state")) +
+		"&code=" + url.QueryEscape(otherCallback.Query().Get("code")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway || !strings.Contains(string(body), "oidc_exchange_failed") {
+		t.Fatalf("a code from another flow must answer 502 oidc_exchange_failed, got %d", resp.StatusCode)
+	}
+}
+
+// The ID token is only as good as its verification: the wrong audience, an
+// expired token, another issuer, and a signature the issuer's keys do not
+// vouch for must each stop sign-in before a user or a session exists.
+func TestCallbackRefusesIDTokenThatDoesNotVerify(t *testing.T) {
+	forged, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name    string
+		breakIt func(*fakeIssuer)
+	}{
+		{"wrong audience", func(fi *fakeIssuer) {
+			fi.tamper = func(claims map[string]any) { claims["aud"] = "some-other-client" }
+		}},
+		{"expired", func(fi *fakeIssuer) {
+			fi.tamper = func(claims map[string]any) {
+				claims["iat"] = time.Now().Add(-2 * time.Hour).Unix()
+				claims["exp"] = time.Now().Add(-time.Hour).Unix()
+			}
+		}},
+		{"wrong issuer", func(fi *fakeIssuer) {
+			fi.tamper = func(claims map[string]any) { claims["iss"] = "https://another-issuer.example" }
+		}},
+		{"bad signature", func(fi *fakeIssuer) { fi.signKey = forged }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e, issuer := newOIDCTestEnvWithIssuer(t)
+			tc.breakIt(issuer)
+
+			browser := newBrowser(t)
+			start, err := browser.Get(e.srv.URL + "/auth/oidc/start")
+			if err != nil {
+				t.Fatal(err)
+			}
+			start.Body.Close()
+			resp, err := browser.Get(approve(t, start.Header.Get("Location")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusUnauthorized || !strings.Contains(string(body), "oidc_verification_failed") {
+				t.Fatalf("want 401 oidc_verification_failed, got %d", resp.StatusCode)
+			}
+			for _, c := range resp.Cookies() {
+				if c.Name == "burrow_session" {
+					t.Fatal("an unverified ID token must not open a session")
+				}
+			}
+			if _, err := e.st.GetUser(context.Background(), "signer-sub-1"); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("an unverified ID token must not record a user, got %v", err)
+			}
+		})
 	}
 }
 
@@ -303,6 +564,27 @@ func (e *testEnv) get(t *testing.T, path string) *http.Response {
 	return resp
 }
 
+// callbackFrom opens the callback the way the browser that started the flow
+// with state would: carrying the cookie /auth/oidc/start handed it. The
+// callback refuses a state with no matching cookie before it looks anything
+// up, so a test of what happens after that check has to get past it.
+func (e *testEnv) callbackFrom(t *testing.T, state string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, e.srv.URL+"/auth/oidc/callback?state="+state+"&code=x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.AddCookie(&http.Cookie{Name: "burrow_oidc_state", Value: state})
+	client := *e.srv.Client()
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
+}
+
 // A refused sign-in must be visible in the log at the level production runs
 // at: before this, an unknown state and a bad grant left nothing behind, so
 // "nobody can sign in" could not be told from "nobody tried". The line names
@@ -312,7 +594,7 @@ func TestSignInRefusalsAreLogged(t *testing.T) {
 	logs := captureLogs(t)
 
 	const state = "state-value-that-must-not-be-logged"
-	resp := e.get(t, "/auth/oidc/callback?state="+state+"&code=x")
+	resp := e.callbackFrom(t, state)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("unknown state must 400, got %d", resp.StatusCode)
 	}
@@ -349,7 +631,7 @@ func TestSignInStoreFailureIsNotABadCredential(t *testing.T) {
 	wantLogged(t, logs, []string{"level=ERROR", `msg="sign-in state save failed"`})
 
 	const state = "state-value-that-must-not-be-logged"
-	resp = e.get(t, "/auth/oidc/callback?state="+state+"&code=x")
+	resp = e.callbackFrom(t, state)
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("callback with the store down must 500, got %d", resp.StatusCode)
 	}
@@ -384,7 +666,7 @@ func TestCallbackFailuresAfterStateAreLogged(t *testing.T) {
 		if err := e.st.SaveOIDCState(context.Background(), state, verifier, true, time.Minute); err != nil {
 			t.Fatal(err)
 		}
-		resp := e.get(t, "/auth/oidc/callback?state="+state+"&code=x")
+		resp := e.callbackFrom(t, state)
 		if resp.StatusCode != http.StatusBadGateway {
 			t.Fatalf("a refused code must 502, got %d", resp.StatusCode)
 		}
@@ -398,7 +680,7 @@ func TestCallbackFailuresAfterStateAreLogged(t *testing.T) {
 		if err := e.st.SaveOIDCState(context.Background(), state, verifier, true, time.Minute); err != nil {
 			t.Fatal(err)
 		}
-		resp := e.get(t, "/auth/oidc/callback?state="+state+"&code=x")
+		resp := e.callbackFrom(t, state)
 		if resp.StatusCode != http.StatusInternalServerError {
 			t.Fatalf("a failed upsert must 500, got %d", resp.StatusCode)
 		}

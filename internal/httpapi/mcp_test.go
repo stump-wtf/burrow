@@ -2,6 +2,7 @@ package httpapi_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // mcpEnv mints an MCP token through the real endpoint.
@@ -289,6 +291,22 @@ func TestMCPAuthFailuresCarryRemintCodes(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "invalid_mcp_token") {
 		t.Fatalf("bad token must carry invalid_mcp_token, got %s", body)
+	}
+
+	// An expired token has its own code: the client remints on it, and
+	// folding it into invalid_mcp_token would hide which of the two happened.
+	expired, _, err := e.st.MintMCPToken(context.Background(), aliceSub, e.cfg.OrgID(), -time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, body = e.mcpPost(t, expired, map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+	})
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expired token must 401, got %d", resp.StatusCode)
+	}
+	if !strings.Contains(string(body), "expired_mcp_token") {
+		t.Fatalf("expired token must carry expired_mcp_token, got %s", body)
 	}
 }
 

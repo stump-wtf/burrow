@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/url"
 	"testing"
 	"time"
 )
@@ -106,8 +105,10 @@ func TestFreshSignInIsNotCappedByAnOlderSession(t *testing.T) {
 	e := newOIDCTestEnv(t)
 	const life = 3 * time.Second
 	deadline := time.Now().Add(life)
-	client := e.srv.Client()
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }
+	// One browser throughout: the callback only honors a state whose cookie
+	// this client was handed at /auth/oidc/start, and the issuer's code is
+	// bound to that flow's PKCE challenge.
+	client := newBrowser(t)
 	signIn := func() string {
 		t.Helper()
 		resp, err := client.Get(e.srv.URL + "/auth/oidc/start?desktop=1")
@@ -115,11 +116,7 @@ func TestFreshSignInIsNotCappedByAnOlderSession(t *testing.T) {
 			t.Fatal(err)
 		}
 		resp.Body.Close()
-		authorizeURL, err := url.Parse(resp.Header.Get("Location"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp, err = client.Get(e.srv.URL + "/auth/oidc/callback?state=" + url.QueryEscape(authorizeURL.Query().Get("state")) + "&code=test-code")
+		resp, err = client.Get(approve(t, resp.Header.Get("Location")))
 		if err != nil {
 			t.Fatal(err)
 		}

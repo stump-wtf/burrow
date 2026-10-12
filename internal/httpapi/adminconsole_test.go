@@ -189,7 +189,7 @@ func TestConsoleOIDCCallbackSetsSessionCookie(t *testing.T) {
 	}
 	client.CheckRedirect = nil
 
-	resp, err := client.Get(e.srv.URL + "/auth/oidc/callback?state=" + url.QueryEscape(state) + "&code=test-code")
+	resp, err := client.Get(approve(t, loc.String()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +235,7 @@ func TestConsoleOIDCCallbackSetsSessionCookie(t *testing.T) {
 	start.Body.Close()
 	loc, _ = url.Parse(start.Header.Get("Location"))
 	client.CheckRedirect = nil
-	resp, err = client.Get(e.srv.URL + "/auth/oidc/callback?state=" + url.QueryEscape(loc.Query().Get("state")) + "&code=test-code")
+	resp, err = client.Get(approve(t, loc.String()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +248,8 @@ func TestConsoleOIDCCallbackSetsSessionCookie(t *testing.T) {
 }
 
 // newOIDCClientFor points the console env's server at a fake issuer and
-// returns its HTTP client.
+// returns a browser for it: the client keeps the state cookie sign-in sets, so
+// the callback sees it started the flow.
 func newOIDCClientFor(t *testing.T, e *testEnv, issuer *fakeIssuer) *http.Client {
 	t.Helper()
 	client, err := oidc.New(context.Background(), issuer.srv.URL, "burrow-desktop", "secret",
@@ -259,7 +260,7 @@ func newOIDCClientFor(t *testing.T, e *testEnv, issuer *fakeIssuer) *http.Client
 	e.srv.Config.Handler = httpapi.New(e.cfg, e.st,
 		skills.NewCatalog(skills.Source{Dir: e.cfg.SkillsDir}),
 		providers.NewRuntime(e.st, time.Minute), client).Routes()
-	return e.srv.Client()
+	return newBrowser(t)
 }
 
 // The list, editor, create, update, delete, audit, and preview surfaces,

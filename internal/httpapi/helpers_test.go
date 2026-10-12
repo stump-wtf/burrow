@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -168,8 +170,42 @@ func nonEmptyString(t *testing.T, m map[string]any, key string) string {
 	return v
 }
 
-// fakeIssuer is a minimal OIDC provider: discovery, JWKS, and a token
-// endpoint that mints RS256 ID tokens with the claims burrow reads.
+// newBrowser returns an HTTP client with its own cookie jar that does not
+// follow redirects: one browser, as far as sign-in can tell. The state cookie
+// /auth/oidc/start sets comes back only from the client that received it, so
+// a flow started in one browser and finished in another is two of these.
+func newBrowser(t *testing.T) *http.Client {
+	t.Helper()
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &http.Client{
+		Jar:           jar,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+}
+
+// approve plays the member at the issuer: it opens the authorize URL burrow
+// redirected to and returns the callback URL the issuer sends the browser
+// back to, carrying a code bound to that flow's PKCE challenge.
+func approve(t *testing.T, authorizeURL string) string {
+	t.Helper()
+	resp, err := newBrowser(t).Get(authorizeURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("issuer authorize status %d for %s", resp.StatusCode, authorizeURL)
+	}
+	return resp.Header.Get("Location")
+}
+
+// fakeIssuer is a minimal OIDC provider: discovery, JWKS, an authorize
+// endpoint that issues codes bound to the S256 challenge it was shown, and a
+// token endpoint that redeems a code only for the matching code_verifier and
+// mints RS256 ID tokens with the claims burrow reads.
 type fakeIssuer struct {
 	srv       *httptest.Server
 	key       *rsa.PrivateKey
@@ -177,6 +213,14 @@ type fakeIssuer struct {
 	claimsSub func() string
 	// groups, when non-nil, is emitted as the ID token's groups claim.
 	groups any
+	// tamper, when non-nil, edits the ID token's claims before signing, and
+	// signKey, when non-nil, signs with a key the JWKS does not publish: the
+	// tokens a relying party must refuse.
+	tamper  func(claims map[string]any)
+	signKey *rsa.PrivateKey
+
+	mu         sync.Mutex
+	challenges map[string]string // authorization code -> S256 code_challenge
 }
 
 func newFakeIssuer(t *testing.T, clientID string) *fakeIssuer {
@@ -185,7 +229,7 @@ func newFakeIssuer(t *testing.T, clientID string) *fakeIssuer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fi := &fakeIssuer{key: key, clientID: clientID}
+	fi := &fakeIssuer{key: key, clientID: clientID, challenges: map[string]string{}}
 
 	mux := http.NewServeMux()
 	srv := httptest.NewServer(mux)
@@ -208,7 +252,22 @@ func newFakeIssuer(t *testing.T, clientID string) *fakeIssuer {
 		writeJSONString(w, fmt.Sprintf(`{"keys":[{"kty":"RSA","kid":"k1","alg":"RS256","use":"sig","n":%q,"e":"AQAB"}]}`, base64.RawURLEncoding.EncodeToString(key.N.Bytes())))
 	})
 
+	// A code is redeemed once, and only with the verifier whose S256 hash is
+	// the challenge shown at /authorize (RFC 7636 §4.6). Without this the
+	// suite passes with PKCE removed from burrow altogether.
 	mux.HandleFunc("POST /token", func(w http.ResponseWriter, r *http.Request) {
+		code := r.PostFormValue("code")
+		fi.mu.Lock()
+		challenge, issued := fi.challenges[code]
+		delete(fi.challenges, code)
+		fi.mu.Unlock()
+		sum := sha256.Sum256([]byte(r.PostFormValue("code_verifier")))
+		if !issued || base64.RawURLEncoding.EncodeToString(sum[:]) != challenge {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"error":"invalid_grant","error_description":"code_verifier does not match the code_challenge"}`)
+			return
+		}
 		idToken, err := fi.mintIDToken()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -217,10 +276,24 @@ func newFakeIssuer(t *testing.T, clientID string) *fakeIssuer {
 		writeJSONString(w, fmt.Sprintf(`{"access_token":"at","token_type":"Bearer","expires_in":3600,"id_token":%q}`, idToken))
 	})
 
+	// The member is always approved: record the challenge under a fresh code
+	// and send the browser back to the redirect URI with it.
 	mux.HandleFunc("GET /authorize", func(w http.ResponseWriter, r *http.Request) {
-		// The test drives the callback directly; the authorize page only
-		// needs to exist for redirects to resolve.
-		fmt.Fprint(w, "authorize")
+		q := r.URL.Query()
+		if q.Get("code_challenge") == "" || q.Get("code_challenge_method") != "S256" {
+			http.Error(w, "authorize needs an S256 code_challenge", http.StatusBadRequest)
+			return
+		}
+		buf := make([]byte, 16)
+		if _, err := rand.Read(buf); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		code := base64.RawURLEncoding.EncodeToString(buf)
+		fi.mu.Lock()
+		fi.challenges[code] = q.Get("code_challenge")
+		fi.mu.Unlock()
+		http.Redirect(w, r, q.Get("redirect_uri")+"?"+url.Values{"code": {code}, "state": {q.Get("state")}}.Encode(), http.StatusFound)
 	})
 
 	return fi
@@ -247,13 +320,20 @@ func (fi *fakeIssuer) mintIDToken() (string, error) {
 	if fi.groups != nil {
 		claims["groups"] = fi.groups
 	}
+	if fi.tamper != nil {
+		fi.tamper(claims)
+	}
+	key := fi.key
+	if fi.signKey != nil {
+		key = fi.signKey
+	}
 	payload, err := json.Marshal(claims)
 	if err != nil {
 		return "", err
 	}
 	signingInput := base64.RawURLEncoding.EncodeToString([]byte(header)) + "." + base64.RawURLEncoding.EncodeToString(payload)
 	digest := sha256.Sum256([]byte(signingInput))
-	sig, err := rsa.SignPKCS1v15(rand.Reader, fi.key, crypto.SHA256, digest[:])
+	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest[:])
 	if err != nil {
 		return "", err
 	}

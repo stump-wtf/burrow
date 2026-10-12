@@ -57,11 +57,20 @@ internal/httpapi    routes: auth pages, /api/den/v1/*, /mcp/agent
   `invalid_session`; expired → `session_expired`. Exchange failures use
   `invalid_grant`, which the client does not treat as session-terminating —
   right, since a typo'd paste must not sign the desktop app out.
-- **OIDC state without cookies.** The client contract forbids cookies on the
-  API, not on the browser flow, but burrow still keeps the sign-in flow
-  cookie-free: the state parameter is the key to a server-side (state,
-  verifier, desktop) row with a 10-minute TTL. The `OIDCClient` interface in
-  httpapi exists so the full flow is testable against a fake issuer.
+- **OIDC state bound to the browser.** The state parameter is the key to a
+  server-side (state, verifier, desktop) row with a 10-minute TTL, and
+  `/auth/oidc/start` also hands the same state to the browser in a
+  `burrow_oidc_state` cookie (HttpOnly, SameSite=Lax, `Path=/auth/oidc`,
+  Secure on https, same TTL). The callback refuses a state that does not
+  match the cookie, before the row is consumed, and clears the cookie when it
+  does. The row alone proves burrow issued the state, not who holds it: the
+  flow was cookie-free at first, and a callback URL from a flow someone else
+  had started and authenticated signed whoever opened it into that account
+  (login CSRF). The client contract forbids cookies on the API, not on the
+  browser flow, and the desktop sign-in is one: the app opens `/` in a
+  browser, and start, issuer and callback all happen there. The `OIDCClient`
+  interface in httpapi exists so the full flow is testable against a fake
+  issuer.
 - **Expired rows are swept, not just refused.** Every lookup checks
   `expires_at` itself, and that check is the enforcement. Separately,
   `Store.PurgeExpired` deletes sessions, grants, sign-in states and MCP tokens
