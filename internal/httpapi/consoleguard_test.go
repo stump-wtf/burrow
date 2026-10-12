@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"gitea.stump.rocks/stump.wtf/burrow/internal/store"
 )
@@ -138,7 +139,7 @@ func TestConsoleRefusesCrossOriginPosts(t *testing.T) {
 
 			// Put back whatever a forgery got through, so each case starts
 			// from the same state and reports on its own.
-			_ = e.st.DeleteProvider(context.Background(), "lpr_forged", "test")
+			_ = e.st.DeleteProvider(context.Background(), "lpr_forged", time.Time{}, "test")
 			_ = e.st.ForgetSkillPack(context.Background(), adminGroup)
 			if _, err := e.st.GetProvider(context.Background(), "lpr_family"); err == store.ErrNotFound {
 				seedConsoleRow(t, e, family)

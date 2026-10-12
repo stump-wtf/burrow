@@ -394,6 +394,68 @@ func TestConsoleProviderLifecycle(t *testing.T) {
 	mustNotContain(t, page, "test-key-value") // secrets never render
 }
 
+// The confirm page shows one version of a row; the confirm POST deletes only
+// that version. A row another admin changed in between — here a scratch row
+// nobody could see became the org-wide one — survives with an explanation,
+// and a POST that carries no usable etag is refused rather than deleting
+// blind.
+func TestConsoleDeleteRefusesAChangedRow(t *testing.T) {
+	e := newConsoleEnv(t)
+	ctx := context.Background()
+	seedConsoleRow(t, e, store.ProviderRow{
+		ID: "lpr_a", ProviderID: "litellm", Name: "Scratch", BaseURL: "http://127.0.0.1:1/v1",
+		APIKeyEnv: "LLM_CONSOLE_KEY", Groups: []string{"nobody"}, NameOverrides: map[string]string{},
+	})
+
+	_, page := e.consoleGet(t, "/admin/providers/lpr_a/delete")
+	mustContain(t, page, "Delete Scratch?")
+	shown := consoleEtagOf(t, page)
+
+	if _, err := e.st.UpdateProvider(ctx, store.ProviderRow{
+		ID: "lpr_a", ProviderID: "litellm", Name: "Production (org-wide)", BaseURL: "http://127.0.0.1:1/v1",
+		APIKeyEnv: "LLM_CONSOLE_KEY", Groups: nil, NameOverrides: map[string]string{},
+	}, time.Time{}, "other-admin"); err != nil {
+		t.Fatalf("concurrent update: %v", err)
+	}
+
+	stillThere := func(when string) {
+		t.Helper()
+		if _, err := e.st.GetProvider(ctx, "lpr_a"); err != nil {
+			t.Fatalf("%s must leave the row, got %v", when, err)
+		}
+	}
+
+	resp, page := e.consolePost(t, "/admin/providers/lpr_a/delete", url.Values{"etag": {shown}})
+	if resp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("delete with the stale confirm etag: status %d: %s", resp.StatusCode, page)
+	}
+	mustContain(t, page, "changed since the confirm step")
+	stillThere("a stale confirm")
+
+	resp, page = e.consolePost(t, "/admin/providers/lpr_a/delete", url.Values{"etag": {"garbage"}})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("delete with a malformed etag: status %d: %s", resp.StatusCode, page)
+	}
+	stillThere("a malformed etag")
+
+	resp, page = e.consolePost(t, "/admin/providers/lpr_a/delete", url.Values{})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("delete with no etag: status %d: %s", resp.StatusCode, page)
+	}
+	stillThere("a missing etag")
+
+	// Confirming again, against the row as it now is, deletes it.
+	_, page = e.consoleGet(t, "/admin/providers/lpr_a/delete")
+	mustContain(t, page, "Delete Production (org-wide)?")
+	resp, page = e.consolePost(t, "/admin/providers/lpr_a/delete", url.Values{"etag": {consoleEtagOf(t, page)}})
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("delete with the fresh confirm etag: status %d: %s", resp.StatusCode, page)
+	}
+	if _, err := e.st.GetProvider(ctx, "lpr_a"); err != store.ErrNotFound {
+		t.Fatalf("deleted row must be gone, got %v", err)
+	}
+}
+
 // The preview answers exactly what the runtime would serve a member of the
 // picked group: null-audience rows plus that group's rows, nothing else.
 func TestConsoleVisibilityPreview(t *testing.T) {

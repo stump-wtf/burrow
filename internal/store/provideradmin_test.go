@@ -166,6 +166,48 @@ func TestUpdateProviderStalePrecondition(t *testing.T) {
 	}
 }
 
+// A delete that names the version it read removes only that version: after
+// another writer lands, the same expectation is ErrStale, the row and the
+// winner's change survive, and nothing is audited for the refused delete.
+func TestDeleteProviderStalePrecondition(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	if err := st.CreateProvider(ctx, testProviderRow("lpr_a"), "alice"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	read, err := st.GetProvider(ctx, "lpr_a")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	winner := testProviderRow("lpr_a")
+	winner.Name = "Winner"
+	current, err := st.UpdateProvider(ctx, winner, read.UpdatedAt, "winner")
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	if err := st.DeleteProvider(ctx, "lpr_a", read.UpdatedAt, "loser"); !errors.Is(err, store.ErrStale) {
+		t.Fatalf("stale expectation must be ErrStale, got %v", err)
+	}
+	got, err := st.GetProvider(ctx, "lpr_a")
+	if err != nil || got.Name != "Winner" {
+		t.Fatalf("a stale delete must leave the winner's row, got %q, %v", got.Name, err)
+	}
+	if actions := actionsOf(auditFor(t, st, "lpr_a")); strings.Join(actions, ",") != "update,create" {
+		t.Fatalf("a refused delete must not be audited, got %v", actions)
+	}
+
+	if err := st.DeleteProvider(ctx, "lpr_a", current, "alice"); err != nil {
+		t.Fatalf("delete with the current expectation: %v", err)
+	}
+	if _, err := st.GetProvider(ctx, "lpr_a"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("deleted row must be gone, got %v", err)
+	}
+	if err := st.DeleteProvider(ctx, "lpr_a", current, "alice"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("a missing row is ErrNotFound whatever the expectation, got %v", err)
+	}
+}
+
 func TestDeleteAndAuditTrail(t *testing.T) {
 	st := openTestStore(t)
 	ctx := context.Background()
@@ -178,10 +220,10 @@ func TestDeleteAndAuditTrail(t *testing.T) {
 	if _, err := st.UpdateProvider(ctx, row, time.Time{}, "ci-token"); err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	if err := st.DeleteProvider(ctx, "lpr_a", "alice"); err != nil {
+	if err := st.DeleteProvider(ctx, "lpr_a", time.Time{}, "alice"); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	if err := st.DeleteProvider(ctx, "lpr_a", "alice"); !errors.Is(err, store.ErrNotFound) {
+	if err := st.DeleteProvider(ctx, "lpr_a", time.Time{}, "alice"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("second delete must be ErrNotFound, got %v", err)
 	}
 

@@ -26,7 +26,9 @@ implements: [ADR-0004]
 - **ETag = quoted `updated_at` RFC3339Nano.** PUT is a full replace; a
   missing `If-Match` is `428 Precondition Required` rather than a silent
   clobber, because the whole point of the API is automation without lost
-  updates.
+  updates. DELETE takes `If-Match` optionally: absent, it deletes by id
+  (automation that only knows the id); present, `DeleteProvider` checks it
+  inside the same row lock `UpdateProvider` uses and a stale one is `412`.
 - **One middleware, two credentials.** `requireAdmin` runs before the
   handler: API-token bearer first (its hash exists in `api_tokens` and holds
   `llm-admin`), else the normal session lookup plus the `BURROW_ADMIN_GROUPS`
@@ -57,6 +59,11 @@ implements: [ADR-0004]
   gate and wires the audit actor; reads call the same store functions the
   API's handlers call. No loopback HTTP hop: the edge proxy owns the public
   origin, so a self-call could not reliably reach the process.
+- **Delete confirm carries the etag.** The confirm page puts the row's etag
+  in a hidden field and the confirm POST sends it as `If-Match`. Because the
+  API's DELETE is unconditional without `If-Match`, the console itself
+  refuses a confirm POST whose etag is missing or malformed rather than
+  forwarding it (2026-10-12).
 - **Browser session = the session token in a cookie.** The non-desktop OIDC
   callback mints a session and sets `burrow_session` (HttpOnly,
   SameSite=Lax, Secure on https, `SessionTTL`); the desktop deep-link flow

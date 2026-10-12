@@ -584,3 +584,79 @@ func TestAdminAPITokenLifecycle(t *testing.T) {
 		t.Fatalf("out-of-scope token: status %d body %#v", resp.StatusCode, refused)
 	}
 }
+
+// DELETE honors If-Match when the caller sends one: a stale etag is 412 with
+// the current row (the row survives), a malformed one is 400, and a fresh
+// one deletes. Without the header DELETE stays unconditional, which is what
+// automation that only knows the id relies on.
+func TestAdminDeleteHonorsIfMatch(t *testing.T) {
+	e := newAdminTestEnv(t)
+	signInAs(t, e, "stumpcloud-admins")
+	const path = "/api/den/v1/admin/llm-providers/lpr_del"
+
+	var created any
+	if resp := adminDo(t, e, http.MethodPost, "/api/den/v1/admin/llm-providers",
+		providerBody("lpr_del", "Scratch", "https://gw.example/v1", "KEY_DEL"), &created, "", ""); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create: status %d", resp.StatusCode)
+	}
+	shown := adminRow(t, created)["etag"].(string)
+
+	// Another writer replaces the row after the etag was read.
+	var updated any
+	if resp := adminDo(t, e, http.MethodPut, path,
+		providerBody("lpr_del", "Production", "https://gw.example/v1", "KEY_DEL"), &updated, "", shown); resp.StatusCode != http.StatusOK {
+		t.Fatalf("update: status %d", resp.StatusCode)
+	}
+	current := adminRow(t, updated)["etag"].(string)
+
+	resp := adminDo(t, e, http.MethodDelete, path, nil, nil, "", shown)
+	if resp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("DELETE with a stale If-Match must 412, got %d", resp.StatusCode)
+	}
+	var stale any
+	if err := json.NewDecoder(resp.Body).Decode(&stale); err != nil {
+		t.Fatalf("412 body: %v", err)
+	}
+	if row := adminRow(t, stale); row["name"] != "Production" || row["etag"] != current {
+		t.Fatalf("412 body must carry the current row: %#v", row)
+	}
+	if resp := adminDo(t, e, http.MethodGet, path, nil, nil, "", ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("a refused delete must leave the row, got %d", resp.StatusCode)
+	}
+
+	if resp := adminDo(t, e, http.MethodDelete, path, nil, nil, "", `"not-an-etag"`); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("DELETE with a malformed If-Match must 400, got %d", resp.StatusCode)
+	}
+	if resp := adminDo(t, e, http.MethodGet, path, nil, nil, "", ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("a malformed precondition must leave the row, got %d", resp.StatusCode)
+	}
+
+	if resp := adminDo(t, e, http.MethodDelete, path, nil, nil, "", current); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("DELETE with a fresh If-Match must 204, got %d", resp.StatusCode)
+	}
+	if resp := adminDo(t, e, http.MethodGet, path, nil, nil, "", ""); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("deleted row must 404, got %d", resp.StatusCode)
+	}
+
+	// No header: unconditional, as before.
+	if resp := adminDo(t, e, http.MethodPost, "/api/den/v1/admin/llm-providers",
+		providerBody("lpr_del", "Scratch", "https://gw.example/v1", "KEY_DEL"), nil, "", ""); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("recreate: status %d", resp.StatusCode)
+	}
+	if resp := adminDo(t, e, http.MethodDelete, path, nil, nil, "", ""); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("DELETE without If-Match must still 204, got %d", resp.StatusCode)
+	}
+
+	// Only the two deletes that happened are audited; a refused one is not.
+	var audit any
+	e.getJSON(t, "/api/den/v1/admin/audit", &audit)
+	deletes := 0
+	for _, entry := range listOf(t, mapOf(t, audit)["audit"]) {
+		if mapOf(t, entry)["action"] == "delete" {
+			deletes++
+		}
+	}
+	if deletes != 2 {
+		t.Fatalf("audit must record exactly the two deletes that landed, got %d", deletes)
+	}
+}
