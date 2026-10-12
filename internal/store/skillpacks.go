@@ -18,10 +18,32 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 )
+
+// ErrSkillPacksChanged is returned by SaveSkillPacks when the rules in the
+// store are no longer the ones the caller's revision was computed from.
+var ErrSkillPacksChanged = errors.New("store: skill packs changed since they were read")
+
+// lockSkillPacks serializes every writer of the two pack tables for the rest
+// of the transaction. Row locks are not enough here: a group's allowance is
+// replaced by delete-then-insert, and at READ COMMITTED a second writer's
+// DELETE cannot see the rows the first one has just inserted, so two saves of
+// one group either merged into an allowance wider than either wrote or died on
+// the primary key. Readers take ACCESS SHARE and are not blocked.
+func lockSkillPacks(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `LOCK TABLE skill_packs, skill_pack_skills IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+		return fmt.Errorf("store: lock skill packs: %w", err)
+	}
+	return nil
+}
 
 // SetSkillPack declares one group's whole allowance in a single transaction,
 // so a failed insert cannot leave the group half-mapped. An empty list is a
@@ -37,6 +59,18 @@ func (s *Store) SetSkillPack(ctx context.Context, group string, skills []string)
 		return fmt.Errorf("store: begin set skill pack: %w", err)
 	}
 	defer tx.Rollback()
+	if err := lockSkillPacks(ctx, tx); err != nil {
+		return err
+	}
+	if err := setSkillPack(ctx, tx, group, skills); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// setSkillPack replaces one group's allowance inside a transaction that
+// already holds lockSkillPacks.
+func setSkillPack(ctx context.Context, tx *sql.Tx, group string, skills []string) error {
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO skill_packs (pack_group, created_at) VALUES ($1, $2)
 ON CONFLICT (pack_group) DO NOTHING`, group, now()); err != nil {
@@ -52,7 +86,75 @@ ON CONFLICT (pack_group) DO NOTHING`, group, now()); err != nil {
 			return fmt.Errorf("store: map skill %s to group %q: %w", skill, group, err)
 		}
 	}
+	return nil
+}
+
+// SaveSkillPacks applies one console save — every declared column and every
+// withdrawn one — in a single transaction, and only if the rules in the store
+// still fingerprint to revision. A page rendered before another admin's save
+// therefore changes nothing and gets ErrSkillPacksChanged, instead of writing
+// its older picture of the matrix over the newer one.
+func (s *Store) SaveSkillPacks(ctx context.Context, revision string, declare map[string][]string, forget []string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin save skill packs: %w", err)
+	}
+	defer tx.Rollback()
+	if err := lockSkillPacks(ctx, tx); err != nil {
+		return err
+	}
+	current, err := listSkillPacks(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if SkillPacksRevision(current) != revision {
+		return ErrSkillPacksChanged
+	}
+	for _, group := range forget {
+		if group = strings.TrimSpace(group); group == "" {
+			return fmt.Errorf("store: skill pack needs a group name")
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM skill_packs WHERE pack_group = $1`, group); err != nil {
+			return fmt.Errorf("store: forget skill pack %q: %w", group, err)
+		}
+	}
+	groups := make([]string, 0, len(declare))
+	for group := range declare {
+		groups = append(groups, group)
+	}
+	sort.Strings(groups)
+	for _, group := range groups {
+		name := strings.TrimSpace(group)
+		if name == "" {
+			return fmt.Errorf("store: skill pack needs a group name")
+		}
+		if err := setSkillPack(ctx, tx, name, declare[group]); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
+}
+
+// SkillPacksRevision fingerprints a set of rules, independent of map and slice
+// order. The console renders it into the matrix form and SaveSkillPacks checks
+// it, which is how a save proves it was made from the rules still in force.
+func SkillPacksRevision(packs map[string][]string) string {
+	groups := make([]string, 0, len(packs))
+	for group := range packs {
+		groups = append(groups, group)
+	}
+	sort.Strings(groups)
+	canonical := make([][]string, 0, len(groups))
+	for _, group := range groups {
+		skills := append([]string{}, packs[group]...)
+		sort.Strings(skills)
+		canonical = append(canonical, append([]string{group}, skills...))
+	}
+	// Marshalling [][]string cannot fail, and JSON quoting keeps a name that
+	// contains a separator from colliding with two shorter names.
+	encoded, _ := json.Marshal(canonical)
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
 }
 
 // ForgetSkillPack withdraws one group's rule entirely, returning it to "no rule
@@ -75,7 +177,14 @@ func (s *Store) ForgetSkillPack(ctx context.Context, group string) error {
 // allowance is empty — that emptiness is the rule — while a group nobody has
 // declared is absent.
 func (s *Store) ListSkillPacks(ctx context.Context) (map[string][]string, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	return listSkillPacks(ctx, s.db)
+}
+
+// listSkillPacks reads the rules through the pool or through a transaction.
+func listSkillPacks(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}) (map[string][]string, error) {
+	rows, err := q.QueryContext(ctx, `
 SELECT p.pack_group, k.skill
 FROM skill_packs p
 LEFT JOIN skill_pack_skills k ON k.pack_group = p.pack_group
