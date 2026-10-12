@@ -238,14 +238,28 @@ func TestAdminWriteValidation(t *testing.T) {
 		{"id without the lpr_ prefix", providerBody("admin", "X", "https://gw.example/v1", "K"), "invalid_row"},
 		{"relative baseURL", providerBody("lpr_x", "X", "gw.example:4000", "K"), "invalid_row"},
 		{"apiKeyEnv is not an env name", providerBody("lpr_x", "X", "https://gw.example/v1", "not an env"), "invalid_row"},
+		// "/models" must land in the path, and a credential in the URL
+		// would be served to every member in providerConfig.
+		{"baseURL with a query string", providerBody("lpr_x", "X", "https://gw.example/v1?x=", "K"), "invalid_row"},
+		{"baseURL with a fragment", providerBody("lpr_x", "X", "https://gw.example/v1#x", "K"), "invalid_row"},
+		{"baseURL with userinfo", providerBody("lpr_x", "X", "https://user:pass@gw.example/v1", "K"), "invalid_row"},
 		// burrow's own configuration, secrets included, must never be
 		// nameable as a key: /connect would hand it to members and the menu
 		// fetch would send it to whatever baseURL the writer chose.
 		{"apiKeyEnv names burrow's database URL", providerBody("lpr_x", "X", "https://gw.example/v1", "BURROW_DATABASE_URL"), "invalid_row"},
 		{"apiKeyEnv names burrow's OIDC secret", providerBody("lpr_x", "X", "https://gw.example/v1", "BURROW_OIDC_CLIENT_SECRET"), "invalid_row"},
+		// The namespace is reserved in any letter case: the check folds
+		// the name first, and only upper-case spellings were covered.
+		{"apiKeyEnv names burrow's namespace in lower case", providerBody("lpr_x", "X", "https://gw.example/v1", "burrow_oidc_client_secret"), "invalid_row"},
 		{"empty groups list", func() map[string]any {
 			m := providerBody("lpr_x", "X", "https://gw.example/v1", "K")
 			m["groups"] = []string{}
+			return m
+		}(), "invalid_row"},
+		// " family" matches no member: stored, it is a row served to nobody.
+		{"group name with surrounding whitespace", func() map[string]any {
+			m := providerBody("lpr_x", "X", "https://gw.example/v1", "K")
+			m["groups"] = []string{" family"}
 			return m
 		}(), "invalid_row"},
 		{"models field is no longer a thing", func() map[string]any {
@@ -272,6 +286,181 @@ func TestAdminWriteValidation(t *testing.T) {
 	e.getJSON(t, "/api/den/v1/admin/llm-providers", &listed)
 	if rows := listOf(t, mapOf(t, listed)["llmProviders"]); len(rows) != 0 {
 		t.Fatalf("rejected writes must not persist, got %#v", rows)
+	}
+}
+
+// A row id is a path segment — /connect on the desktop surface, the admin
+// routes, the console's links — so an id that needs escaping, or that reads
+// as another route, is refused at the write rather than stored and found
+// unaddressable later (SPEC-0004 REQ "Rows in the store").
+func TestAdminRejectsUnaddressableRowIDs(t *testing.T) {
+	e := newAdminTestEnv(t)
+	signInAs(t, e, "stumpcloud-admins")
+
+	for name, id := range map[string]string{
+		"slash":                 "lpr_a/b",
+		"bare prefix":           "lpr_",
+		"space and newline":     "lpr_x y\n",
+		"dot segments":          "lpr_../admin",
+		"console action suffix": "lpr_a/delete",
+		"100 KB":                "lpr_" + strings.Repeat("a", 100<<10),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var out any
+			resp := adminDo(t, e, http.MethodPost, "/api/den/v1/admin/llm-providers",
+				providerBody(id, "X", "https://gw.example/v1", "K"), &out, "", "")
+			if resp.StatusCode != http.StatusBadRequest || mapOf(t, out)["error"] != "invalid_row" {
+				t.Fatalf("id %.40q: status %d, want 400 invalid_row", id, resp.StatusCode)
+			}
+		})
+	}
+
+	var listed any
+	e.getJSON(t, "/api/den/v1/admin/llm-providers", &listed)
+	if rows := listOf(t, mapOf(t, listed)["llmProviders"]); len(rows) != 0 {
+		t.Fatalf("rejected ids must not persist, got %d rows", len(rows))
+	}
+}
+
+// The id rule binds writes, not rows already stored: a row an older build
+// accepted must still be read and deleted, or an operator could never clean
+// it up.
+func TestAdminOddStoredRowIDStaysReadableAndDeletable(t *testing.T) {
+	e := newAdminTestEnv(t)
+	signInAs(t, e, "stumpcloud-admins")
+	seedProviders(t, e, store.ProviderRow{ID: "lpr_a/b", BaseURL: "https://gw.example/v1", APIKeyEnv: "K"})
+
+	const path = "/api/den/v1/admin/llm-providers/lpr_a%2Fb"
+	var got any
+	if resp := adminDo(t, e, http.MethodGet, path, nil, &got, "", ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("a stored odd id must still be readable, got %d", resp.StatusCode)
+	}
+	if adminRow(t, got)["id"] != "lpr_a/b" {
+		t.Fatalf("read row: %#v", got)
+	}
+	if resp := adminDo(t, e, http.MethodDelete, path, nil, nil, "", ""); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("a stored odd id must still be deletable, got %d", resp.StatusCode)
+	}
+	if resp := adminDo(t, e, http.MethodGet, path, nil, nil, "", ""); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("deleted row must 404, got %d", resp.StatusCode)
+	}
+}
+
+// A control character is the writer's mistake, so it is a 400 naming the
+// field like any other invalid row — never a value handed to Postgres, which
+// refuses a NUL in TEXT and used to surface that as "500 store unavailable".
+func TestAdminControlCharactersAre400(t *testing.T) {
+	e := newAdminTestEnv(t)
+	signInAs(t, e, "stumpcloud-admins")
+
+	cases := map[string]func(map[string]any){
+		"NUL in name":        func(m map[string]any) { m["name"] = "Admin\x00Row" },
+		"NUL in providerId":  func(m map[string]any) { m["providerId"] = "lite\x00llm" },
+		"newline in name":    func(m map[string]any) { m["name"] = "Admin\nRow" },
+		"newline in a group": func(m map[string]any) { m["groups"] = []string{"fam\nily"} },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			body := providerBody("lpr_x", "X", "https://gw.example/v1", "K")
+			mutate(body)
+			var out any
+			resp := adminDo(t, e, http.MethodPost, "/api/den/v1/admin/llm-providers", body, &out, "", "")
+			if resp.StatusCode != http.StatusBadRequest || mapOf(t, out)["error"] != "invalid_row" {
+				t.Fatalf("status %d body %#v, want 400 invalid_row", resp.StatusCode, out)
+			}
+		})
+	}
+
+	var listed any
+	e.getJSON(t, "/api/den/v1/admin/llm-providers", &listed)
+	if rows := listOf(t, mapOf(t, listed)["llmProviders"]); len(rows) != 0 {
+		t.Fatalf("rejected writes must not persist, got %#v", rows)
+	}
+}
+
+// One request is one JSON object. Anything after it — a second object, a
+// stray token — means the payload is not what its author thinks it is, and
+// accepting the first value would be the silent drop that rejecting unknown
+// fields exists to prevent.
+func TestAdminRejectsTrailingJSON(t *testing.T) {
+	e := newAdminTestEnv(t)
+	signInAs(t, e, "stumpcloud-admins")
+
+	post := func(t *testing.T, body string) (int, map[string]any) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, e.srv.URL+"/api/den/v1/admin/llm-providers", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+e.token)
+		resp, err := e.srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out any
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		return resp.StatusCode, mapOf(t, out)
+	}
+	row := func(id string) string {
+		return `{"id":"` + id + `","providerId":"litellm","name":"X","baseURL":"https://gw.example/v1","apiKeyEnv":"K"}`
+	}
+
+	for name, body := range map[string]string{
+		"a second object":     row("lpr_first") + row("lpr_second"),
+		"an unknown field":    row("lpr_first") + ` {"models":[]}`,
+		"garbage":             row("lpr_first") + ` garbage`,
+		"a closing delimiter": row("lpr_first") + `}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			status, out := post(t, body)
+			if status != http.StatusBadRequest || out["error"] != "invalid_request" {
+				t.Fatalf("status %d body %#v, want 400 invalid_request", status, out)
+			}
+		})
+	}
+	var listed any
+	e.getJSON(t, "/api/den/v1/admin/llm-providers", &listed)
+	if rows := listOf(t, mapOf(t, listed)["llmProviders"]); len(rows) != 0 {
+		t.Fatalf("rejected writes must not persist, got %#v", rows)
+	}
+
+	// Trailing whitespace is not trailing data: `curl -d @row.json` sends
+	// the file's final newline.
+	if status, out := post(t, row("lpr_first")+"\n \t\n"); status != http.StatusCreated {
+		t.Fatalf("a trailing newline must still be accepted, got %d %#v", status, out)
+	}
+}
+
+// PUT is a write like POST and goes through the same gate: a valid row must
+// not be replaceable by one that names burrow's own configuration as its key.
+// TestAdminWriteValidation only POSTs, so it stays green with the PUT
+// handler's validation removed.
+func TestAdminUpdateValidatesTheReplacement(t *testing.T) {
+	e := newAdminTestEnv(t)
+	signInAs(t, e, "stumpcloud-admins")
+
+	var created any
+	if resp := adminDo(t, e, http.MethodPost, "/api/den/v1/admin/llm-providers",
+		providerBody("lpr_admin", "Admin Row", "https://gw.example/v1", "KEY_ADMIN"), &created, "", ""); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create: status %d", resp.StatusCode)
+	}
+	etag := adminRow(t, created)["etag"].(string)
+
+	var refused any
+	resp := adminDo(t, e, http.MethodPut, "/api/den/v1/admin/llm-providers/lpr_admin",
+		providerBody("lpr_admin", "Admin Row", "https://gw.example/v1", "BURROW_DATABASE_URL"), &refused, "", etag)
+	if resp.StatusCode != http.StatusBadRequest || mapOf(t, refused)["error"] != "invalid_row" {
+		t.Fatalf("PUT naming burrow's database URL as the key: status %d body %#v, want 400 invalid_row", resp.StatusCode, refused)
+	}
+
+	var after any
+	adminDo(t, e, http.MethodGet, "/api/den/v1/admin/llm-providers/lpr_admin", nil, &after, "", "")
+	if row := adminRow(t, after); row["apiKeyEnv"] != "KEY_ADMIN" || row["etag"] != etag {
+		t.Fatalf("a refused PUT must leave the row untouched: %#v", row)
 	}
 }
 

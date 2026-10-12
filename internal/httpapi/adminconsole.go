@@ -271,7 +271,7 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 {{if .IsNew}}
 <label for="id">Row id (lpr_&hellip;)</label>
 <input type="text" id="id" name="id" value="{{.Row.ID}}">
-<p class="hint">Unique; must match /^lpr_/i.</p>
+<p class="hint">Unique; lpr_ followed by 1 to 64 letters, digits, _ or -.</p>
 {{end}}
 <label for="providerId">Gateway provider id</label>
 <input type="text" id="providerId" name="providerId" value="{{.Row.ProviderID}}">

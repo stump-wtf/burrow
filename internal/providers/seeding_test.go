@@ -119,3 +119,29 @@ func TestSeededRowServesNoModelsWithoutKey(t *testing.T) {
 		}
 	}
 }
+
+// A value the store cannot hold must fail the file at validation, before the
+// first insert: failing in Postgres on the second row leaves the first one
+// committed, and a non-empty table is never seeded again.
+func TestSeedRejectsControlCharactersBeforeInserting(t *testing.T) {
+	st := storetest.Open(t)
+	ctx := context.Background()
+	const file = `{"providers": [
+    {"id": "lpr_local", "providerId": "litellm", "name": "Local",
+     "baseURL": "https://gw.example/v1", "apiKeyEnv": "KEY_LOCAL"},
+    {"id": "lpr_owner", "providerId": "litellm", "name": "Own\u0000er",
+     "baseURL": "https://gw.example/v1", "apiKeyEnv": "KEY_OWNER"}
+  ]}`
+
+	seeded, _, err := providers.SeedFromFile(ctx, st, writeProvidersFile(t, file))
+	if err == nil {
+		t.Fatal("a NUL in a name must fail the seed")
+	}
+	n, countErr := st.CountProviders(ctx)
+	if countErr != nil {
+		t.Fatal(countErr)
+	}
+	if seeded != 0 || n != 0 {
+		t.Fatalf("a refused file must insert nothing, seeded=%d stored=%d (error: %v)", seeded, n, err)
+	}
+}

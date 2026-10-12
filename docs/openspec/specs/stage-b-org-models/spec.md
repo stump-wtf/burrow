@@ -25,7 +25,8 @@ contract.
 
 Providers SHALL be defined in a JSON file named by `BURROW_PROVIDERS_FILE`
 (optional; unset serves none, preserving the Stage A empties). Each
-definition SHALL carry `id` (matching `/^lpr_/i`), `providerId`, `name`,
+definition SHALL carry `id` (matching `/^lpr_/i`; SPEC-0004 REQ "Rows in the
+store" bounds its charset and length), `providerId`, `name`,
 `baseURL` (absolute http(s)), `apiKeyEnv` (an environment variable name), and
 `models[]` where every model has `id`, `name`, and an optional `config`
 object. Load SHALL fail the whole file on any violation — duplicate ids

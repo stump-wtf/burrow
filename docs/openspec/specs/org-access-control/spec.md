@@ -46,6 +46,9 @@ A provider definition and each of its models MAY carry `groups`, a non-empty
 array of non-empty strings. Load SHALL fail on an empty `groups` array or an
 empty entry, because "visible to nobody" written as `[]` is indistinguishable
 from a mistake.
+A row-level entry with leading or trailing whitespace SHALL fail
+the same way (SPEC-0004 REQ "Rows in the store"): groups are compared exactly,
+so it names an audience no member holds.
 
 ### Requirement: Visibility
 

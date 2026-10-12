@@ -19,14 +19,26 @@ menu's source moves.
 
 ### Requirement: Rows in the store
 
-The store SHALL carry an `llm_providers` table: `id` (matching `/^lpr_/i`,
-unique), `providerId`, `name`, `baseURL` (absolute http(s)), `apiKeyEnv` (an
+The store SHALL carry an `llm_providers` table: `id` (the contract's
+`/^lpr_/i` prefix followed by 1 to 64 of `[A-Za-z0-9_-]`,
+unique), `providerId`, `name`, `baseURL` (absolute http(s), with no query
+string, fragment or userinfo), `apiKeyEnv` (an
 environment-variable name, never one in burrow's own `BURROW_` namespace), `groups` (NULL for every member; otherwise a
-non-empty JSON array of non-empty strings — an empty array is invalid, per
-SPEC-0003), `nameOverrides` (JSON object, model id to display name),
+non-empty JSON array of non-empty strings with no leading or trailing
+whitespace — an empty array is invalid, per SPEC-0003, and an untrimmed name
+would match no member), `nameOverrides` (JSON object, model id to display name),
 `created_at`, `updated_at`. Writes SHALL apply the same validation
 `providers.Load` applied to the file; an invalid write SHALL be rejected
-without touching the served set.
+without touching the served set. The `id` is a URL path segment on
+`/connect`, the admin routes and the console, which is why nothing that
+would need escaping there is accepted; the rule binds writes, so a row
+already stored under an id it refuses SHALL stay readable and deletable.
+`baseURL` is an origin and a path only because the row's key is sent to
+`{baseURL}/models` and the value is served to every member: `/models` SHALL
+be joined to it as a path element, never appended as text.
+`providerId`, `name` and group names SHALL NOT contain control characters:
+the store cannot hold a NUL, and such a value is the writer's error (`400`),
+never a store failure.
 
 #### Scenario: First-boot seed
 
@@ -69,7 +81,8 @@ existing id), `GET|PUT|DELETE /{id}` (PUT replaces; `404` unknown id; `428`
 PUT without `If-Match`; `412` stale `If-Match`, whose body carries the
 current row). `etag` SHALL be the row's `updated_at` (quoted). These routes
 are burrow-designed (outside the client contract): error codes are burrow's
-own, and unknown fields SHALL be rejected rather than ignored.
+own, and unknown fields SHALL be rejected rather than ignored, as SHALL a
+body that carries anything after its one JSON object.
 
 ### Requirement: Admin authorization
 

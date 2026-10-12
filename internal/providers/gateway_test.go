@@ -414,3 +414,95 @@ func TestMenuFollowsARepointedRow(t *testing.T) {
 		t.Fatalf("a repointed row must serve its new gateway's menu at once, got %s", got)
 	}
 }
+
+// The other half of a repoint: the same gateway, another key. The menu is the
+// key's scope, so a row switched to a second key must stop serving the first
+// key's models at once, not when the TTL runs out. Keying the cache on baseURL
+// alone passes TestMenuFollowsARepointedRow and fails this.
+func TestMenuFollowsARowRepointedByKeyOnly(t *testing.T) {
+	st := storetest.Open(t)
+	byKey := map[string]string{"sk-old-key": "gpt-5", "sk-new-key": "qwen-27b"}
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, ok := byKey[strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")]
+		if !ok {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		fmt.Fprintf(w, `{"data":[{"id":%q}]}`, id)
+	}))
+	t.Cleanup(gw.Close)
+	t.Setenv("GW_KEY", "sk-old-key")
+	t.Setenv("GW_KEY_NEW", "sk-new-key")
+	row := gatewayRow(gw.URL)
+	seedRow(t, st, row)
+	runtime := providers.NewRuntime(st, time.Hour)
+
+	rows, err := runtime.RowsFor(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := menuIDs(rows[0].Models); got != "gpt-5" {
+		t.Fatalf("old key's menu: %s", got)
+	}
+
+	read, err := st.GetProvider(context.Background(), row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row.APIKeyEnv = "GW_KEY_NEW" // baseURL unchanged
+	if _, err := st.UpdateProvider(context.Background(), row, read.UpdatedAt, "test"); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = runtime.RowsFor(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := menuIDs(rows[0].Models); got != "qwen-27b" {
+		t.Fatalf("a row repointed at another key must serve that key's menu at once, got %s", got)
+	}
+}
+
+// "/models" is a path element under baseURL, never text appended to it. A row
+// stored before validation refused a query string (or written past the
+// validator) must not have the suffix swallowed by that query: the writer of
+// the row would then pick the whole request path the row's key is sent to.
+func TestMenuFetchAppendsModelsToThePath(t *testing.T) {
+	var mu sync.Mutex
+	var paths, queries, auths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		queries = append(queries, r.URL.RawQuery)
+		auths = append(auths, r.Header.Get("Authorization"))
+		mu.Unlock()
+		fmt.Fprint(w, `{"data":[]}`)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("GW_KEY", "sk-gateway-secret")
+
+	cases := []struct{ id, base, wantPath string }{
+		{"lpr_plain", "/v1", "/v1/models"},
+		{"lpr_slash", "/v1/", "/v1/models"},
+		{"lpr_root", "", "/models"},
+		{"lpr_query", "/latest/meta-data/iam/security-credentials/role?x=", "/latest/meta-data/iam/security-credentials/role/models"},
+	}
+	st := storetest.Open(t)
+	for _, tc := range cases {
+		seedRow(t, st, store.ProviderRow{ID: tc.id, BaseURL: srv.URL + tc.base, APIKeyEnv: "GW_KEY"})
+	}
+	if _, err := providers.NewRuntime(st, time.Minute).RowsFor(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(paths) != len(cases) {
+		t.Fatalf("one fetch per row, got %v", paths)
+	}
+	for i, tc := range cases {
+		if paths[i] != tc.wantPath {
+			t.Errorf("baseURL %q: the gateway saw path %q query %q (bearer sent: %v), want path %q",
+				tc.base, paths[i], queries[i], auths[i] != "", tc.wantPath)
+		}
+	}
+}

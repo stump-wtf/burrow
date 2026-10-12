@@ -176,12 +176,20 @@ func unquoteETag(tag string) string {
 
 // decodeStrict decodes a JSON body, rejecting unknown fields — a typo in an
 // automation's payload must fail loudly, not silently drop a field
-// (SPEC-0004 REQ "Admin surface").
+// (SPEC-0004 REQ "Admin surface"). The body is one value: Decode stops at
+// the end of the first, so anything after it (a second object, a stray
+// token) would otherwise be dropped just as silently as an unknown field.
 func decodeStrict(r *http.Request, v any) error {
 	defer r.Body.Close()
 	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
 	dec.DisallowUnknownFields()
-	return dec.Decode(v)
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("unexpected data after the JSON object")
+	}
+	return nil
 }
 
 func (s *Server) handleAdminListProviders(w http.ResponseWriter, r *http.Request) {

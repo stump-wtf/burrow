@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"gitea.stump.rocks/stump.wtf/burrow/internal/store"
 )
@@ -75,8 +76,13 @@ type fileModel struct {
 }
 
 var (
-	idPrefixRE = regexp.MustCompile(`(?i)^lpr_`)
-	envNameRE  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	// idRE is the contract's /^lpr_/i prefix plus burrow's own charset and
+	// length. The id is a path segment on /connect, on the admin routes and
+	// in the console's links, so anything that would need escaping there —
+	// or that reads as a route, like "lpr_a/delete" — is not an id. Spelled
+	// out rather than (?i), which would fold non-ASCII letters into [a-z].
+	idRE      = regexp.MustCompile(`^[lL][pP][rR]_[A-Za-z0-9_-]{1,64}$`)
+	envNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
 // reservedEnvPrefix is burrow's configuration namespace (internal/config),
@@ -159,18 +165,36 @@ func validate(p Provider) error {
 
 // validateIdentity checks the fields every row — file or store — carries.
 func validateIdentity(id, providerID, name, baseURL, apiKeyEnv string, groups []string) error {
-	if !idPrefixRE.MatchString(id) {
-		return fmt.Errorf("id %q must match /^lpr_/i", id)
+	if !idRE.MatchString(id) {
+		// The id is not echoed: it may be any length and any bytes.
+		return fmt.Errorf("id must be lpr_ followed by 1 to 64 letters, digits, '_' or '-'")
 	}
 	if strings.TrimSpace(providerID) == "" {
 		return fmt.Errorf("providerId must not be empty")
 	}
+	if hasControl(providerID) {
+		return fmt.Errorf("providerId must not contain control characters")
+	}
 	if strings.TrimSpace(name) == "" {
 		return fmt.Errorf("name must not be empty")
+	}
+	if hasControl(name) {
+		return fmt.Errorf("name must not contain control characters")
 	}
 	u, err := url.Parse(baseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return fmt.Errorf("baseURL %q must be an absolute http(s) URL", baseURL)
+	}
+	// The row's key is sent to {baseURL}/models and baseURL itself is served
+	// to every member in providerConfig, so it is an origin and a path and
+	// nothing else. A query or fragment would swallow "/models" and let the
+	// writer aim the key at any path on that host; userinfo is a credential
+	// at rest in a row, which is why the refusal does not echo the value.
+	if u.User != nil {
+		return fmt.Errorf("baseURL must not carry credentials (user:password@host); the key belongs in apiKeyEnv")
+	}
+	if strings.ContainsAny(baseURL, "?#") {
+		return fmt.Errorf("baseURL %q must not carry a query string or fragment", baseURL)
 	}
 	if !envNameRE.MatchString(apiKeyEnv) {
 		return fmt.Errorf("apiKeyEnv %q must be an environment variable name", apiKeyEnv)
@@ -183,6 +207,15 @@ func validateIdentity(id, providerID, name, baseURL, apiKeyEnv string, groups []
 		return fmt.Errorf("apiKeyEnv %q is in burrow's own %s namespace; name the provider key's own variable", apiKeyEnv, reservedEnvPrefix)
 	}
 	return validateGroups(groups)
+}
+
+// hasControl reports whether s carries a control character. Postgres TEXT
+// cannot hold a NUL, so one that passed validation failed in the store
+// instead: a 500 on the admin API, and at boot a seed that stopped after the
+// rows before it were committed. The rest (newlines, escapes, DEL, C1) have
+// no use in a field a human reads or a group burrow matches.
+func hasControl(s string) bool {
+	return strings.ContainsFunc(s, unicode.IsControl)
 }
 
 // validateStoreRow applies the same validation a file Load performed
@@ -205,7 +238,10 @@ func validateStoreRow(p store.ProviderRow) error {
 
 // validateGroups rejects an explicit empty list and empty entries (SPEC-0003
 // REQ "Group declarations"): "visible to nobody" written as [] cannot be told
-// apart from a mistake. An absent list (nil) means everyone.
+// apart from a mistake. An absent list (nil) means everyone. A name with
+// surrounding whitespace is the same mistake in another spelling: groups are
+// compared exactly, so " family" is an audience no member holds. It is
+// refused, not trimmed, so the writer sees what they sent.
 func validateGroups(groups []string) error {
 	if groups != nil && len(groups) == 0 {
 		return fmt.Errorf("groups must not be an empty list; omit it to mean every member")
@@ -213,6 +249,12 @@ func validateGroups(groups []string) error {
 	for _, g := range groups {
 		if strings.TrimSpace(g) == "" {
 			return fmt.Errorf("groups must not contain an empty name")
+		}
+		if hasControl(g) {
+			return fmt.Errorf("groups must not contain control characters")
+		}
+		if g != strings.TrimSpace(g) {
+			return fmt.Errorf("groups: %q has leading or trailing whitespace and would match no member", g)
 		}
 	}
 	return nil
@@ -512,7 +554,12 @@ func (r *Runtime) menuIDs(ctx context.Context, p store.ProviderRow) ([]string, t
 // fetch asks the gateway what the key may use: the OpenAI-compatible
 // GET {baseURL}/models, answered as {"data":[{"id":…}]}.
 func (r *Runtime) fetch(ctx context.Context, baseURL, key string) ([]string, error) {
-	endpoint := strings.TrimRight(baseURL, "/") + "/models"
+	// Joined as a path element: appended as text, "/models" lands in the
+	// query of a baseURL that carries one.
+	endpoint, err := url.JoinPath(baseURL, "models")
+	if err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
