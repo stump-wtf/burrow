@@ -282,7 +282,7 @@ type Catalog struct {
 	mu        sync.Mutex // guards the cache fields
 	refreshMu sync.Mutex // serializes refreshes; never held by cache hits
 	skills    []Skill
-	loadedAt  time.Time
+	loadedAt  time.Time // zero until the first successful load
 }
 
 // DefaultCacheTTL balances freshness against clone traffic.
@@ -298,7 +298,11 @@ func NewCatalog(source Source) *Catalog {
 // a reader arriving mid-refresh serves the stale catalog instead of waiting.
 func (c *Catalog) All(ctx context.Context) ([]Skill, error) {
 	c.mu.Lock()
-	if c.skills != nil && time.Since(c.loadedAt) < c.CacheTTL {
+	// "Loaded" is the timestamp, not a non-nil slice: a source with no valid
+	// skills loads as an empty catalog, and an empty catalog that never counts
+	// as cached runs git on every request.
+	loaded := !c.loadedAt.IsZero()
+	if loaded && time.Since(c.loadedAt) < c.CacheTTL {
 		skills := c.skills
 		c.mu.Unlock()
 		return skills, nil
@@ -307,7 +311,7 @@ func (c *Catalog) All(ctx context.Context) ([]Skill, error) {
 	c.mu.Unlock()
 
 	if !c.refreshMu.TryLock() {
-		if stale == nil {
+		if !loaded {
 			// Cold start with a load already in flight: wait for it.
 			c.refreshMu.Lock()
 			c.refreshMu.Unlock()
@@ -321,7 +325,7 @@ func (c *Catalog) All(ctx context.Context) ([]Skill, error) {
 	skills, err := c.Source.Load(ctx)
 	if err != nil {
 		// Serve the stale catalog rather than an error when a refresh fails.
-		if stale != nil {
+		if loaded {
 			slog.Warn("skills: reload failed; serving stale catalog", "error", err)
 			return stale, nil
 		}

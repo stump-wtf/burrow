@@ -250,3 +250,69 @@ func TestLoadFromGitSubDir(t *testing.T) {
 		t.Fatalf("root scan must find no skills, got %+v", root)
 	}
 }
+
+// A source with no valid skills is still a loaded catalog. The cache used to
+// tell "never loaded" from "loaded" by the slice being non-nil, so an empty
+// Library was never cached and every request inside the TTL ran git again.
+func TestCatalogCachesAnEmptyCatalog(t *testing.T) {
+	// The developer's git configuration must not change the outcome.
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# skills\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"init", "--initial-branch=main"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "Test"},
+		{"add", "-A"},
+		{"commit", "-m", "seed"},
+	} {
+		out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+
+	// From here on `git` is a wrapper that records each invocation before
+	// handing over to the real one.
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	calls := filepath.Join(bin, "calls")
+	wrapper := "#!/bin/sh\necho \"$1\" >> '" + calls + "'\nexec '" + realGit + "' \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	gitCalls := func() int {
+		raw, err := os.ReadFile(calls)
+		if err != nil {
+			t.Fatalf("git was never run through the wrapper: %v", err)
+		}
+		return strings.Count(string(raw), "\n")
+	}
+
+	cat := skills.NewCatalog(skills.Source{GitURL: repo, CacheDir: t.TempDir()})
+	list, err := cat.All(context.Background())
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("the seed repo has no skills, got %+v", list)
+	}
+	first := gitCalls()
+
+	for range 4 {
+		if _, err := cat.All(context.Background()); err != nil {
+			t.Fatalf("cached load: %v", err)
+		}
+	}
+	if again := gitCalls() - first; again != 0 {
+		t.Fatalf("an empty catalog must be cached for the TTL, but 4 more requests ran git %d more times", again)
+	}
+}
