@@ -55,12 +55,13 @@ func TestLoadDirParsesFrontmatter(t *testing.T) {
 	}
 }
 
-// A skill without a description, and a directory that is not kebab-case, are
-// skipped rather than served broken.
+// A skill without a description, a directory that is not kebab-case, and
+// frontmatter that is not YAML are skipped rather than served broken.
 func TestLoadDirSkipsInvalidEntries(t *testing.T) {
 	dir := t.TempDir()
 	writeSkill(t, dir, "no-description", "title: Broken")
 	writeSkill(t, dir, "Not_Kebab", "description: Bad name.")
+	writeSkill(t, dir, "not-yaml", "description: [never closed")
 	writeSkill(t, dir, "good-one", "description: Fine.")
 
 	got, err := (&skills.Source{Dir: dir}).Load(context.Background())
@@ -69,6 +70,87 @@ func TestLoadDirSkipsInvalidEntries(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Name != "good-one" {
 		t.Fatalf("want only good-one, got %+v", got)
+	}
+}
+
+// Frontmatter is YAML, and skill authors write it as YAML: a description
+// folded over several lines, a metadata block with its own keys, Windows line
+// endings. Each of these used to produce a wrong catalog entry — a description
+// of ">-", a title taken from metadata — or drop the skill outright, and the
+// catalog entry is what the agent is shown.
+func TestLoadDirDecodesFrontmatterAsYAML(t *testing.T) {
+	tests := []struct {
+		name            string
+		source          string
+		wantTitle       string
+		wantDescription string
+	}{
+		{
+			name:            "plain",
+			source:          "---\ntitle: Code Review\ndescription: Review code carefully.\n---\n\nDo the thing.\n",
+			wantTitle:       "Code Review",
+			wantDescription: "Review code carefully.",
+		},
+		{
+			name:            "folded",
+			source:          "---\ndescription: >-\n  Review code carefully,\n  then review it again.\n---\n\nDo the thing.\n",
+			wantTitle:       "folded",
+			wantDescription: "Review code carefully, then review it again.",
+		},
+		{
+			name:            "literal",
+			source:          "---\ndescription: |\n  Review code carefully.\n  Then review it again.\n---\n\nDo the thing.\n",
+			wantTitle:       "literal",
+			wantDescription: "Review code carefully.\nThen review it again.",
+		},
+		{
+			name:            "nested",
+			source:          "---\ntitle: Code Review\ndescription: Review code carefully.\nmetadata:\n  title: Internal\n  description: Not the skill's description.\n---\n\nDo the thing.\n",
+			wantTitle:       "Code Review",
+			wantDescription: "Review code carefully.",
+		},
+		{
+			name:            "trailing-quote",
+			source:          "---\ndescription: Use when asked to \"review this\"\n---\n\nDo the thing.\n",
+			wantTitle:       "trailing-quote",
+			wantDescription: `Use when asked to "review this"`,
+		},
+		{
+			name:            "crlf",
+			source:          "---\r\ntitle: Code Review\r\ndescription: Review code carefully.\r\n---\r\n\r\nDo the thing.\r\n",
+			wantTitle:       "Code Review",
+			wantDescription: "Review code carefully.",
+		},
+	}
+	dir := t.TempDir()
+	for _, tt := range tests {
+		if err := os.MkdirAll(filepath.Join(dir, tt.name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, tt.name, "SKILL.md"), []byte(tt.source), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := (&skills.Source{Dir: dir}).Load(context.Background())
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			skill, ok := skills.Find(got, tt.name)
+			if !ok {
+				t.Fatal("skill was dropped from the catalog")
+			}
+			if skill.Title != tt.wantTitle {
+				t.Errorf("title: want %q, got %q", tt.wantTitle, skill.Title)
+			}
+			if skill.Description != tt.wantDescription {
+				t.Errorf("description: want %q, got %q", tt.wantDescription, skill.Description)
+			}
+			if skill.Body != tt.source {
+				t.Errorf("body must stay the SKILL.md source verbatim, got %q", skill.Body)
+			}
+		})
 	}
 }
 

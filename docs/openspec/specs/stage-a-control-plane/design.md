@@ -90,7 +90,8 @@ internal/httpapi    routes: auth pages, /api/den/v1/*, /mcp/agent
   and hard-resets to it, so a changed URL or an upstream force-push is
   followed (a failed refresh serves the cached clone). The
   catalog caches for 30s so the client's polling does not hit git. Frontmatter
-  is parsed by hand — `key: value` lines between `---` markers; no dependency.
+  is the YAML block between `---` markers, decoded with `gopkg.in/yaml.v3`;
+  only `title` and `description` are read.
 - **Marketplace naming.** One marketplace named `<OrgName> Library` with id
   `mkt_<org slug>`; plugin `plg_<skill>`, config object `cfo_<skill>`,
   membership `pm_<skill>`, latest version `cfv_<skill>`. IDs are derived, not

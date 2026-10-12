@@ -23,6 +23,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Skill is one loadable Library entry.
@@ -220,47 +222,54 @@ func loadDir(dir string) ([]Skill, error) {
 	return skills, nil
 }
 
-// parse reads the frontmatter of a SKILL.md. Frontmatter is a leading
-// `---`-delimited block of `key: value` lines; description is required,
-// title optional (defaults to the directory name).
+// frontmatter is what the loader reads out of a SKILL.md frontmatter block.
+// Every other key is the agent's business and is ignored.
+type frontmatter struct {
+	Title       string `yaml:"title"`
+	Description string `yaml:"description"`
+}
+
+// parse reads the frontmatter of a SKILL.md: a leading `---`-delimited YAML
+// block. description is required, title optional (defaults to the directory
+// name). The block is decoded as YAML, not scanned for `key: value` lines: a
+// line scan reads a folded `description: >-` as the description ">-" and
+// takes a nested metadata block's keys for the skill's own, and what it gets
+// wrong goes into the catalog the agent is shown.
 func parse(name, raw string, updated time.Time) (Skill, error) {
 	skill := Skill{Name: name, Title: name, Body: raw, UpdatedAt: updated}
 	front, ok := splitFrontmatter(raw)
 	if !ok {
 		return skill, fmt.Errorf("no frontmatter block")
 	}
-	for _, line := range front {
-		key, value, found := strings.Cut(line, ":")
-		if !found {
-			continue
-		}
-		key = strings.TrimSpace(key)
-		value = strings.Trim(strings.TrimSpace(value), `"'`)
-		switch key {
-		case "description":
-			skill.Description = value
-		case "title", "name":
-			if value != "" && key == "title" {
-				skill.Title = value
-			}
-		}
+	var meta frontmatter
+	if err := yaml.Unmarshal([]byte(front), &meta); err != nil {
+		return skill, fmt.Errorf("frontmatter is not valid YAML: %w", err)
 	}
-	if strings.TrimSpace(skill.Description) == "" {
+	if title := strings.TrimSpace(meta.Title); title != "" {
+		skill.Title = title
+	}
+	skill.Description = strings.TrimSpace(meta.Description)
+	if skill.Description == "" {
 		return skill, fmt.Errorf("frontmatter has no description")
 	}
 	return skill, nil
 }
 
-func splitFrontmatter(raw string) ([]string, bool) {
-	if !strings.HasPrefix(raw, "---\n") {
-		return nil, false
+// splitFrontmatter returns the text between the opening `---` line and the
+// next one. A file saved with CRLF line endings opens with "---\r\n".
+func splitFrontmatter(raw string) (string, bool) {
+	rest, ok := strings.CutPrefix(raw, "---\n")
+	if !ok {
+		rest, ok = strings.CutPrefix(raw, "---\r\n")
 	}
-	rest := raw[len("---\n"):]
+	if !ok {
+		return "", false
+	}
 	end := strings.Index(rest, "\n---")
 	if end < 0 {
-		return nil, false
+		return "", false
 	}
-	return strings.Split(rest[:end], "\n"), true
+	return rest[:end], true
 }
 
 // Catalog is a caching view over a Source. The desktop app polls the Library
