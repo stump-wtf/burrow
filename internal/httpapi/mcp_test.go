@@ -347,3 +347,36 @@ func TestMCPPathLogsOutcomeWithoutTokens(t *testing.T) {
 		t.Fatalf("log must never contain a token value:\n%s", written)
 	}
 }
+
+// A database outage on the MCP token lookup is not a bad token. Answered as
+// invalid_mcp_token it sends the client off to re-mint (the contract's remint
+// codes), which fails the same way; it must be a 500 the client reads as
+// burrow being unavailable, logged at Error.
+func TestMCPTokenStoreFailureIsNotAnInvalidToken(t *testing.T) {
+	e := newTestEnv(t)
+	token := e.mcpToken(t)
+	logs := captureLogs(t)
+	e.st.Close()
+
+	resp, body := e.mcpPost(t, token, map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("token lookup with the store down must 500, got %d: %s", resp.StatusCode, body)
+	}
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("the 500 must still be a JSON-RPC error body: %v: %s", err, body)
+	}
+	rpcErr := mapOf(t, mapOf(t, payload)["error"])
+	// The client re-mints on these codes and on any code containing
+	// "expired" or "auth" (docs/client-contract.md, the MCP endpoint).
+	answer := strings.ToLower(string(body))
+	for _, remint := range []string{"invalid_mcp_token", "missing_mcp_token", "expired", "auth"} {
+		if strings.Contains(answer, remint) {
+			t.Fatalf("a store failure must not answer with a remint code (%q): %s", remint, body)
+		}
+	}
+	if code := nonEmptyString(t, mapOf(t, rpcErr["data"]), "code"); code != "internal" {
+		t.Fatalf("data.code must be internal, got %q", code)
+	}
+	wantLogged(t, logs, []string{"level=ERROR", `msg="mcp: token lookup failed"`}, token)
+}

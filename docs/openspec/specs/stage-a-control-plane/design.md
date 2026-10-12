@@ -100,6 +100,14 @@ internal/httpapi    routes: auth pages, /api/den/v1/*, /mcp/agent
   Auth failures return JSON-RPC error bodies whose message and `data.code`
   carry the remint codes (`missing_mcp_token`, `invalid_mcp_token`,
   `expired_mcp_token`).
+- **A store failure is not a credential failure.** The codes above are for
+  a credential the store answered for: unknown, used, or expired. When the
+  lookup itself fails, burrow answers 500 and logs it at Error — `internal`
+  on the session path, `server_error` on the sign-in callback and the grant
+  exchange, and a JSON-RPC error with `data.code: internal` on the MCP
+  endpoint — so a database outage neither signs the desktop app out, nor
+  tells a member to start again, nor sends the client off to re-mint a token.
+  Refusals are logged at Warn with the reason and never the credential.
 - **Origin handling.** `BURROW_BASE_URL` overrides; otherwise the origin is
   derived per request from `X-Forwarded-Proto` (first hop) / TLS / Host, so
   loopback dev (http) and proxied production (https) both produce correct

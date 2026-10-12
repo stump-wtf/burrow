@@ -97,9 +97,19 @@ func (s *Server) handleMCPAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	mcpUser, _, err := s.store.LookupMCPToken(r.Context(), token)
 	if err != nil {
-		code := "invalid_mcp_token"
-		if errors.Is(err, store.ErrExpired) {
+		var code string
+		switch {
+		case errors.Is(err, store.ErrExpired):
 			code = "expired_mcp_token"
+		case errors.Is(err, store.ErrNotFound):
+			code = "invalid_mcp_token"
+		default:
+			// A store failure is not a token problem. The token codes
+			// send the client off to re-mint (docs/client-contract.md,
+			// "The MCP endpoint"), which cannot fix an outage.
+			slog.Error("mcp: token lookup failed", "token_present", true, "error", err)
+			s.writeMCPError(w, http.StatusInternalServerError, nil, -32003, "token store unavailable", map[string]string{"code": "internal"})
+			return
 		}
 		slog.Warn("mcp: request refused", "reason", code, "token_present", true, "error", err)
 		s.writeMCPError(w, http.StatusUnauthorized, nil, -32001, code, map[string]string{"code": code})

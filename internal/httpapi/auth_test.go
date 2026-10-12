@@ -3,6 +3,7 @@ package httpapi_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -257,4 +258,187 @@ func TestCallbackRejectsUnknownState(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("unknown state must 400, got %d", resp.StatusCode)
 	}
+}
+
+// stubOIDC stands in for the issuer when a test needs the callback to get
+// past the token exchange without a real one, or to fail at a chosen step.
+type stubOIDC struct {
+	exchangeErr error
+	// beforeClaims runs once the ID token has "verified", just before the
+	// callback goes back to the store.
+	beforeClaims func()
+}
+
+func (stubOIDC) AuthCodeURL(state, codeVerifier string) string { return "/authorize?state=" + state }
+
+func (c stubOIDC) Exchange(ctx context.Context, code, codeVerifier string) (string, error) {
+	if c.exchangeErr != nil {
+		return "", c.exchangeErr
+	}
+	return "raw-id-token", nil
+}
+
+func (c stubOIDC) Verify(ctx context.Context, rawIDToken string) (oidc.Claims, error) {
+	if c.beforeClaims != nil {
+		c.beforeClaims()
+	}
+	return oidc.Claims{Subject: "signer-sub-1", Email: "signer@example.com", Name: "Signer"}, nil
+}
+
+// withOIDC rebinds the server under test to client.
+func (e *testEnv) withOIDC(client httpapi.OIDCClient) {
+	e.srv.Config.Handler = httpapi.New(e.cfg, e.st, skills.NewCatalog(skills.Source{Dir: e.cfg.SkillsDir}), nil, client).Routes()
+}
+
+// get performs an unauthenticated GET without following redirects.
+func (e *testEnv) get(t *testing.T, path string) *http.Response {
+	t.Helper()
+	client := *e.srv.Client()
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Get(e.srv.URL + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
+}
+
+// A refused sign-in must be visible in the log at the level production runs
+// at: before this, an unknown state and a bad grant left nothing behind, so
+// "nobody can sign in" could not be told from "nobody tried". The line names
+// the outcome and never the state or the grant.
+func TestSignInRefusalsAreLogged(t *testing.T) {
+	e := newTestEnv(t)
+	logs := captureLogs(t)
+
+	const state = "state-value-that-must-not-be-logged"
+	resp := e.get(t, "/auth/oidc/callback?state="+state+"&code=x")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown state must 400, got %d", resp.StatusCode)
+	}
+	if code := errorCode(t, resp); code != "invalid_state" {
+		t.Fatalf("unknown state must be invalid_state, got %q", code)
+	}
+	wantLogged(t, logs, []string{"level=WARN", `msg="sign-in refused"`, "reason=invalid_state"}, state)
+
+	const grant = "grant-value-that-must-not-be-logged"
+	resp = e.doJSON(t, http.MethodPost, "/api/den/v1/auth/desktop-handoff/exchange",
+		map[string]string{"grant": grant}, nil, false)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unknown grant must 401, got %d", resp.StatusCode)
+	}
+	if code := errorCode(t, resp); code != "invalid_grant" {
+		t.Fatalf("unknown grant must be invalid_grant, got %q", code)
+	}
+	wantLogged(t, logs, []string{"level=WARN", `msg="grant exchange refused"`, "reason=invalid_grant"}, grant)
+}
+
+// A database outage is not a bad credential. The callback used to answer it
+// 400 invalid_state ("start again") and the exchange 401 invalid_grant, both
+// silently — so an outage read, to the member and to the log, as everyone
+// mistyping at once. Each step must answer 500 and say so at Error.
+func TestSignInStoreFailureIsNotABadCredential(t *testing.T) {
+	e := newTestEnv(t)
+	logs := captureLogs(t)
+	e.st.Close()
+
+	resp := e.get(t, "/auth/oidc/start?desktop=1")
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("start with the store down must 500, got %d", resp.StatusCode)
+	}
+	wantLogged(t, logs, []string{"level=ERROR", `msg="sign-in state save failed"`})
+
+	const state = "state-value-that-must-not-be-logged"
+	resp = e.get(t, "/auth/oidc/callback?state="+state+"&code=x")
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("callback with the store down must 500, got %d", resp.StatusCode)
+	}
+	if code := errorCode(t, resp); code != "server_error" {
+		t.Fatalf("callback with the store down must be server_error, got %q", code)
+	}
+	wantLogged(t, logs, []string{"level=ERROR", `msg="sign-in state lookup failed"`}, state)
+
+	const grant = "grant-value-that-must-not-be-logged"
+	resp = e.doJSON(t, http.MethodPost, "/api/den/v1/auth/desktop-handoff/exchange",
+		map[string]string{"grant": grant}, nil, false)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("exchange with the store down must 500, got %d", resp.StatusCode)
+	}
+	if code := errorCode(t, resp); code != "server_error" {
+		t.Fatalf("exchange with the store down must be server_error, got %q", code)
+	}
+	wantLogged(t, logs, []string{"level=ERROR", `msg="grant lookup failed"`}, grant)
+}
+
+// The later steps of the callback: an issuer that refuses the code, and a
+// store that fails once the member is known. Both already answered with the
+// right status and logged nothing.
+func TestCallbackFailuresAfterStateAreLogged(t *testing.T) {
+	const state = "state-value-that-must-not-be-logged"
+	const verifier = "verifier-value-that-must-not-be-logged"
+
+	t.Run("the issuer refuses the code", func(t *testing.T) {
+		e := newTestEnv(t)
+		e.withOIDC(stubOIDC{exchangeErr: errors.New("issuer said no")})
+		logs := captureLogs(t)
+		if err := e.st.SaveOIDCState(context.Background(), state, verifier, true, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		resp := e.get(t, "/auth/oidc/callback?state="+state+"&code=x")
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("a refused code must 502, got %d", resp.StatusCode)
+		}
+		wantLogged(t, logs, []string{"level=ERROR", `msg="oidc exchange failed"`, "issuer said no"}, state, verifier)
+	})
+
+	t.Run("the store fails recording the member", func(t *testing.T) {
+		e := newTestEnv(t)
+		e.withOIDC(stubOIDC{beforeClaims: func() { e.st.Close() }})
+		logs := captureLogs(t)
+		if err := e.st.SaveOIDCState(context.Background(), state, verifier, true, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		resp := e.get(t, "/auth/oidc/callback?state="+state+"&code=x")
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("a failed upsert must 500, got %d", resp.StatusCode)
+		}
+		wantLogged(t, logs, []string{"level=ERROR", `msg="sign-in user upsert failed"`, "user=signer-sub-1"}, state, verifier)
+	})
+}
+
+// A refused session leaves a line too, so a client stuck signing in and out
+// shows up in the log with the code it was given — and never with the token.
+func TestSessionRefusalsAreLogged(t *testing.T) {
+	e := newTestEnv(t)
+	logs := captureLogs(t)
+
+	refuse := func(token string) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, e.apiURL+"/v1/me", nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := e.srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("want 401, got %d", resp.StatusCode)
+		}
+	}
+
+	refuse("")
+	wantLogged(t, logs, []string{"level=WARN", `msg="session refused"`, "reason=unauthorized", "path=/v1/me"})
+
+	const unknown = "session-token-that-must-not-be-logged"
+	refuse(unknown)
+	wantLogged(t, logs, []string{"level=WARN", `msg="session refused"`, "reason=invalid_session"}, unknown)
+
+	expired, err := e.st.CreateSession(context.Background(), aliceSub, -time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refuse(expired)
+	wantLogged(t, logs, []string{"level=WARN", `msg="session refused"`, "reason=session_expired"}, unknown, expired)
 }

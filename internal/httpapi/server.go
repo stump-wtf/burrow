@@ -141,7 +141,7 @@ func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
-		if r.URL.Path == "/" || r.URL.Path == "/healthz" {
+		if r.URL.Path == "/" {
 			return
 		}
 		slog.Debug("request", "method", r.Method, "path", r.URL.Path, "elapsed", time.Since(start))

@@ -1,6 +1,7 @@
 package httpapi_test
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -9,11 +10,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -260,4 +263,73 @@ func (fi *fakeIssuer) mintIDToken() (string, error) {
 func writeJSONString(w http.ResponseWriter, body string) {
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, body)
+}
+
+// logCapture is the process log for one test. Handlers write it from the
+// server's goroutines while the test reads it, hence the lock.
+type logCapture struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *logCapture) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *logCapture) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+// captureLogs swaps the default logger for a buffer at Info — the level
+// production runs at — and puts the old one back when the test ends.
+func captureLogs(t *testing.T) *logCapture {
+	t.Helper()
+	logs := &logCapture{}
+	restore := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(restore) })
+	return logs
+}
+
+// wantLogged fails unless one captured line carries every fragment, and fails
+// if any secret appears anywhere in the capture.
+func wantLogged(t *testing.T, logs *logCapture, fragments []string, secrets ...string) {
+	t.Helper()
+	written := logs.String()
+	found := false
+	for _, line := range strings.Split(written, "\n") {
+		all := true
+		for _, fragment := range fragments {
+			if !strings.Contains(line, fragment) {
+				all = false
+				break
+			}
+		}
+		if all {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("no log line carries %q; captured:\n%s", fragments, written)
+	}
+	for _, secret := range secrets {
+		if strings.Contains(written, secret) {
+			t.Fatalf("the log must never carry a credential value (%q found):\n%s", secret, written)
+		}
+	}
+}
+
+// errorCode reads the contract error code out of a JSON error body.
+func errorCode(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	var payload any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	return nonEmptyString(t, mapOf(t, payload), "error")
 }
