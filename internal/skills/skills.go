@@ -263,7 +263,12 @@ func parse(name, raw string, updated time.Time) (Skill, error) {
 	}
 	var meta frontmatter
 	if err := yaml.Unmarshal([]byte(front), &meta); err != nil {
-		return skill, fmt.Errorf("frontmatter is not valid YAML: %w", err)
+		// A block that is not valid YAML is still read, the way it was
+		// before the decode: skill authors write for agents that tolerate
+		// keys such as `argument-hint: [a] [b]`, and one such key the loader
+		// never reads must not drop a skill that was being served.
+		slog.Warn("skills: frontmatter is not valid YAML; reading title and description line by line", "skill", name, "error", err)
+		meta = scanFrontmatter(front)
 	}
 	if title := strings.TrimSpace(meta.Title); title != "" {
 		skill.Title = title
@@ -273,6 +278,30 @@ func parse(name, raw string, updated time.Time) (Skill, error) {
 		return skill, fmt.Errorf("frontmatter has no description")
 	}
 	return skill, nil
+}
+
+// scanFrontmatter is the fallback for a block yaml cannot decode: the
+// top-level `title:` and `description:` lines, taken as plain single-line
+// values. Indented lines belong to some other key and are skipped.
+func scanFrontmatter(front string) frontmatter {
+	var meta frontmatter
+	for _, line := range strings.Split(front, "\n") {
+		if line == "" || line[0] == ' ' || line[0] == '\t' {
+			continue
+		}
+		key, value, found := strings.Cut(line, ":")
+		if !found {
+			continue
+		}
+		value = strings.Trim(strings.TrimSpace(value), `"'`)
+		switch strings.TrimSpace(key) {
+		case "title":
+			meta.Title = value
+		case "description":
+			meta.Description = value
+		}
+	}
+	return meta
 }
 
 // splitFrontmatter returns the text between the opening `---` line and the

@@ -63,7 +63,6 @@ func TestLoadDirSkipsInvalidEntries(t *testing.T) {
 	dir := t.TempDir()
 	writeSkill(t, dir, "no-description", "title: Broken")
 	writeSkill(t, dir, "Not_Kebab", "description: Bad name.")
-	writeSkill(t, dir, "not-yaml", "description: [never closed")
 	writeSkill(t, dir, "good-one", "description: Fine.")
 
 	got, err := (&skills.Source{Dir: dir}).Load(context.Background())
@@ -364,5 +363,27 @@ func TestCatalogCachesAnEmptyCatalog(t *testing.T) {
 	}
 	if again := gitCalls() - first; again != 0 {
 		t.Fatalf("an empty catalog must be cached for the TTL, but 4 more requests ran git %d more times", again)
+	}
+}
+
+// A frontmatter block that is not valid YAML is still read line by line:
+// skills are written for agents that tolerate keys such as
+// `argument-hint: [a] [b]`, and a key the loader never reads must not drop a
+// skill it was serving. Indented lines belong to another key and are not
+// taken for the skill's own.
+func TestLoadDirReadsFrontmatterThatIsNotValidYAML(t *testing.T) {
+	dir := t.TempDir()
+	writeSkill(t, dir, "with-hint", "title: With Hint\ndescription: \"Use when asked.\"\nargument-hint: [a] [b]\nmetadata:\n  description: not this one")
+	writeSkill(t, dir, "hint-only", "argument-hint: [a] [b]")
+
+	got, err := (&skills.Source{Dir: dir}).Load(context.Background())
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "with-hint" {
+		t.Fatalf("want only with-hint (hint-only has no description), got %+v", got)
+	}
+	if got[0].Title != "With Hint" || got[0].Description != "Use when asked." {
+		t.Fatalf("title %q description %q", got[0].Title, got[0].Description)
 	}
 }

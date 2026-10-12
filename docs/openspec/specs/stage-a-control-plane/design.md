@@ -91,7 +91,10 @@ internal/httpapi    routes: auth pages, /api/den/v1/*, /mcp/agent
   followed (a failed refresh serves the cached clone). The
   catalog caches for 30s so the client's polling does not hit git. Frontmatter
   is the YAML block between `---` markers, decoded with `gopkg.in/yaml.v3`;
-  only `title` and `description` are read.
+  only `title` and `description` are read. A block that is not valid YAML
+  (an unread key such as `argument-hint: [a] [b]`) falls back to the
+  top-level `title:` and `description:` lines with a Warn, so it is not
+  dropped.
   A symlinked skill directory or `SKILL.md` is skipped: Library content
   cannot point the loader at a file outside the Library.
 - **Marketplace naming.** One marketplace named `<OrgName> Library` with id
