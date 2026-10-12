@@ -103,4 +103,6 @@ internal/httpapi    routes: auth pages, /api/den/v1/*, /mcp/agent
 - **Origin handling.** `BURROW_BASE_URL` overrides; otherwise the origin is
   derived per request from `X-Forwarded-Proto` (first hop) / TLS / Host, so
   loopback dev (http) and proxied production (https) both produce correct
-  `denBaseUrl`, `denApiUrl`, and MCP `resource` values.
+  `denBaseUrl`, `denApiUrl`, and MCP `resource` values. The forwarded scheme
+  is believed only when it is `http` or `https`; any other value falls back
+  to the connection's own scheme.

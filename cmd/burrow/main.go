@@ -7,9 +7,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"gitea.stump.rocks/stump.wtf/burrow/internal/buildinfo"
@@ -24,6 +28,72 @@ import (
 // storeOpenTimeout bounds connecting to Postgres and converging the schema.
 const storeOpenTimeout = 30 * time.Second
 
+// How long a request may take to arrive, and how long a stop waits.
+//
+// The read timeouts bound the client, not the handler: net/http lifts the read
+// deadline once the request body has been consumed, so a handler waiting on a
+// git refresh or a gateway is not cut by them. Every body burrow accepts is
+// small (httpapi caps them), so a minute to deliver one is generous on any
+// link.
+const (
+	// readHeaderTimeout is how long a client has to finish its request
+	// headers. Without it a connection that sends half a request line is
+	// held open for as long as the client likes.
+	readHeaderTimeout = 10 * time.Second
+	// readTimeout covers the headers and the body together.
+	readTimeout = 60 * time.Second
+	// idleTimeout is how long a keep-alive connection may sit between
+	// requests before burrow closes it.
+	idleTimeout = 120 * time.Second
+	// shutdownGrace is how long a stop waits for requests in flight. It sits
+	// under Docker's default 10 s stop timeout — the deployment sets no
+	// longer one — so burrow drains and exits by itself instead of being
+	// killed mid-drain.
+	shutdownGrace = 8 * time.Second
+)
+
+// newServer builds the HTTP server with its timeouts.
+//
+// There is deliberately no WriteTimeout. It runs from the end of the request
+// headers, so it bounds the handler as well as the write, and two paths have
+// no upper bound to set it above: a Library or MCP request can wait on a git
+// clone that carries only the request's context, and a provider listing makes
+// one gateway call of up to 10 s for every row with a stale menu.
+func newServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		IdleTimeout:       idleTimeout,
+	}
+}
+
+// serve runs srv on ln until ctx ends, then stops accepting and gives
+// requests in flight up to grace to finish. The image ships on every merge to
+// main, so without this every deploy cut whatever was being served. A request
+// still running when grace runs out is cut; the wait is bounded so a stuck
+// handler cannot hold a deploy.
+func serve(ctx context.Context, srv *http.Server, ln net.Listener, grace time.Duration) error {
+	failed := make(chan error, 1)
+	go func() { failed <- srv.Serve(ln) }()
+
+	select {
+	case err := <-failed:
+		return err
+	case <-ctx.Done():
+	}
+
+	slog.Info("burrow shutting down", "grace", grace)
+	drain, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+	if err := srv.Shutdown(drain); err != nil {
+		slog.Warn("shutdown grace ran out; closing the connections still open", "error", err)
+		return srv.Close()
+	}
+	return nil
+}
+
 func main() {
 	cfg, err := config.FromEnv()
 	if err != nil {
@@ -31,9 +101,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	// SIGINT and SIGTERM end ctx instead of killing the process. Boot work
+	// takes it too: once the signals are caught, a boot stuck on the database
+	// or the issuer would otherwise ignore a stop.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	// Bounded: a boot that cannot reach the database, or cannot get a lock its
 	// schema change needs, exits with an error instead of hanging unstarted.
-	openCtx, cancelOpen := context.WithTimeout(context.Background(), storeOpenTimeout)
+	openCtx, cancelOpen := context.WithTimeout(ctx, storeOpenTimeout)
 	st, err := store.Open(openCtx, cfg.DatabaseURL)
 	cancelOpen()
 	if err != nil {
@@ -42,13 +118,13 @@ func main() {
 	}
 	defer st.Close()
 	// Expired rows are refused on read but nothing else deletes them.
-	go reapExpired(context.Background(), st, reapInterval)
+	go reapExpired(ctx, st, reapInterval)
 
 	// Provider rows live in the store (SPEC-0004); the model menus are
 	// derived from each row's own gateway key at request time (ADR-0004).
 	llmRuntime := providers.NewRuntime(st, cfg.ModelsTTL)
 	if cfg.ProvidersFile != "" {
-		seeded, warnings, skipped, err := providers.SeedIfEmpty(context.Background(), st, cfg.ProvidersFile)
+		seeded, warnings, skipped, err := providers.SeedIfEmpty(ctx, st, cfg.ProvidersFile)
 		if err != nil {
 			slog.Error("seed llm providers", "error", err)
 			os.Exit(1)
@@ -85,18 +161,20 @@ func main() {
 	// Rows are mutable at runtime, so the need for the groups claim cannot
 	// be decided at boot: request the scope unless the issuer rejects
 	// unknown scopes (BURROW_OIDC_GROUPS_SCOPE=false, SPEC-0004).
-	client, err := oidc.New(context.Background(), cfg.OIDCIssuerURL, cfg.OIDCClientID, cfg.OIDCClientSecret, redirectURL, cfg.OIDCGroupsScope)
+	client, err := oidc.New(ctx, cfg.OIDCIssuerURL, cfg.OIDCClientID, cfg.OIDCClientSecret, redirectURL, cfg.OIDCGroupsScope)
 	if err != nil {
 		slog.Error("connect to OIDC issuer", "error", err)
 		os.Exit(1)
 	}
 
-	srv := &http.Server{
-		Addr:    cfg.Addr,
-		Handler: httpapi.New(cfg, st, catalog, llmRuntime, client).Routes(),
+	srv := newServer(cfg.Addr, httpapi.New(cfg, st, catalog, llmRuntime, client).Routes())
+	ln, err := net.Listen("tcp", cfg.Addr)
+	if err != nil {
+		slog.Error("listen", "addr", cfg.Addr, "error", err)
+		os.Exit(1)
 	}
 	slog.Info("burrow listening", "addr", cfg.Addr, "version", buildinfo.Version, "org", cfg.OrgSlug)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := serve(ctx, srv, ln, shutdownGrace); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("server exited", "error", err)
 		os.Exit(1)
 	}

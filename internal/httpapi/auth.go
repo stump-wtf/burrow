@@ -258,7 +258,11 @@ func (s *Server) handleMintHandoff(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		DesktopScheme string `json:"desktopScheme"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	// Any other undecodable body is ignored: the scheme is optional.
+	if err := json.NewDecoder(r.Body).Decode(&body); bodyTooLarge(err) {
+		writeBodyTooLarge(w)
+		return
+	}
 	if body.DesktopScheme != "" && body.DesktopScheme != "openwork" {
 		writeError(w, http.StatusBadRequest, "invalid_request", "unsupported desktopScheme")
 		return
@@ -286,6 +290,10 @@ func (s *Server) handleExchange(w http.ResponseWriter, r *http.Request) {
 		Grant string `json:"grant"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if bodyTooLarge(err) {
+			writeBodyTooLarge(w)
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid_request", "body must be JSON with a grant")
 		return
 	}

@@ -109,7 +109,32 @@ func (s *Server) Routes() http.Handler {
 	api.HandleFunc("POST /api/auth/sign-out", s.requireSession(s.handleSignOut))
 	mux.Handle("/api/den/", http.StripPrefix("/api/den", api))
 
-	return logRequests(mux)
+	return logRequests(limitBody(mux))
+}
+
+// maxRequestBody caps every request body. No route has a legitimate body near
+// it: the JSON routes are capped tighter where they decode (1 MiB in
+// decodeBody and decodeStrict, 4 MiB on the MCP endpoint), and 10 MiB is the
+// cap net/http itself puts on a form post, which is what the console's
+// ParseForm calls ran under before the body was wrapped here — so no route's
+// limit drops.
+const maxRequestBody = 10 << 20
+
+// limitBody bounds what any handler can be made to read. A handler that
+// decodes r.Body directly buffers whatever it is sent, and the grant exchange
+// did exactly that with no credential required: a 256 MiB body cost over a
+// gigabyte before it was answered 401. A declared length over the cap is
+// refused before a byte is read; an undeclared one fails the handler's read
+// at the cap, and the handler answers with writeBodyTooLarge.
+func limitBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ContentLength > maxRequestBody {
+			writeBodyTooLarge(w)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+		next.ServeHTTP(w, r)
+	})
 }
 
 func logRequests(next http.Handler) http.Handler {
@@ -126,15 +151,25 @@ func logRequests(next http.Handler) http.Handler {
 // origin returns the externally visible origin for this request: the
 // configured BaseURL when set, else derived from X-Forwarded-Proto / TLS /
 // Host so both loopback dev and proxied production produce https origins.
+//
+// The forwarded scheme is a request header, so it is only believed when it
+// names a scheme burrow can be served on. Taken verbatim, "javascript" came
+// back as javascript://<host> in denApiUrl, the MCP resource and the deep
+// link's denBaseUrl. Anything but http or https falls back to the
+// connection's own scheme.
 func (s *Server) origin(r *http.Request) string {
 	if s.cfg.BaseURL != "" {
 		return s.cfg.BaseURL
 	}
 	scheme := "http"
-	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
-		scheme = strings.TrimSpace(strings.SplitN(proto, ",", 2)[0])
-	} else if r.TLS != nil {
+	if r.TLS != nil {
 		scheme = "https"
+	}
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		switch forwarded := strings.ToLower(strings.TrimSpace(strings.SplitN(proto, ",", 2)[0])); forwarded {
+		case "http", "https":
+			scheme = forwarded
+		}
 	}
 	return scheme + "://" + r.Host
 }

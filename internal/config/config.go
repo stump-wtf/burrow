@@ -19,8 +19,9 @@ type Config struct {
 	// Addr is the listen address (BURROW_ADDR, default ":8080").
 	Addr string
 	// BaseURL overrides the externally visible origin (BURROW_BASE_URL). When
-	// empty, the origin is derived per request (X-Forwarded-Proto, then TLS,
-	// then http) so loopback dev and proxied production both work.
+	// empty, the origin is derived per request (an http or https
+	// X-Forwarded-Proto, then TLS, then http) so loopback dev and proxied
+	// production both work.
 	BaseURL string
 
 	// DatabaseURL is the Postgres connection string (BURROW_DATABASE_URL),

@@ -9,6 +9,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 )
 
@@ -29,4 +30,18 @@ type apiError struct {
 // writeError writes a contract-shaped API error.
 func writeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, apiError{Error: code, Message: message})
+}
+
+// bodyTooLarge reports whether a body read failed on the cap Routes puts on
+// every request (limitBody), as opposed to on what the body said.
+func bodyTooLarge(err error) bool {
+	var tooLarge *http.MaxBytesError
+	return errors.As(err, &tooLarge)
+}
+
+// writeBodyTooLarge answers a request whose body ran past that cap. It is a
+// 413 of its own so an oversized body never reads as a malformed one or as a
+// refused credential.
+func writeBodyTooLarge(w http.ResponseWriter) {
+	writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body is too large")
 }
