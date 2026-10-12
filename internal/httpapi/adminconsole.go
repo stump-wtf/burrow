@@ -152,6 +152,7 @@ type consolePage struct {
 	GroupChoices []string
 	Row          *consoleRow
 	IsNew        bool
+	IsConfirm    bool
 	Etag         string
 	Audit        []auditLine
 	Matrix       *skillMatrix
@@ -247,7 +248,19 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 </tbody></table>
 {{end}}
 
-{{if .Row}}
+{{if .IsConfirm}}
+<h1 style="font-size:19px;font-weight:600;margin:0">Delete {{.Row.Name}}?</h1>
+<section class="card">
+<p class="note">This deletes <strong>{{.Row.Name}}</strong> (<code>{{.Row.ID}}</code>) and its {{.Row.ModelCount}} derived model{{if ne .Row.ModelCount 1}}s{{end}} — menus come from the row's key, so members lose them at their next sign-in.{{if .Row.GroupsNull}} This row is visible org-wide (audience is null).{{end}}</p>
+<form method="post" action="/admin/providers/{{.Row.ID}}/delete">
+<input type="hidden" name="etag" value="{{.Etag}}">
+<button class="button inline danger" type="submit">Delete provider</button>
+<a class="button inline" href="/admin/providers/{{.Row.ID}}">Cancel</a>
+</form>
+</section>
+{{end}}
+
+{{if and .Row (not .IsConfirm)}}
 <h1 style="font-size:19px;font-weight:600;margin:0">{{if .IsNew}}New provider{{else}}Edit {{.Row.Name}}{{end}}</h1>
 <section class="card">
 <form method="post" action="{{if .IsNew}}/admin/providers{{else}}/admin/providers/{{.Row.ID}}{{end}}">
@@ -290,9 +303,7 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 <a class="button inline" href="/admin">Cancel</a>
 </div>
 </form>
-<form method="post" action="/admin/providers/{{.Row.ID}}/delete" style="margin-top:12px">
-<button class="button inline danger" type="submit">Delete provider</button>
-</form>
+<a class="button inline danger" style="margin-top:12px" href="/admin/providers/{{.Row.ID}}/delete">Delete provider</a>
 {{else}}
 </div>
 </form>
@@ -526,15 +537,41 @@ func (s *Server) handleConsoleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleConsoleDelete answers POST /admin/providers/{id}/delete.
+// handleConsoleConfirmDelete answers GET /admin/providers/{id}/delete: the
+// confirm step before a delete. It names the row's display name and model
+// count and carries the row's current etag, so the confirm POST states the
+// exact version the admin agreed to delete (SPEC-0004: no silent clobbers).
+func (s *Server) handleConsoleConfirmDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	p, err := s.store.GetProvider(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.renderConsoleError(w, http.StatusNotFound, "no such provider: "+id)
+			return
+		}
+		s.renderConsoleError(w, http.StatusInternalServerError, "could not load the provider")
+		return
+	}
+	page := consolePage{Title: "Delete " + p.Name, IsConfirm: true,
+		Row: ptr(s.consoleRowOf(r, p)), Etag: quoteETag(p.UpdatedAt)}
+	renderConsole(w, http.StatusOK, page)
+}
+
+// handleConsoleDelete answers POST /admin/providers/{id}/delete: the yes on
+// the confirm step. The etag the confirm page carried rides to the API as
+// If-Match, so a row that changed since the confirm step is not deleted
+// blind; the API's own handler, store path, and audit do the work.
 func (s *Server) handleConsoleDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	rec, _ := s.consoleCall(r, http.MethodDelete, "/v1/admin/llm-providers/"+url.PathEscape(id), nil, "")
+	_ = r.ParseForm()
+	rec, _ := s.consoleCall(r, http.MethodDelete, "/v1/admin/llm-providers/"+url.PathEscape(id), nil, r.FormValue("etag"))
 	switch rec.Code {
 	case http.StatusNoContent:
 		http.Redirect(w, r, "/admin?saved=deleted", http.StatusSeeOther)
 	case http.StatusNotFound:
 		s.renderConsoleError(w, http.StatusNotFound, "no such provider: "+id)
+	case http.StatusPreconditionFailed:
+		s.renderConsoleError(w, http.StatusPreconditionFailed, "the row changed since the confirm step; open it again and delete from there")
 	default:
 		s.renderConsoleError(w, http.StatusInternalServerError, "the write API refused the delete: "+strconv.Itoa(rec.Code))
 	}

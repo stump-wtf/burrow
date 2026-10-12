@@ -64,6 +64,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /admin/providers", s.requireAdminPage(s.handleConsoleCreate))
 	mux.HandleFunc("GET /admin/providers/{id}", s.requireAdminPage(s.handleConsoleEdit))
 	mux.HandleFunc("POST /admin/providers/{id}", s.requireAdminPage(s.handleConsoleUpdate))
+	mux.HandleFunc("GET /admin/providers/{id}/delete", s.requireAdminPage(s.handleConsoleConfirmDelete))
 	mux.HandleFunc("POST /admin/providers/{id}/delete", s.requireAdminPage(s.handleConsoleDelete))
 
 	api := http.NewServeMux()
