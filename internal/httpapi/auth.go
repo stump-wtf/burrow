@@ -251,7 +251,9 @@ func firstNonEmpty(values ...string) string {
 // handleMintHandoff implements the optional pre-provisioning mint
 // (contract, Authentication §5). burrow requires an authenticated session:
 // an unauthenticated mint would be an auth bypass. The grant is for the
-// calling member.
+// calling member, and carries the calling session's expiry: the session it
+// buys ends when this one would have, so a session cannot renew itself by
+// handing off to itself (SPEC-0001 REQ "Session lifetime").
 func (s *Server) handleMintHandoff(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		DesktopScheme string `json:"desktopScheme"`
@@ -261,8 +263,13 @@ func (s *Server) handleMintHandoff(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "unsupported desktopScheme")
 		return
 	}
-	grant, err := s.store.MintGrant(r.Context(), userID(r), s.cfg.GrantTTL)
+	grant, err := s.store.MintHandoffGrant(r.Context(), bearerToken(r), s.cfg.GrantTTL)
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			// Signed out between the session check and the mint.
+			writeError(w, http.StatusUnauthorized, "invalid_session", "session not found")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "server_error", "could not mint a grant")
 		return
 	}
@@ -270,7 +277,10 @@ func (s *Server) handleMintHandoff(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleExchange burns a grant for a session token (contract,
-// Authentication §2). No Authorization header is sent.
+// Authentication §2). No Authorization header is sent. A grant from a fresh
+// OIDC sign-in buys a full BURROW_SESSION_TTL; a grant minted by a session
+// buys one that ends no later than that session (SPEC-0001 REQ "Session
+// lifetime").
 func (s *Server) handleExchange(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Grant string `json:"grant"`
@@ -283,7 +293,7 @@ func (s *Server) handleExchange(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "missing grant")
 		return
 	}
-	uid, err := s.store.ConsumeGrant(r.Context(), body.Grant)
+	uid, notAfter, err := s.store.ConsumeGrant(r.Context(), body.Grant)
 	if err != nil {
 		// invalid_grant is deliberately not a session-terminating code.
 		writeError(w, http.StatusUnauthorized, "invalid_grant", "grant is unknown, used, or expired")
@@ -294,7 +304,7 @@ func (s *Server) handleExchange(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "server_error", "grant pointed at a missing user")
 		return
 	}
-	token, err := s.store.CreateSession(r.Context(), user.ID, s.cfg.SessionTTL)
+	token, err := s.store.CreateSessionCapped(r.Context(), user.ID, s.cfg.SessionTTL, notAfter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "could not create a session")
 		return

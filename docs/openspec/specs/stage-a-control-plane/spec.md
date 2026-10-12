@@ -44,11 +44,24 @@ token), or `session_expired` (expired token) — all three are in the client's
 sign-out set, and no other 401 code may leak into these paths.
 `POST <api base>/api/auth/sign-out` SHALL revoke the session.
 
+### Requirement: Session lifetime
+
+A session SHALL NOT outlive the OIDC sign-in it descends from by more than
+`BURROW_SESSION_TTL` (default 30 days). A session bought with a grant from the
+OIDC callback SHALL expire `BURROW_SESSION_TTL` after the exchange. A session
+bought with a grant from the pre-provisioning mint SHALL expire at the earlier
+of that and the expiry of the session that minted the grant, so no chain of
+mint → exchange extends a sign-in: past the TTL the member authenticates with
+the issuer again, which is also when burrow re-reads their groups. Exchange of
+a grant whose minting session has already expired SHALL fail with
+`invalid_grant`.
+
 ### Requirement: Pre-provisioning mint
 
 `POST /v1/auth/desktop-handoff {desktopScheme:"openwork"}` SHALL require an
 authenticated session and mint a grant for the calling member. An
-unauthenticated mint would be an auth bypass, so it SHALL 401.
+unauthenticated mint would be an auth bypass, so it SHALL 401. The grant SHALL
+record the calling session's expiry (see "Session lifetime").
 
 ### Requirement: Single-org model
 

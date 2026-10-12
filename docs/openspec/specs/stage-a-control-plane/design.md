@@ -41,6 +41,18 @@ internal/httpapi    routes: auth pages, /api/den/v1/*, /mcp/agent
   `DELETE … RETURNING` each — the delete is the read, so a replay finds no row
   regardless of interleaving. Expiry is checked after the read so a burned
   grant cannot be resurrected by racing the clock.
+- **A handoff inherits its session's expiry.** The pre-provisioning mint
+  writes the calling session's `expires_at` onto the grant
+  (`grants.session_expires_at`, read from the session row in the same
+  `INSERT … SELECT`), and exchange issues a session expiring at
+  `min(now + SessionTTL, that)`. A callback-minted grant has no parent session
+  and leaves the column NULL, which is a full TTL. Without the cap any live
+  session could mint a grant and exchange it for a fresh full-TTL session,
+  forever and without an issuer round trip, so `BURROW_SESSION_TTL` bounded
+  nothing and a member removed at the issuer kept the groups of their last
+  real sign-in. The expiry is copied, never recomputed as a TTL, so a chain of
+  handoffs cannot creep. The wire shape is unchanged; a pre-provisioned
+  desktop simply signs in again when the provisioning session would have.
 - **401 code mapping.** missing header → `unauthorized`; unknown token →
   `invalid_session`; expired → `session_expired`. Exchange failures use
   `invalid_grant`, which the client does not treat as session-terminating —

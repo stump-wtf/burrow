@@ -92,6 +92,10 @@ CREATE TABLE IF NOT EXISTS grants (
 	created_at TIMESTAMPTZ NOT NULL,
 	expires_at TIMESTAMPTZ NOT NULL
 );
+-- SPEC-0001 REQ "Session lifetime": the expiry of the session that minted this
+-- grant, which the session it buys may not outlive. NULL for a grant minted by
+-- the OIDC callback, which has no parent session.
+ALTER TABLE grants ADD COLUMN IF NOT EXISTS session_expires_at TIMESTAMPTZ;
 CREATE TABLE IF NOT EXISTS oidc_states (
 	state      TEXT PRIMARY KEY,
 	verifier   TEXT NOT NULL,
@@ -269,7 +273,9 @@ func decodeGroups(raw string) ([]string, error) {
 }
 
 // MintGrant issues a single-use sign-in grant for user, valid for ttl.
-// It returns the raw grant value — the only time it exists in the clear.
+// It returns the raw grant value — the only time it exists in the clear. This
+// is the grant of a fresh OIDC sign-in: it has no parent session, so the
+// session it buys gets a full lifetime.
 func (s *Store) MintGrant(ctx context.Context, userID string, ttl time.Duration) (string, error) {
 	grant := randomToken()
 	_, err := s.db.ExecContext(ctx,
@@ -281,6 +287,32 @@ func (s *Store) MintGrant(ctx context.Context, userID string, ttl time.Duration)
 	return grant, nil
 }
 
+// MintHandoffGrant issues a single-use grant on behalf of a live session, for
+// that session's user, valid for ttl. The grant records the session's expiry,
+// and the session it buys cannot outlive it (SPEC-0001 REQ "Session
+// lifetime") — otherwise a session could mint its own successor forever and
+// the session TTL would bound nothing. The user and the expiry are read from
+// the session row in the same statement as the insert, so a session signed
+// out in between mints nothing: ErrNotFound.
+func (s *Store) MintHandoffGrant(ctx context.Context, sessionToken string, ttl time.Duration) (string, error) {
+	grant := randomToken()
+	tag, err := s.db.ExecContext(ctx, `
+INSERT INTO grants (token_hash, user_id, created_at, expires_at, session_expires_at)
+SELECT $1, user_id, $2, $3, expires_at FROM sessions WHERE token_hash = $4`,
+		hashToken(grant), now(), now().Add(ttl), hashToken(sessionToken))
+	if err != nil {
+		return "", fmt.Errorf("store: mint handoff grant: %w", err)
+	}
+	affected, err := tag.RowsAffected()
+	if err != nil {
+		return "", fmt.Errorf("store: mint handoff grant rows: %w", err)
+	}
+	if affected == 0 {
+		return "", ErrNotFound
+	}
+	return grant, nil
+}
+
 // ErrGrantInvalid marks a grant that is unknown, already used, or expired.
 var ErrGrantInvalid = errors.New("store: grant is invalid, used, or expired")
 
@@ -288,31 +320,56 @@ var ErrGrantInvalid = errors.New("store: grant is invalid, used, or expired")
 // user it was minted for. The DELETE is the read: a second call with the same
 // grant finds no row, so no interleaving of two requests can spend a grant
 // twice. An expired row is deleted and answered the same way a reused one is.
-func (s *Store) ConsumeGrant(ctx context.Context, grant string) (string, error) {
-	var userID string
+//
+// notAfter is the expiry of the session that minted the grant — the latest
+// moment the session this grant buys may live to — and the zero time for a
+// grant from a fresh OIDC sign-in. A grant whose minting session has already
+// expired is refused like an expired grant: the sign-in it descends from is
+// over.
+func (s *Store) ConsumeGrant(ctx context.Context, grant string) (userID string, notAfter time.Time, err error) {
 	var expiresAt time.Time
-	err := s.db.QueryRowContext(ctx,
-		`DELETE FROM grants WHERE token_hash = $1 RETURNING user_id, expires_at`, hashToken(grant)).
-		Scan(&userID, &expiresAt)
+	var sessionExpiresAt sql.NullTime
+	err = s.db.QueryRowContext(ctx,
+		`DELETE FROM grants WHERE token_hash = $1 RETURNING user_id, expires_at, session_expires_at`, hashToken(grant)).
+		Scan(&userID, &expiresAt, &sessionExpiresAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", ErrGrantInvalid
+			return "", time.Time{}, ErrGrantInvalid
 		}
-		return "", fmt.Errorf("store: consume grant: %w", err)
+		return "", time.Time{}, fmt.Errorf("store: consume grant: %w", err)
 	}
 	if now().After(expiresAt) {
-		return "", ErrGrantInvalid
+		return "", time.Time{}, ErrGrantInvalid
 	}
-	return userID, nil
+	if sessionExpiresAt.Valid {
+		if now().After(sessionExpiresAt.Time) {
+			return "", time.Time{}, ErrGrantInvalid
+		}
+		notAfter = sessionExpiresAt.Time
+	}
+	return userID, notAfter, nil
 }
 
 // CreateSession issues a session token for user, valid for ttl, returning the
 // raw token value.
 func (s *Store) CreateSession(ctx context.Context, userID string, ttl time.Duration) (string, error) {
+	return s.CreateSessionCapped(ctx, userID, ttl, time.Time{})
+}
+
+// CreateSessionCapped is CreateSession for a session bought with a grant: it
+// is valid for ttl but never past notAfter, the value ConsumeGrant returned.
+// A zero notAfter is no cap. The expiry is stored as notAfter itself, not as
+// a ttl recomputed from it, so a chain of handoffs cannot creep past the
+// sign-in it started from.
+func (s *Store) CreateSessionCapped(ctx context.Context, userID string, ttl time.Duration, notAfter time.Time) (string, error) {
 	token := randomToken()
+	expiresAt := now().Add(ttl)
+	if !notAfter.IsZero() && notAfter.Before(expiresAt) {
+		expiresAt = notAfter
+	}
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES ($1, $2, $3, $4)`,
-		hashToken(token), userID, now(), now().Add(ttl))
+		hashToken(token), userID, now(), expiresAt)
 	if err != nil {
 		return "", fmt.Errorf("store: create session: %w", err)
 	}
