@@ -42,12 +42,17 @@ fmt:
 vet:
 	$(GO) vet ./...
 
+# -count=1 keeps Go's test cache out of the gate. The cache keys a result on
+# the test binary, its flags and the environment it read — not on the Postgres
+# server behind BURROW_TEST_DATABASE_URL — so an unchanged package reports
+# `ok (cached)` whether or not a database is there to reach, and CI restores
+# that cache between runs.
 test: test-db
-	$(GO) test ./...
+	$(GO) test -count=1 ./...
 
 # -race needs CGO enabled.
 race: test-db
-	CGO_ENABLED=1 $(GO) test -race ./...
+	CGO_ENABLED=1 $(GO) test -race -count=1 ./...
 
 # The store is Postgres (ADR-0002), so the suites need a real server. Locally
 # this starts a disposable container and points the tests at it; CI exports

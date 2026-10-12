@@ -27,9 +27,13 @@ jobs:
   # The suite talks to a real Postgres (ADR-0002): burrow's store is Postgres,
   # and a store tested against a fake is a store nobody has tested. The tests
   # fail outright when BURROW_TEST_DATABASE_URL is missing rather than skipping,
-  # so a green run here proves the database was actually reached — the failure
-  # mode cairn documents, where a suite self-skips under a green pipeline and
-  # the gate silently stops gating.
+  # and the Makefile runs them with -count=1, so a green run here proves the
+  # database was actually reached. Both halves are needed: setup-go restores
+  # Go's test cache along with the build cache, the URL below is the same on
+  # every run, and the server behind it is not a cache input, so without
+  # -count=1 an unchanged package is answered `ok (cached)` without opening a
+  # connection. That is the failure mode cairn documents, where a suite stops
+  # running under a green pipeline and the gate silently stops gating.
   #
   # Why a user-defined network rather than a `services:` sidecar or a published
   # port, established empirically on this runner fleet (cairn's probe run 4005,
