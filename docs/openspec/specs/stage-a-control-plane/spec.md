@@ -123,3 +123,13 @@ tokens SHALL fail 401 carrying `missing_mcp_token` / `invalid_mcp_token` /
 The OIDC client credential and equivalent SHALL arrive only via environment
 variables (OpenBao in deployment) and never live in the repo or the database.
 Tokens and grants SHALL be persisted only as SHA-256 hashes.
+
+### Requirement: Expired rows
+
+Expiry SHALL be enforced on every read: an expired session, grant, sign-in
+state or MCP token is refused whether or not its row still exists. burrow
+SHALL also delete those rows once they are past `expires_at` — at start and
+periodically while running — so the tables are bounded by what is live;
+`GET /auth/oidc/start` is unauthenticated and writes a sign-in state per
+request. A failed sweep SHALL be logged and retried, never fatal. Admin API
+tokens are exempt: they stay listed until revoked.

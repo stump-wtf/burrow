@@ -62,6 +62,17 @@ internal/httpapi    routes: auth pages, /api/den/v1/*, /mcp/agent
   cookie-free: the state parameter is the key to a server-side (state,
   verifier, desktop) row with a 10-minute TTL. The `OIDCClient` interface in
   httpapi exists so the full flow is testable against a fake issuer.
+- **Expired rows are swept, not just refused.** Every lookup checks
+  `expires_at` itself, and that check is the enforcement. Separately,
+  `Store.PurgeExpired` deletes sessions, grants, sign-in states and MCP tokens
+  past `expires_at`; `cmd/burrow` runs it at start and hourly. Before it,
+  nothing deleted an expired row, and the state row above is written by an
+  unauthenticated GET, so anyone could grow the table. A swept session or MCP
+  token reads as unknown instead of expired (`invalid_session` for
+  `session_expired`, `invalid_mcp_token` for `expired_mcp_token`); both pairs
+  sit in the client's sign-out and remint sets, so the client does the same
+  thing either way. Admin API tokens are left out: an admin mints and revokes
+  them by name, and an expired one is worth seeing in that list.
 - **User id = OIDC subject.** Stable across email changes; email/name claims
   refresh on every sign-in (upsert). Member ids are `mem_<sub>`.
 - **Skills source.** `BURROW_SKILLS_DIR` reads a directory directly;

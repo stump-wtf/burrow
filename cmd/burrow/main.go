@@ -33,6 +33,8 @@ func main() {
 		os.Exit(1)
 	}
 	defer st.Close()
+	// Expired rows are refused on read but nothing else deletes them.
+	go reapExpired(context.Background(), st, reapInterval)
 
 	// Provider rows live in the store (SPEC-0004); the model menus are
 	// derived from each row's own gateway key at request time (ADR-0004).

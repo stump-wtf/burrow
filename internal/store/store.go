@@ -467,6 +467,47 @@ func (s *Store) LookupMCPToken(ctx context.Context, token string) (userID, orgID
 	return userID, orgID, nil
 }
 
+// Purged counts the expired rows one PurgeExpired call removed, per table.
+type Purged struct {
+	Sessions   int64
+	Grants     int64
+	OIDCStates int64
+	MCPTokens  int64
+}
+
+// PurgeExpired deletes every session, grant, OIDC sign-in state and MCP token
+// past its expires_at. It is housekeeping, not enforcement: each lookup still
+// checks expiry itself, so a row this has not reached yet is refused exactly
+// as before. Without it nothing ever removes an expired row — and
+// /auth/oidc/start writes a state row for every anonymous request, so the
+// tables only grow. Once swept, an expired token reads as unknown rather than
+// expired, which every caller already answers with a refusal.
+//
+// Admin API tokens are left alone on purpose: they are a short list an admin
+// mints and revokes by name, and an expired one is still worth seeing there.
+func (s *Store) PurgeExpired(ctx context.Context) (Purged, error) {
+	var purged Purged
+	cutoff := now()
+	for _, t := range []struct {
+		table string
+		count *int64
+	}{
+		{"sessions", &purged.Sessions},
+		{"grants", &purged.Grants},
+		{"oidc_states", &purged.OIDCStates},
+		{"mcp_tokens", &purged.MCPTokens},
+	} {
+		tag, err := s.db.ExecContext(ctx, `DELETE FROM `+t.table+` WHERE expires_at < $1`, cutoff)
+		if err != nil {
+			return purged, fmt.Errorf("store: purge expired %s: %w", t.table, err)
+		}
+		if *t.count, err = tag.RowsAffected(); err != nil {
+			return purged, fmt.Errorf("store: purge expired %s rows: %w", t.table, err)
+		}
+	}
+	return purged, nil
+}
+
 // ProviderRow is one LLM provider row as stored (SPEC-0004 REQ "Rows in the
 // store"). It carries what burrow owns — identity, gateway location, the key's
 // environment variable, the audience, and model display-name overrides. Model
