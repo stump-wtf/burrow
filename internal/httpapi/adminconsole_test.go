@@ -281,6 +281,7 @@ func TestConsoleProviderLifecycle(t *testing.T) {
 	mustContain(t, page, "LLM_CONSOLE_KEY")
 	mustNotContain(t, page, "test-key-value")
 	mustContain(t, page, `value="Model One"`)
+	mustContain(t, page, `href="/admin/providers/lpr_family/delete"`) // delete goes via the confirm step
 
 	// New row form.
 	_, page = e.consoleGet(t, "/admin/providers/new")
@@ -350,8 +351,16 @@ func TestConsoleProviderLifecycle(t *testing.T) {
 	mustContain(t, page, "changed while you were editing")
 	mustContain(t, page, "Family v2") // the CURRENT row, not the typed v3
 
-	// Delete through the console.
-	resp, page = e.consolePost(t, "/admin/providers/lpr_console/delete", url.Values{})
+	// Delete through the console: the confirm step names the row, its model
+	// count, and offers a cancel; the confirm POST carries the shown etag.
+	_, page = e.consoleGet(t, "/admin/providers/lpr_console/delete")
+	mustContain(t, page, "Delete Console?")
+	mustContain(t, page, "lpr_console")
+	mustContain(t, page, "derived model")
+	mustContain(t, page, "Cancel")
+	form = url.Values{}
+	form.Set("etag", consoleEtagOf(t, page))
+	resp, page = e.consolePost(t, "/admin/providers/lpr_console/delete", form)
 	if resp.StatusCode != http.StatusSeeOther {
 		t.Fatalf("delete status %d: %s", resp.StatusCode, page)
 	}
