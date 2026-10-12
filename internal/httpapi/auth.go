@@ -272,9 +272,12 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	// the /admin console: the cookie carries the same session token the
 	// desktop client holds as a bearer, so the console reuses the session
 	// store, its TTL, and sign-out, and the admin gate stays the API's own
-	// BURROW_ADMIN_GROUPS check (SPEC-0004 REQ "Admin console"). HttpOnly +
-	// SameSite=Lax keeps it out of scripts and off cross-site form posts,
-	// so the console's POST-only mutations are not CSRF-able.
+	// BURROW_ADMIN_GROUPS check (SPEC-0004 REQ "Admin console"). HttpOnly
+	// keeps it out of scripts. SameSite=Lax keeps it off cross-SITE form
+	// posts only: a sibling subdomain of burrow's registrable domain is
+	// same-site and its POSTs carry the cookie, so the cookie's attributes
+	// are not the console's CSRF defense — the cross-origin check every
+	// /admin route sits behind is (sameOriginConsole).
 	if !desktop {
 		token, err := s.store.CreateSession(r.Context(), user.ID, s.cfg.SessionTTL)
 		if err != nil {
@@ -304,6 +307,8 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		}).String())
 		data.AutoRedirect = true
 	}
+	// The page shows a live one-time grant.
+	privatePage(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = pageTmpl.Execute(w, data)
 }
@@ -397,6 +402,7 @@ func (s *Server) handleExchange(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "server_error", "could not create a session")
 		return
 	}
+	noStore(w)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token": token,
 		"user": map[string]any{
@@ -423,4 +429,40 @@ func (s *Server) handleSignOut(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{})
+}
+
+// handleConsoleSignOut answers POST /admin/sign-out: the browser's way to
+// end its session. The cookie is HttpOnly, so no script can drop it, and
+// handleSignOut reads a bearer a browser never sends; without this route a
+// browser session ends only when its TTL does. The session is deleted in the
+// store, so the token stops working everywhere — as this cookie and as a
+// bearer — and only then is the cookie expired. It is deliberately not
+// behind requireAdminPage: a member outside BURROW_ADMIN_GROUPS is handed the
+// cookie at sign-in like anyone else. It is behind the /admin cross-origin
+// check, so another site cannot sign a member out.
+//
+// Governing: SPEC-0004 REQ "Admin console".
+func (s *Server) handleConsoleSignOut(w http.ResponseWriter, r *http.Request) {
+	if token := adminSessionCookie(r); token != "" {
+		if err := s.store.DeleteSession(r.Context(), token); err != nil {
+			// The session is still live in the store. Keep the cookie so
+			// the member can try again, rather than show a signed-out
+			// browser over a token that still works.
+			slog.Error("console sign-out failed", "error", err)
+			s.renderConsoleError(w, http.StatusInternalServerError, "could not sign out; try again")
+			return
+		}
+	}
+	// Same name, path and attributes as the cookie the callback set, or the
+	// browser keeps the original.
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   strings.HasPrefix(s.origin(r), "https://"),
+		MaxAge:   -1,
+	})
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }

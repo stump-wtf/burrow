@@ -54,18 +54,28 @@ func (s *Server) Routes() http.Handler {
 	// writes the Library's mapping directly (SPEC-0003 REQ "Library audience"),
 	// which has no API surface of its own — the mapping is burrow's, not the
 	// client contract's.
-	mux.HandleFunc("GET /admin/{$}", s.requireAdminPage(s.handleConsoleList))
-	mux.HandleFunc("GET /admin", s.requireAdminPage(s.handleConsoleList))
-	mux.HandleFunc("GET /admin/audit", s.requireAdminPage(s.handleConsoleAudit))
-	mux.HandleFunc("GET /admin/skills", s.requireAdminPage(s.handleConsoleSkills))
-	mux.HandleFunc("POST /admin/skills", s.requireAdminPage(s.handleConsoleSkillsSave))
-	mux.HandleFunc("GET /admin/preview", s.requireAdminPage(s.handleConsolePreview))
-	mux.HandleFunc("GET /admin/providers/new", s.requireAdminPage(s.handleConsoleNew))
-	mux.HandleFunc("POST /admin/providers", s.requireAdminPage(s.handleConsoleCreate))
-	mux.HandleFunc("GET /admin/providers/{id}", s.requireAdminPage(s.handleConsoleEdit))
-	mux.HandleFunc("POST /admin/providers/{id}", s.requireAdminPage(s.handleConsoleUpdate))
-	mux.HandleFunc("GET /admin/providers/{id}/delete", s.requireAdminPage(s.handleConsoleConfirmDelete))
-	mux.HandleFunc("POST /admin/providers/{id}/delete", s.requireAdminPage(s.handleConsoleDelete))
+	console := http.NewServeMux()
+	console.HandleFunc("GET /admin/{$}", s.requireAdminPage(s.handleConsoleList))
+	console.HandleFunc("GET /admin", s.requireAdminPage(s.handleConsoleList))
+	console.HandleFunc("GET /admin/audit", s.requireAdminPage(s.handleConsoleAudit))
+	console.HandleFunc("GET /admin/skills", s.requireAdminPage(s.handleConsoleSkills))
+	console.HandleFunc("POST /admin/skills", s.requireAdminPage(s.handleConsoleSkillsSave))
+	console.HandleFunc("GET /admin/preview", s.requireAdminPage(s.handleConsolePreview))
+	console.HandleFunc("GET /admin/providers/new", s.requireAdminPage(s.handleConsoleNew))
+	console.HandleFunc("POST /admin/providers", s.requireAdminPage(s.handleConsoleCreate))
+	console.HandleFunc("GET /admin/providers/{id}", s.requireAdminPage(s.handleConsoleEdit))
+	console.HandleFunc("POST /admin/providers/{id}", s.requireAdminPage(s.handleConsoleUpdate))
+	console.HandleFunc("GET /admin/providers/{id}/delete", s.requireAdminPage(s.handleConsoleConfirmDelete))
+	console.HandleFunc("POST /admin/providers/{id}/delete", s.requireAdminPage(s.handleConsoleDelete))
+	// Sign-out is the one console route outside requireAdminPage: a member
+	// who is not an admin holds the session cookie too.
+	console.HandleFunc("POST /admin/sign-out", s.handleConsoleSignOut)
+	// Every console route, present and future, is mounted through the
+	// cross-origin check: register console pages on the console mux above,
+	// never on the outer mux, where a more specific pattern would bypass it.
+	guarded := s.sameOriginConsole(console)
+	mux.Handle("/admin", guarded)
+	mux.Handle("/admin/", guarded)
 
 	api := http.NewServeMux()
 	api.HandleFunc("POST /v1/auth/desktop-handoff", s.requireSession(s.handleMintHandoff))
@@ -135,6 +145,35 @@ func limitBody(next http.Handler) http.Handler {
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 		next.ServeHTTP(w, r)
 	})
+}
+
+// sameOriginConsole refuses a console write that a browser says came from
+// another origin. The console is the one surface a browser authenticates to
+// with a cookie it attaches on its own, so it is the one surface a page
+// elsewhere can write to on a signed-in admin's behalf — and SameSite=Lax
+// does not stop that: SameSite is scoped to the site, and every sibling
+// subdomain of burrow's registrable domain is same-site, so its form POSTs
+// carry the cookie. A forged provider row is enough to exfiltrate a key
+// (name an environment variable burrow holds, point baseURL elsewhere).
+//
+// The check is the standard library's: GET/HEAD/OPTIONS pass, so no console
+// GET may change anything; any other method passes only when Sec-Fetch-Site
+// is same-origin or none or, from a browser too old to send it, when
+// Origin's host is the request's Host. A request carrying neither header
+// passes: it is a non-browser client (curl, a script), which has no ambient
+// cookie to ride, or a browser years out of date. The /api/den routes are
+// bearer-only and deliberately stay outside the check.
+//
+// Governing: SPEC-0004 REQ "Admin console".
+func (s *Server) sameOriginConsole(next http.Handler) http.Handler {
+	guard := http.NewCrossOriginProtection()
+	guard.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slog.Warn("console: cross-origin request refused", "method", r.Method, "path", r.URL.Path,
+			"origin", r.Header.Get("Origin"), "sec_fetch_site", r.Header.Get("Sec-Fetch-Site"))
+		s.renderConsoleError(w, http.StatusForbidden,
+			"cross_origin: this request came from another site, so nothing was changed. Open the console and try again from there.")
+	}))
+	return guard.Handler(next)
 }
 
 func logRequests(next http.Handler) http.Handler {

@@ -177,6 +177,11 @@ body.console{display:block;place-items:start;max-width:980px;margin:0 auto;paddi
 .console-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:20px}
 .console-head nav a{color:var(--muted);text-decoration:none;font-size:14px}
 .console-head nav a:hover{color:var(--ink)}
+.console-head nav form{display:inline;margin:0}
+.console-head nav button{padding:0;border:none;background:none;cursor:pointer;
+  font:inherit;font-size:14px;color:var(--muted)}
+.console-head nav button:hover{color:var(--ink)}
+.console-head nav button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
 table{width:100%;border-collapse:separate;border-spacing:0;background:var(--card);
   border:1px solid var(--border);border-radius:var(--radius-card);box-shadow:var(--card-shadow)}
 th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--border);font-size:14px;vertical-align:top}
@@ -227,7 +232,7 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 <main class="shell" style="width:100%">
 <header class="console-head">
 <div class="wordmark">burrow · admin</div>
-<nav><a href="/admin">Providers</a> &middot; <a href="/admin/skills">Skill packs</a> &middot; <a href="/admin/audit">Audit</a></nav>
+<nav><a href="/admin">Providers</a> &middot; <a href="/admin/skills">Skill packs</a> &middot; <a href="/admin/audit">Audit</a> &middot; <form method="post" action="/admin/sign-out"><button type="submit">Sign out</button></form></nav>
 </header>
 {{if .Flash}}<p class="flash">{{.Flash}}</p>{{end}}
 {{range .Errors}}<p class="error">{{.}}</p>{{end}}
@@ -390,6 +395,7 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 
 // renderConsole executes the console template.
 func renderConsole(w http.ResponseWriter, status int, data consolePage) {
+	privatePage(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	_ = consoleTmpl.Execute(w, data)
