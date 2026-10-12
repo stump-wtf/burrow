@@ -152,7 +152,19 @@ errors) and its audit records - so the console is a client of the API, never
 a second management path. A web (non-desktop) OIDC sign-in SHALL establish
 the browser session the console reads: an HttpOnly, SameSite=Lax cookie
 carrying the session token (the desktop grant flow is unchanged). The
-console SHALL say that audience edits take effect at each member's next
+cookie's attributes are not a cross-origin defense - SameSite is scoped to
+the site, so a sibling subdomain's form POST carries the cookie - so the
+console SHALL refuse, with 403 and before any handler runs, a non-safe
+request a browser marks as coming from another origin: `Sec-Fetch-Site`
+other than `same-origin` or `none`, or, absent that header, an `Origin`
+whose host is not the request's `Host`. Console GETs SHALL NOT change
+state. Every console page SHALL be served `Cache-Control: no-store` and
+SHALL refuse to be framed (`X-Frame-Options: DENY` and
+`Content-Security-Policy: frame-ancestors 'none'`). Every console page
+SHALL offer sign-out: `POST /admin/sign-out` SHALL delete the browser's
+session, so its token is refused as a cookie and as a bearer alike, expire
+the cookie, and redirect to `/` - for any signed-in member, admin or not,
+behind the same cross-origin check. The console SHALL say that audience edits take effect at each member's next
 sign-in, and SHALL warn when a row's audience is null (visible org-wide);
 key rotation stays an OpenBao/LiteLLM operation outside burrow.
 
@@ -162,6 +174,20 @@ key rotation stays an OpenBao/LiteLLM operation outside burrow.
 - **WHEN** the first admin saves with the stale etag
 - **THEN** the editor re-renders with the API's current row and an
   explanation, and no change is lost silently
+
+#### Scenario: Forged write from a sibling subdomain
+
+- **GIVEN** an admin signed in to the console in a browser
+- **WHEN** a page on another origin - a sibling subdomain included - posts a
+  form to any `/admin` route with the admin's cookie attached
+- **THEN** the console answers 403, writes nothing, and logs the refusal
+
+#### Scenario: Browser sign-out
+
+- **GIVEN** a member signed in to a browser, in an admin group or not
+- **WHEN** they press Sign out on any console page
+- **THEN** the session is deleted, the cookie is expired, and the old token
+  is refused by the console and by the API
 
 #### Scenario: Console closed by default
 

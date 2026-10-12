@@ -59,11 +59,30 @@ implements: [ADR-0004]
   origin, so a self-call could not reliably reach the process.
 - **Browser session = the session token in a cookie.** The non-desktop OIDC
   callback mints a session and sets `burrow_session` (HttpOnly,
-  SameSite=Lax, Secure on https, `SessionTTL`). Lax keeps the cookie off
-  cross-site POSTs, so the console's POST-only mutations need no CSRF
-  token; the desktop deep-link flow is untouched. A member who can sign in
-  could already mint a session by exchanging the page's grant, so this adds
-  no capability.
+  SameSite=Lax, Secure on https, `SessionTTL`); the desktop deep-link flow
+  is untouched. A member who can sign in could already mint a session by
+  exchanging the page's grant, so this adds no capability.
+- **Cross-origin writes are refused by the server, not by the cookie
+  (2026-10-12).** This section first said Lax keeps the cookie off
+  cross-site POSTs and so the console needs no CSRF defense. That was wrong:
+  SameSite is scoped to the site, and a form on any sibling subdomain of
+  burrow's registrable domain is same-site, so its POST carries the cookie.
+  The whole `/admin` subtree is now mounted behind Go's
+  `http.CrossOriginProtection` (`sameOriginConsole`): a non-safe request
+  passes only with `Sec-Fetch-Site: same-origin`/`none`, or, from a browser
+  too old to send it, an `Origin` whose host is the request's `Host`; a
+  request with neither header passes (a non-browser client, with no ambient
+  cookie to ride, or a browser years out of date). No token in the forms, so
+  there is no state to mint, store or expire. `/api/den` stays outside it:
+  bearer-only, nothing ambient to ride.
+- **Sign-out is a console POST, open to non-admins (2026-10-12).** The
+  cookie is HttpOnly and the API's sign-out reads a bearer, so a browser had
+  no way to end its session short of the TTL. `POST /admin/sign-out` deletes
+  the session row (the token dies as a bearer too), expires the cookie and
+  redirects to `/`. It skips `requireAdminPage` because every web sign-in
+  gets the cookie, admin or not, and the console's 403 page is where a
+  non-admin lands; it stays behind the cross-origin check so another site
+  cannot sign a member out.
 - **Etags on forms.** The editor carries the fetched etag in a hidden field;
   a 412 re-renders with the API's current row, a 409/400 re-renders the
   typed values with the API's message, and a 428 (the form lost its etag)

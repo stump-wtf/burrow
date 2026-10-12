@@ -42,6 +42,7 @@ func (s *Server) handleMCPToken(w http.ResponseWriter, r *http.Request) {
 	// client ever get a token at all", which is the first question when an
 	// MCP load fails on the client side and says nothing about the server.
 	slog.Info("mcp: token minted", "user", userID(r), "expires_at", expiresAt.Format(time.RFC3339))
+	noStore(w)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token":          token,
 		"expiresAt":      expiresAt.Format(time.RFC3339),
