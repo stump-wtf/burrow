@@ -4,6 +4,11 @@ package providers_test
 // ADR-0004): the cache contract, TTL expiry, stale-on-error with a bounded
 // cooldown, the updated_at bump when the derived set changes, and display
 // names from name overrides.
+//
+// Only a row's first fetch is waited for. After that the request that finds
+// a menu expired is served the last-known one and starts the refresh behind
+// itself, so these tests make that request, wait for the gateway call to
+// land (WaitRefreshes), and assert on the request after it.
 
 import (
 	"context"
@@ -11,6 +16,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -154,15 +160,20 @@ func TestMenuRefetchedAfterTTL(t *testing.T) {
 		t.Fatalf("inside the TTL the cache answers, gateway calls %d", n)
 	}
 	time.Sleep(80 * time.Millisecond)
+	if _, err := runtime.RowsFor(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	runtime.WaitRefreshes()
+	if n := gw.count(); n != 2 {
+		t.Fatalf("expiry must trigger exactly one refetch, calls %d", n)
+	}
 	rows, err := runtime.RowsFor(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	runtime.WaitRefreshes()
 	if got := menuIDs(rows[0].Models); got != "gpt-5,gpt-5-mini" {
 		t.Fatalf("after TTL expiry the new menu must be served, got %s", got)
-	}
-	if n := gw.count(); n != 2 {
-		t.Fatalf("expiry must trigger exactly one refetch, calls %d", n)
 	}
 }
 
@@ -208,13 +219,19 @@ func TestGatewayFailureServesStaleWithCooldown(t *testing.T) {
 
 	// After the cooldown the gateway is asked again, and recovery serves
 	// the fresh set.
+	runtime.WaitRefreshes()
 	gw.setFail(false)
 	gw.add("gpt-5-mini")
 	time.Sleep(40 * time.Millisecond)
+	if _, err := runtime.RowsFor(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	runtime.WaitRefreshes()
 	rows, err = runtime.RowsFor(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	runtime.WaitRefreshes()
 	if got := menuIDs(rows[0].Models); got != "gpt-5,gpt-5-mini" {
 		t.Fatalf("after recovery the new menu must be served, got %s", got)
 	}
@@ -245,10 +262,15 @@ func TestMenuChangeBumpsUpdatedAtOnce(t *testing.T) {
 	// LiteLLM edit).
 	gw.add("gpt-5-mini")
 	time.Sleep(80 * time.Millisecond)
+	if _, err := runtime.RowsFor(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	runtime.WaitRefreshes()
 	rows, err = runtime.RowsFor(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	runtime.WaitRefreshes()
 	bumped, err := st.GetProvider(ctx, "lpr_gw")
 	if err != nil {
 		t.Fatal(err)
@@ -265,6 +287,7 @@ func TestMenuChangeBumpsUpdatedAtOnce(t *testing.T) {
 	if _, err := runtime.RowsFor(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
+	runtime.WaitRefreshes()
 	again, err := st.GetProvider(ctx, "lpr_gw")
 	if err != nil {
 		t.Fatal(err)
@@ -293,10 +316,15 @@ func TestSnapshotPathAlsoDerives(t *testing.T) {
 
 	gw.add("gpt-5-mini")
 	time.Sleep(80 * time.Millisecond)
+	if _, err := runtime.SnapshotFor(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	runtime.WaitRefreshes()
 	snap, err = runtime.SnapshotFor(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	runtime.WaitRefreshes()
 	if snap["lpr_gw"] == before {
 		t.Fatalf("the snapshot value must advance when the derived set changes")
 	}
@@ -340,10 +368,15 @@ func TestMenuKnownSeparatesUnansweredFromEmpty(t *testing.T) {
 	gw := newFakeGateway(t)
 	row := gatewayRow(gw.URL())
 	seedRow(t, st, row)
-	// TTL 80ms → cooldown 20ms.
-	runtime := providers.NewRuntime(st, 80*time.Millisecond)
+	// TTL 400ms → cooldown 100ms.
+	runtime := providers.NewRuntime(st, 400*time.Millisecond)
 	ctx := context.Background()
+	// A menu that is due a gateway call gets it behind the request that
+	// noticed, so ask, let that call land, and read what the next request
+	// is served.
 	menu := func() (int, bool) {
+		runtime.MenuFor(ctx, row)
+		runtime.WaitRefreshes()
 		ids, _ := runtime.MenuFor(ctx, row)
 		return len(ids), runtime.MenuKnown(row.ID)
 	}
@@ -367,19 +400,19 @@ func TestMenuKnownSeparatesUnansweredFromEmpty(t *testing.T) {
 
 	// The gateway answers, with nothing in scope: zero is now a fact.
 	gw.setFail(false)
-	time.Sleep(40 * time.Millisecond)
+	time.Sleep(120 * time.Millisecond) // past the cooldown
 	if n, known := menu(); n != 0 || !known {
 		t.Fatalf("an answered empty menu: want 0 ids and known, got %d known=%v", n, known)
 	}
 
 	// A later outage serves the last-known menu, which is still an answer.
 	gw.setIDs("gpt-5")
-	time.Sleep(90 * time.Millisecond)
+	time.Sleep(420 * time.Millisecond) // past the TTL
 	if n, known := menu(); n != 1 || !known {
 		t.Fatalf("a refreshed menu: want 1 id and known, got %d known=%v", n, known)
 	}
 	gw.setFail(true)
-	time.Sleep(90 * time.Millisecond)
+	time.Sleep(420 * time.Millisecond) // past the TTL
 	if n, known := menu(); n != 1 || !known {
 		t.Fatalf("an outage after an answer: want the last-known id and known, got %d known=%v", n, known)
 	}
@@ -559,10 +592,23 @@ func TestMenuFetchAppendsModelsToThePath(t *testing.T) {
 	if len(paths) != len(cases) {
 		t.Fatalf("one fetch per row, got %v", paths)
 	}
-	for i, tc := range cases {
-		if paths[i] != tc.wantPath {
-			t.Errorf("baseURL %q: the gateway saw path %q query %q (bearer sent: %v), want path %q",
-				tc.base, paths[i], queries[i], auths[i] != "", tc.wantPath)
+	// Rows fetch concurrently, so arrival order is not seed order: compare
+	// as a multiset. Every fetch must still carry the row's bearer.
+	got := append([]string(nil), paths...)
+	want := make([]string, 0, len(cases))
+	for _, tc := range cases {
+		want = append(want, tc.wantPath)
+	}
+	sort.Strings(got)
+	sort.Strings(want)
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("the gateway saw path %q, want path %q (queries: %v)", got[i], want[i], queries)
+		}
+	}
+	for _, a := range auths {
+		if a == "" {
+			t.Error("a fetch went out without the row's bearer")
 		}
 	}
 }
