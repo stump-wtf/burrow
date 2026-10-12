@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +23,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Skill is one loadable Library entry.
@@ -43,13 +46,24 @@ type Skill struct {
 // refreshed into CacheDir on every Load. SubDir names a directory inside the
 // resolved source to load from instead of its root — the org's skills repo
 // keeps its skills under skills/, and the repo root carries repo plumbing
-// that is not a skill.
+// that is not a skill. GitTimeout bounds the git commands of one refresh; zero
+// means DefaultGitTimeout.
 type Source struct {
-	Dir      string
-	GitURL   string
-	CacheDir string
-	SubDir   string
+	Dir        string
+	GitURL     string
+	CacheDir   string
+	SubDir     string
+	GitTimeout time.Duration
 }
+
+// DefaultGitTimeout is how long one refresh may spend in git. A shallow clone
+// of a skills repository is seconds of work, so a minute only ever ends a
+// remote that has stopped answering.
+const DefaultGitTimeout = time.Minute
+
+// gitWaitDelay is how long a git that has exited or been killed may keep its
+// output pipe open before the loader stops reading it.
+const gitWaitDelay = 5 * time.Second
 
 var nameRE = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 
@@ -72,22 +86,105 @@ func (s *Source) Load(ctx context.Context) ([]Skill, error) {
 }
 
 func (s *Source) refreshGit(ctx context.Context) (string, error) {
+	// The refresh is shared: it runs under the refresh lock and its result
+	// serves every member. So it takes its deadline from the loader, not from
+	// the request that happened to trigger it — that member disconnecting must
+	// not kill a clone part-way, and a request with no deadline of its own must
+	// not let a silent remote hold the lock forever.
+	timeout := s.GitTimeout
+	if timeout <= 0 {
+		timeout = DefaultGitTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
+
 	clone := filepath.Join(s.CacheDir, "repo")
 	if _, err := os.Stat(filepath.Join(clone, ".git")); err != nil {
 		if err := os.MkdirAll(s.CacheDir, 0o755); err != nil {
 			return "", fmt.Errorf("skills: cache dir: %w", err)
 		}
-		out, err := exec.CommandContext(ctx, "git", "clone", "--depth", "1", s.GitURL, clone).CombinedOutput()
+		// A clone killed part-way leaves a .git directory behind, and the
+		// check above would take it for a finished checkout from then on.
+		// Whether refreshing such a repository ever recovers depends on where
+		// git died, so the clone is made beside the cache and only a finished
+		// one is renamed into place.
+		tmp, err := os.MkdirTemp(s.CacheDir, "clone-")
 		if err != nil {
-			return "", fmt.Errorf("skills: git clone: %v: %s", err, strings.TrimSpace(string(out)))
+			return "", fmt.Errorf("skills: cache dir: %w", err)
+		}
+		defer os.RemoveAll(tmp)
+		out, err := s.git(ctx, "clone", "--depth", "1", s.GitURL, tmp)
+		if err != nil {
+			return "", fmt.Errorf("skills: git clone: %v: %s", err, out)
+		}
+		// Whatever sits at the path is not a checkout; it would block the rename.
+		if err := os.RemoveAll(clone); err != nil {
+			return "", fmt.Errorf("skills: cache dir: %w", err)
+		}
+		if err := os.Rename(tmp, clone); err != nil {
+			return "", fmt.Errorf("skills: cache dir: %w", err)
 		}
 	} else {
-		out, err := exec.CommandContext(ctx, "git", "-C", clone, "pull", "--ff-only").CombinedOutput()
-		if err != nil {
-			slog.Warn("skills: git pull failed; serving the cached clone", "error", strings.TrimSpace(string(out)))
+		// The cache is a mirror of the remote's default branch, not a branch
+		// of its own: fetch what the remote has now and move to it, whatever
+		// the history between. A fast-forward-only pull freezes the Library
+		// the first time upstream force-pushes, which is how a bad skill gets
+		// retracted. origin is re-pointed first because the clone remembers
+		// the URL it was made from: without that, changing
+		// BURROW_SKILLS_GIT_URL is ignored for as long as the cache exists.
+		for _, args := range [][]string{
+			{"remote", "set-url", "origin", s.GitURL},
+			{"fetch", "--depth", "1", "origin", "HEAD"},
+			{"reset", "--hard", "FETCH_HEAD"},
+		} {
+			out, err := s.git(ctx, append([]string{"-C", clone}, args...)...)
+			if err != nil {
+				slog.Warn("skills: git refresh failed; serving the cached clone", "step", args[0], "error", err, "output", out)
+				break
+			}
 		}
 	}
 	return clone, nil
+}
+
+// git runs one git command and returns its combined output. git reaches a
+// remote through a helper process (git-remote-http, ssh) that inherits the
+// output pipe and survives git itself being killed, so killing git alone
+// leaves CombinedOutput reading a pipe the orphan still holds: the whole
+// process group goes down with the deadline, and WaitDelay stops the read if
+// something escapes that. The output comes back redacted, because it is only
+// ever used in an error or a log line.
+func (s *Source) git(ctx context.Context, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	killGroupOnCancel(cmd)
+	cmd.WaitDelay = gitWaitDelay
+	out, err := cmd.CombinedOutput()
+	if err != nil && ctx.Err() != nil {
+		// "signal: killed" says nothing; the deadline is why.
+		err = ctx.Err()
+	}
+	return s.redact(strings.TrimSpace(string(out))), err
+}
+
+// redact takes the configured URL out of git's output. The URL may carry a
+// credential, and git repeats it: a token in the username position comes back
+// in "could not read Password for 'https://<token>@host'" when the remote
+// answers 401. Current gits strip the userinfo from most other messages, so
+// the URL is matched with and without it, and the userinfo on its own for the
+// messages that print only part of the URL.
+func (s *Source) redact(out string) string {
+	const placeholder = "<BURROW_SKILLS_GIT_URL>"
+	pairs := []string{s.GitURL, placeholder}
+	if u, err := url.Parse(s.GitURL); err == nil && u.User != nil {
+		userinfo := u.User.String()
+		password, _ := u.User.Password()
+		u.User = nil
+		pairs = append(pairs, u.String(), placeholder, userinfo+"@", "***@")
+		if password != "" {
+			pairs = append(pairs, password, "***")
+		}
+	}
+	return strings.NewReplacer(pairs...).Replace(out)
 }
 
 func loadDir(dir string) ([]Skill, error) {
@@ -95,22 +192,42 @@ func loadDir(dir string) ([]Skill, error) {
 	if err != nil {
 		return nil, fmt.Errorf("skills: read dir: %w", err)
 	}
+	// The directory's content is whatever the skills repository commits, and a
+	// commit can add a symlink: innocent/SKILL.md -> /some/outside/values.yaml
+	// would be read and, if it happens to open with a frontmatter block, served
+	// to every member and agent as a skill. So SKILL.md is read through a root
+	// at the Library directory, which refuses any path that leaves it, and only
+	// when both it and its skill directory are the real thing, not a link.
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, fmt.Errorf("skills: read dir: %w", err)
+	}
+	defer root.Close()
 	var skills []Skill
 	for _, entry := range entries {
+		name := entry.Name()
+		if entry.Type()&os.ModeSymlink != 0 {
+			slog.Warn("skills: skipping symlinked entry", "skill", name)
+			continue
+		}
 		if !entry.IsDir() {
 			continue
 		}
-		name := entry.Name()
 		if !nameRE.MatchString(name) || len(name) > 64 {
 			slog.Warn("skills: skipping directory with non-kebab-case name", "dir", name)
 			continue
 		}
 		path := filepath.Join(dir, name, "SKILL.md")
-		info, err := os.Stat(path)
+		inRoot := filepath.Join(name, "SKILL.md")
+		info, err := root.Lstat(inRoot)
 		if err != nil {
 			continue
 		}
-		raw, err := os.ReadFile(path)
+		if !info.Mode().IsRegular() {
+			slog.Warn("skills: skipping SKILL.md that is not a regular file", "skill", name)
+			continue
+		}
+		raw, err := root.ReadFile(inRoot)
 		if err != nil {
 			slog.Warn("skills: skipping unreadable SKILL.md", "path", path, "error", err)
 			continue
@@ -125,47 +242,83 @@ func loadDir(dir string) ([]Skill, error) {
 	return skills, nil
 }
 
-// parse reads the frontmatter of a SKILL.md. Frontmatter is a leading
-// `---`-delimited block of `key: value` lines; description is required,
-// title optional (defaults to the directory name).
+// frontmatter is what the loader reads out of a SKILL.md frontmatter block.
+// Every other key is the agent's business and is ignored.
+type frontmatter struct {
+	Title       string `yaml:"title"`
+	Description string `yaml:"description"`
+}
+
+// parse reads the frontmatter of a SKILL.md: a leading `---`-delimited YAML
+// block. description is required, title optional (defaults to the directory
+// name). The block is decoded as YAML, not scanned for `key: value` lines: a
+// line scan reads a folded `description: >-` as the description ">-" and
+// takes a nested metadata block's keys for the skill's own, and what it gets
+// wrong goes into the catalog the agent is shown.
 func parse(name, raw string, updated time.Time) (Skill, error) {
 	skill := Skill{Name: name, Title: name, Body: raw, UpdatedAt: updated}
 	front, ok := splitFrontmatter(raw)
 	if !ok {
 		return skill, fmt.Errorf("no frontmatter block")
 	}
-	for _, line := range front {
-		key, value, found := strings.Cut(line, ":")
-		if !found {
-			continue
-		}
-		key = strings.TrimSpace(key)
-		value = strings.Trim(strings.TrimSpace(value), `"'`)
-		switch key {
-		case "description":
-			skill.Description = value
-		case "title", "name":
-			if value != "" && key == "title" {
-				skill.Title = value
-			}
-		}
+	var meta frontmatter
+	if err := yaml.Unmarshal([]byte(front), &meta); err != nil {
+		// A block that is not valid YAML is still read, the way it was
+		// before the decode: skill authors write for agents that tolerate
+		// keys such as `argument-hint: [a] [b]`, and one such key the loader
+		// never reads must not drop a skill that was being served.
+		slog.Warn("skills: frontmatter is not valid YAML; reading title and description line by line", "skill", name, "error", err)
+		meta = scanFrontmatter(front)
 	}
-	if strings.TrimSpace(skill.Description) == "" {
+	if title := strings.TrimSpace(meta.Title); title != "" {
+		skill.Title = title
+	}
+	skill.Description = strings.TrimSpace(meta.Description)
+	if skill.Description == "" {
 		return skill, fmt.Errorf("frontmatter has no description")
 	}
 	return skill, nil
 }
 
-func splitFrontmatter(raw string) ([]string, bool) {
-	if !strings.HasPrefix(raw, "---\n") {
-		return nil, false
+// scanFrontmatter is the fallback for a block yaml cannot decode: the
+// top-level `title:` and `description:` lines, taken as plain single-line
+// values. Indented lines belong to some other key and are skipped.
+func scanFrontmatter(front string) frontmatter {
+	var meta frontmatter
+	for _, line := range strings.Split(front, "\n") {
+		if line == "" || line[0] == ' ' || line[0] == '\t' {
+			continue
+		}
+		key, value, found := strings.Cut(line, ":")
+		if !found {
+			continue
+		}
+		value = strings.Trim(strings.TrimSpace(value), `"'`)
+		switch strings.TrimSpace(key) {
+		case "title":
+			meta.Title = value
+		case "description":
+			meta.Description = value
+		}
 	}
-	rest := raw[len("---\n"):]
+	return meta
+}
+
+// splitFrontmatter returns the text between the opening `---` line and the
+// next one. A file saved with CRLF line endings opens with "---\r\n".
+func splitFrontmatter(raw string) (string, bool) {
+	rest, ok := strings.CutPrefix(raw, "---\n")
+	if !ok {
+		rest, ok = strings.CutPrefix(raw, "---\r\n")
+	}
+	if !ok {
+		return "", false
+	}
 	end := strings.Index(rest, "\n---")
 	if end < 0 {
-		return nil, false
+		return "", false
 	}
-	return strings.Split(rest[:end], "\n"), true
+	return rest[:end], true
 }
 
 // Catalog is a caching view over a Source. The desktop app polls the Library
@@ -178,7 +331,7 @@ type Catalog struct {
 	mu        sync.Mutex // guards the cache fields
 	refreshMu sync.Mutex // serializes refreshes; never held by cache hits
 	skills    []Skill
-	loadedAt  time.Time
+	loadedAt  time.Time // zero until the first successful load
 }
 
 // DefaultCacheTTL balances freshness against clone traffic.
@@ -190,11 +343,15 @@ func NewCatalog(source Source) *Catalog {
 }
 
 // All returns the cached catalog, reloading when stale. The refresh lock is
-// only held across Source.Load, so a slow git pull never stalls cache hits;
+// only held across Source.Load, so a slow git fetch never stalls cache hits;
 // a reader arriving mid-refresh serves the stale catalog instead of waiting.
 func (c *Catalog) All(ctx context.Context) ([]Skill, error) {
 	c.mu.Lock()
-	if c.skills != nil && time.Since(c.loadedAt) < c.CacheTTL {
+	// "Loaded" is the timestamp, not a non-nil slice: a source with no valid
+	// skills loads as an empty catalog, and an empty catalog that never counts
+	// as cached runs git on every request.
+	loaded := !c.loadedAt.IsZero()
+	if loaded && time.Since(c.loadedAt) < c.CacheTTL {
 		skills := c.skills
 		c.mu.Unlock()
 		return skills, nil
@@ -203,7 +360,7 @@ func (c *Catalog) All(ctx context.Context) ([]Skill, error) {
 	c.mu.Unlock()
 
 	if !c.refreshMu.TryLock() {
-		if stale == nil {
+		if !loaded {
 			// Cold start with a load already in flight: wait for it.
 			c.refreshMu.Lock()
 			c.refreshMu.Unlock()
@@ -217,7 +374,7 @@ func (c *Catalog) All(ctx context.Context) ([]Skill, error) {
 	skills, err := c.Source.Load(ctx)
 	if err != nil {
 		// Serve the stale catalog rather than an error when a refresh fails.
-		if stale != nil {
+		if loaded {
 			slog.Warn("skills: reload failed; serving stale catalog", "error", err)
 			return stale, nil
 		}

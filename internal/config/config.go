@@ -81,6 +81,23 @@ type Config struct {
 
 // FromEnv builds a Config from BURROW_* environment variables.
 func FromEnv() (*Config, error) {
+	// A duration or boolean that is set but unreadable fails the load (see
+	// envDuration); the first one found is reported once the struct is built.
+	var invalid error
+	duration := func(key string, def time.Duration) time.Duration {
+		d, err := envDuration(key, def)
+		if err != nil && invalid == nil {
+			invalid = err
+		}
+		return d
+	}
+	boolean := func(key string, def bool) bool {
+		b, err := envBool(key, def)
+		if err != nil && invalid == nil {
+			invalid = err
+		}
+		return b
+	}
 	c := &Config{
 		Addr:             env("BURROW_ADDR", ":8080"),
 		BaseURL:          strings.TrimRight(os.Getenv("BURROW_BASE_URL"), "/"),
@@ -96,14 +113,17 @@ func FromEnv() (*Config, error) {
 		SkillsCacheDir:   env("BURROW_SKILLS_CACHE_DIR", ""),
 		SkillsSubdir:     os.Getenv("BURROW_SKILLS_SUBDIR"),
 		ProvidersFile:    os.Getenv("BURROW_PROVIDERS_FILE"),
-		ModelsTTL:        envDuration("BURROW_MODELS_TTL", 60*time.Second),
+		ModelsTTL:        duration("BURROW_MODELS_TTL", 60*time.Second),
 		AdminGroups:      envList("BURROW_ADMIN_GROUPS"),
-		APITokenTTL:      envDuration("BURROW_API_TOKEN_TTL", 90*24*time.Hour),
-		OIDCGroupsScope:  envBool("BURROW_OIDC_GROUPS_SCOPE", true),
-		GrantTTL:         envDuration("BURROW_GRANT_TTL", 5*time.Minute),
-		SessionTTL:       envDuration("BURROW_SESSION_TTL", 30*24*time.Hour),
-		MCPTokenTTL:      envDuration("BURROW_MCP_TOKEN_TTL", 24*time.Hour),
-		OIDCStateTTL:     envDuration("BURROW_OIDC_STATE_TTL", 10*time.Minute),
+		APITokenTTL:      duration("BURROW_API_TOKEN_TTL", 90*24*time.Hour),
+		OIDCGroupsScope:  boolean("BURROW_OIDC_GROUPS_SCOPE", true),
+		GrantTTL:         duration("BURROW_GRANT_TTL", 5*time.Minute),
+		SessionTTL:       duration("BURROW_SESSION_TTL", 30*24*time.Hour),
+		MCPTokenTTL:      duration("BURROW_MCP_TOKEN_TTL", 24*time.Hour),
+		OIDCStateTTL:     duration("BURROW_OIDC_STATE_TTL", 10*time.Minute),
+	}
+	if invalid != nil {
+		return nil, invalid
 	}
 	// OIDC issuer and client id are required; the client secret is not —
 	// the deployment uses a public PKCE client (Pocket ID, like cairn's),
@@ -137,13 +157,22 @@ func env(key, def string) string {
 	return def
 }
 
-func envDuration(key string, def time.Duration) time.Duration {
-	if v := os.Getenv(key); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			return d
-		}
+// envDuration reads a lifetime. Unset or blank means def. Anything else must
+// be a positive Go duration, and a value that is not is an error rather than
+// def: "7d" or "300" would otherwise leave an operator who meant to shorten a
+// window running the default one, with nothing said. Every caller is a token
+// or cache lifetime, so zero and negative values are mistakes as well. The
+// error names the variable, not its value.
+func envDuration(key string, def time.Duration) (time.Duration, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
 	}
-	return def
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("config: %s must be a positive duration with a unit, such as 90s, 30m or 720h (there is no day unit: 7 days is 168h)", key)
+	}
+	return d, nil
 }
 
 // envList parses a comma-separated list, trimming entries and dropping
@@ -162,13 +191,19 @@ func envList(key string) []string {
 	return out
 }
 
-func envBool(key string, def bool) bool {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			return b
-		}
+// envBool reads a switch. Unset or blank means def; a value that is set but
+// is not a boolean is an error for the same reason as in envDuration — "off"
+// read as the default true is the opposite of what was asked for.
+func envBool(key string, def bool) (bool, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
 	}
-	return def
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("config: %s must be true or false", key)
+	}
+	return b, nil
 }
 
 func cacheDefault() string {

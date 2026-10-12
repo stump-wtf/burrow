@@ -18,7 +18,15 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/burrow ./cmd/burrow
+# VERSION lands in internal/buildinfo.Version, which the startup log line and
+# the MCP `initialize` serverInfo report. ship.yaml passes `sha-<short sha>`,
+# the same string as the image's sha tag; a bare `docker build`, or an empty
+# build-arg, says "dev" like a bare `go build`. Declared here rather than at
+# the top so a new version does not invalidate the module download above.
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+    -ldflags="-s -w -X gitea.stump.rocks/stump.wtf/burrow/internal/buildinfo.Version=${VERSION:-dev}" \
+    -o /out/burrow ./cmd/burrow
 
 # Named `runtime` so CI's image job passes `no-cache-filter: runtime`: the
 # apk upgrade layer must rebuild on every image build, or the Trivy scan (and

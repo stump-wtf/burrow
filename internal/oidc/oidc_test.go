@@ -6,7 +6,8 @@ import (
 )
 
 // Governing: SPEC-0003 REQ "Groups claim" — an array of strings or a single
-// string; anything else and empty entries yield nothing, never nil.
+// string; anything else and empty entries yield nothing, never nil. Names are
+// trimmed and listed once.
 func TestGroupsFromClaim(t *testing.T) {
 	cases := []struct {
 		claim any
@@ -18,6 +19,12 @@ func TestGroupsFromClaim(t *testing.T) {
 		{"", ""},
 		{[]any{"a", "", 3, "b"}, "a,b"},
 		{map[string]any{"x": 1}, ""},
+		// One spelling per group: every later comparison is exact, and the
+		// rules it is compared with are trimmed when an admin saves them.
+		{"contractors ", "contractors"},
+		{"  ", ""},
+		{[]any{" family", "friends\t", "family ", "   "}, "family,friends"},
+		{[]any{"a", "b", "a"}, "a,b"},
 	}
 	for _, tc := range cases {
 		got := GroupsFromClaim(tc.claim)

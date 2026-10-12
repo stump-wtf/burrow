@@ -116,7 +116,11 @@ type consoleModel struct {
 
 // consoleRow is one provider row as the console renders it. Key VALUES
 // never appear here — only the environment variable's name and whether it
-// is set (SPEC-0004: burrow never holds a key).
+// is set (SPEC-0004: burrow never holds a key). ModelCount is a count only
+// when ModelsKnown: a gateway that could not be asked (unreachable, refusing
+// the key, cooling down, or a key variable that is unset) leaves an empty
+// menu too, and printing that as "0 models" tells an admin about to delete
+// the row something nobody established.
 type consoleRow struct {
 	ID              string
 	ProviderID      string
@@ -128,6 +132,7 @@ type consoleRow struct {
 	GroupsNull      bool
 	Models          []consoleModel
 	ModelCount      int
+	ModelsKnown     bool
 	UpdatedAt       string
 	HiddenOverrides []consoleModel
 	IsNewRow        bool
@@ -144,11 +149,16 @@ type auditLine struct {
 }
 
 // consolePage is the data for every console page (one template; sections
-// render when their fields are set).
+// render when their fields are set). The list, preview, and audit views are
+// selected by IsList, IsPreview, and IsAudit rather than by having rows to
+// show: a view with nothing in it still renders its heading, its links, and
+// a line saying so — keyed on Rows alone, an empty store rendered a bare
+// navigation bar with no way to add the first provider.
 type consolePage struct {
 	Title        string
 	Flash        string
 	Errors       []string
+	IsList       bool
 	Rows         []consoleRow
 	IsPreview    bool
 	PreviewGroup string
@@ -157,6 +167,7 @@ type consolePage struct {
 	IsNew        bool
 	IsConfirm    bool
 	Etag         string
+	IsAudit      bool
 	Audit        []auditLine
 	Matrix       *skillMatrix
 }
@@ -181,10 +192,11 @@ td .sub{color:var(--muted);font-size:12.5px}
 section.card{width:100%;margin-top:20px}
 section.card.wide{max-width:none}
 label{display:block;margin:14px 0 4px;font-size:13px;font-weight:500;color:var(--body)}
-input[type=text]{width:100%;padding:8px 10px;border:1px solid var(--border);
+input[type=text],textarea{width:100%;padding:8px 10px;border:1px solid var(--border);
   border-radius:var(--radius-control);font:14px/1.4 system-ui,sans-serif;color:var(--ink);
   background:var(--card)}
-input[type=text]:focus-visible{outline:2px solid var(--ink);outline-offset:1px}
+input[type=text]:focus-visible,textarea:focus-visible{outline:2px solid var(--ink);outline-offset:1px}
+textarea{display:block;resize:vertical}
 .hint{margin:4px 0 0;font-size:12.5px;color:var(--muted)}
 .actions{display:flex;gap:12px;align-items:center;margin-top:20px}
 .actions form{margin:0}
@@ -220,9 +232,10 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 {{if .Flash}}<p class="flash">{{.Flash}}</p>{{end}}
 {{range .Errors}}<p class="error">{{.}}</p>{{end}}
 
-{{if .Rows}}
+{{if or .IsList .IsPreview}}
 {{if .IsPreview}}
 <h1 style="font-size:19px;font-weight:600;margin:0 0 16px">Visibility preview</h1>
+{{if .GroupChoices}}
 <form method="get" action="/admin/preview" class="card" style="padding:20px">
 <label for="group">A member of group</label>
 <select id="group" name="group" style="padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius-control);font:14px system-ui,sans-serif;color:var(--ink);background:var(--card)">
@@ -230,11 +243,21 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 </select>
 <button class="button inline" type="submit" style="margin-left:12px">Preview</button>
 </form>
+{{else}}
+<p class="note">No provider names a group yet, so there is no group to pick: a row with a null audience is visible to every member.</p>
+{{end}}
+{{if .PreviewGroup}}
 <p class="note">Rows a member of <strong>{{.PreviewGroup}}</strong> would get — the same group match the runtime applies (SPEC-0003). Rows with a null audience are visible to every member.</p>
+{{if not .Rows}}<p class="note">A member of <strong>{{.PreviewGroup}}</strong> would get no providers.</p>{{end}}
+{{else if .GroupChoices}}
+<p class="note">Pick a group to see exactly the rows its members would get.</p>
+{{end}}
 {{else}}
 <h1 style="font-size:19px;font-weight:600;margin:0 0 16px">LLM providers</h1>
 <p class="note" style="margin:0 0 16px"><a class="plain" href="/admin/providers/new">Add a provider</a> &middot; <a class="plain" href="/admin/preview">Visibility preview</a> &middot; audiences take effect at each member's next sign-in</p>
+{{if not .Rows}}<p class="note">No providers yet. Members get no organization models until one is added.</p>{{end}}
 {{end}}
+{{if .Rows}}
 <table>
 <thead><tr><th>Provider</th><th>Base URL</th><th>Key</th><th>Audience</th><th>Models</th><th></th></tr></thead>
 <tbody>
@@ -244,17 +267,18 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 <td>{{.BaseURL}}</td>
 <td>{{if .HasAPIKey}}<span class="badge">{{.APIKeyEnv}} set</span>{{else}}<span class="badge warn">{{.APIKeyEnv}} unset</span>{{end}}</td>
 <td>{{if .GroupsNull}}<span class="badge warn">everyone (org-wide)</span>{{else}}{{range .Groups}}<span class="badge">{{.}}</span> {{end}}{{end}}</td>
-<td>{{.ModelCount}}</td>
+<td>{{if .ModelsKnown}}{{.ModelCount}}{{else}}<span class="sub">model count unknown (gateway unreachable or key unset)</span>{{end}}</td>
 <td><a class="plain" href="/admin/providers/{{.ID}}">edit</a></td>
 </tr>
 {{end}}
 </tbody></table>
 {{end}}
+{{end}}
 
 {{if .IsConfirm}}
 <h1 style="font-size:19px;font-weight:600;margin:0">Delete {{.Row.Name}}?</h1>
 <section class="card">
-<p class="note">This deletes <strong>{{.Row.Name}}</strong> (<code>{{.Row.ID}}</code>) and its {{.Row.ModelCount}} derived model{{if ne .Row.ModelCount 1}}s{{end}} — menus come from the row's key, so members lose them at their next sign-in.{{if .Row.GroupsNull}} This row is visible org-wide (audience is null).{{end}}</p>
+<p class="note">This deletes <strong>{{.Row.Name}}</strong> (<code>{{.Row.ID}}</code>){{if .Row.ModelsKnown}} and its {{.Row.ModelCount}} derived model{{if ne .Row.ModelCount 1}}s{{end}}{{else}}; model count unknown (gateway unreachable or key unset){{end}} — menus come from the row's key, so members lose them at their next sign-in.{{if .Row.GroupsNull}} This row is visible org-wide (audience is null).{{end}}</p>
 <form method="post" action="/admin/providers/{{.Row.ID}}/delete">
 <input type="hidden" name="etag" value="{{.Etag}}">
 <button class="button inline danger" type="submit">Delete provider</button>
@@ -284,8 +308,9 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 <p class="hint">The variable's NAME only — key values never enter burrow. Rotation stays an OpenBao / LiteLLM operation.
 {{if not .IsNew}}{{if .Row.HasAPIKey}}Currently set.{{else}}Currently unset — the row serves no models.{{end}}{{end}}</p>
 <label for="groups">Audience (groups)</label>
-<input type="text" id="groups" name="groups" value="{{range .Row.Groups}}{{.}}, {{end}}" placeholder="empty = every member">
-<p class="hint">Comma-separated OIDC groups. {{if .Row.GroupsNull}}This row currently has a null audience — it is visible org-wide.{{end}} Changes take effect at each member's next sign-in.</p>
+<textarea id="groups" name="groups" rows="3" placeholder="empty = every member">{{range .Row.Groups}}{{.}}
+{{end}}</textarea>
+<p class="hint">One OIDC group per line; the whole line is the group's name, commas included. {{if .Row.GroupsNull}}This row currently has a null audience — it is visible org-wide.{{end}} Changes take effect at each member's next sign-in.</p>
 
 {{if .Row.Models}}
 <label>Models (derived from the row's key — display names are editable)</label>
@@ -314,8 +339,9 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 </section>
 {{end}}
 
-{{if .Audit}}
+{{if .IsAudit}}
 <h1 style="font-size:19px;font-weight:600;margin:0 0 16px">Audit — recent provider changes</h1>
+{{if .Audit}}
 <table>
 <thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Provider</th><th>Detail</th></tr></thead>
 <tbody>
@@ -331,6 +357,9 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 </tr>
 {{end}}
 </tbody></table>
+{{else}}
+<p class="note">No provider changes recorded yet.</p>
+{{end}}
 {{end}}
 
 {{if .Matrix}}
@@ -386,6 +415,7 @@ func (s *Server) consoleRowOf(r *http.Request, p store.ProviderRow) consoleRow {
 		ModelCount: len(ids),
 		UpdatedAt:  quoteETag(p.UpdatedAt),
 	}
+	row.ModelsKnown = s.providers.MenuKnown(p.ID)
 	sort.Strings(ids)
 	for _, id := range ids {
 		name := id
@@ -431,7 +461,7 @@ func (s *Server) handleConsoleList(w http.ResponseWriter, r *http.Request) {
 		s.renderConsoleError(w, http.StatusInternalServerError, "could not load the providers")
 		return
 	}
-	page := consolePage{Title: "LLM providers"}
+	page := consolePage{Title: "LLM providers", IsList: true}
 	for _, p := range rows {
 		page.Rows = append(page.Rows, s.consoleRowOf(r, p))
 	}
@@ -532,6 +562,10 @@ func (s *Server) handleConsoleUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.renderConsoleForm(w, r, etag, "The row changed while you were editing; reload the editor and save again.", formRow)
+	case http.StatusPreconditionRequired:
+		// The API's 428: the form arrived without its etag. Nothing is
+		// wrong with the server, and nothing was written.
+		s.renderConsoleForm(w, r, etag, "The save did not carry the row's etag; reload the editor and save again.", formRow)
 	case http.StatusBadRequest:
 		s.renderConsoleForm(w, r, etag, consoleAPIError(out, "invalid_row"), formRow)
 	case http.StatusNotFound:
@@ -543,7 +577,7 @@ func (s *Server) handleConsoleUpdate(w http.ResponseWriter, r *http.Request) {
 
 // handleConsoleConfirmDelete answers GET /admin/providers/{id}/delete: the
 // confirm step before a delete. It names the row's display name and model
-// count and carries the row's current etag, so the confirm POST states the
+// count (or says the count is unknown) and carries the row's current etag, so the confirm POST states the
 // exact version the admin agreed to delete (SPEC-0004: no silent clobbers).
 func (s *Server) handleConsoleConfirmDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -611,6 +645,9 @@ func (s *Server) handleConsolePreview(w http.ResponseWriter, r *http.Request) {
 				HasAPIKey:  row.HasAPIKey,
 				ModelCount: len(row.Models),
 				Models:     modelsOf(row),
+				// RowsFor just derived this row's menu, so the cache
+				// entry MenuKnown reads is the one behind row.Models.
+				ModelsKnown: s.providers.MenuKnown(row.ID),
 			})
 		}
 	}
@@ -625,7 +662,7 @@ func (s *Server) handleConsoleAudit(w http.ResponseWriter, r *http.Request) {
 		s.renderConsoleError(w, http.StatusInternalServerError, "could not load the audit trail")
 		return
 	}
-	page := consolePage{Title: "Audit"}
+	page := consolePage{Title: "Audit", IsAudit: true}
 	for _, e := range entries {
 		page.Audit = append(page.Audit, auditLine{
 			When:       e.CreatedAt.UTC().Format(time.RFC3339),
@@ -665,10 +702,20 @@ func prettyJSON(raw json.RawMessage) string {
 // renderConsoleForm re-renders the editor with the submitted values and an
 // error banner (create and update failures). The etag rides along so a
 // retry after a fixable error keeps its precondition.
+//
+// The editor's hints beside the key and audience fields describe the STORED
+// row ("Currently set", "currently has a null audience"), which a submitted
+// form says nothing about. They are read back from the store here: left at
+// their zero values, a rejected save reported a provisioned key as unset and
+// dropped the org-wide warning from a row that is still org-wide.
 func (s *Server) renderConsoleForm(w http.ResponseWriter, r *http.Request, etag, msg string, row *consoleRow) {
 	page := consolePage{Title: "New provider", IsNew: row.IsNewRow, Row: row, Etag: etag}
 	if !row.IsNewRow {
 		page.Title = "Edit provider"
+		if p, err := s.store.GetProvider(r.Context(), row.ID); err == nil {
+			stored := s.consoleRowOf(r, p)
+			row.HasAPIKey, row.GroupsNull = stored.HasAPIKey, stored.GroupsNull
+		}
 	}
 	if msg != "" {
 		page.Errors = []string{msg}
@@ -723,15 +770,18 @@ func consoleFormRow(r *http.Request, id string, form url.Values) (*consoleRow, [
 	return row, body
 }
 
-// parseGroups turns the comma-separated audience input into the row's
-// groups: blank means null (visible to every member), never an empty array
-// (SPEC-0004 rejects one).
+// parseGroups turns the audience textarea into the row's groups, one per
+// line: blank means null (visible to every member), never an empty array
+// (SPEC-0004 rejects one). A line is taken whole. The field used to be
+// comma-separated, and a group the API accepts may contain a comma (an LDAP
+// DN does): opening such a row and pressing Save split its one group into
+// several that match nobody.
 func parseGroups(raw string) []string {
 	if strings.TrimSpace(raw) == "" {
 		return nil
 	}
 	var groups []string
-	for _, part := range strings.Split(raw, ",") {
+	for _, part := range strings.Split(raw, "\n") {
 		if g := strings.TrimSpace(part); g != "" {
 			groups = append(groups, g)
 		}

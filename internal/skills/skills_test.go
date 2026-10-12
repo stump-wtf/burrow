@@ -1,7 +1,9 @@
 package skills_test
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -55,8 +57,8 @@ func TestLoadDirParsesFrontmatter(t *testing.T) {
 	}
 }
 
-// A skill without a description, and a directory that is not kebab-case, are
-// skipped rather than served broken.
+// A skill without a description, a directory that is not kebab-case, and
+// frontmatter that is not YAML are skipped rather than served broken.
 func TestLoadDirSkipsInvalidEntries(t *testing.T) {
 	dir := t.TempDir()
 	writeSkill(t, dir, "no-description", "title: Broken")
@@ -69,6 +71,135 @@ func TestLoadDirSkipsInvalidEntries(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Name != "good-one" {
 		t.Fatalf("want only good-one, got %+v", got)
+	}
+}
+
+// Frontmatter is YAML, and skill authors write it as YAML: a description
+// folded over several lines, a metadata block with its own keys, Windows line
+// endings. Each of these used to produce a wrong catalog entry — a description
+// of ">-", a title taken from metadata — or drop the skill outright, and the
+// catalog entry is what the agent is shown.
+func TestLoadDirDecodesFrontmatterAsYAML(t *testing.T) {
+	tests := []struct {
+		name            string
+		source          string
+		wantTitle       string
+		wantDescription string
+	}{
+		{
+			name:            "plain",
+			source:          "---\ntitle: Code Review\ndescription: Review code carefully.\n---\n\nDo the thing.\n",
+			wantTitle:       "Code Review",
+			wantDescription: "Review code carefully.",
+		},
+		{
+			name:            "folded",
+			source:          "---\ndescription: >-\n  Review code carefully,\n  then review it again.\n---\n\nDo the thing.\n",
+			wantTitle:       "folded",
+			wantDescription: "Review code carefully, then review it again.",
+		},
+		{
+			name:            "literal",
+			source:          "---\ndescription: |\n  Review code carefully.\n  Then review it again.\n---\n\nDo the thing.\n",
+			wantTitle:       "literal",
+			wantDescription: "Review code carefully.\nThen review it again.",
+		},
+		{
+			name:            "nested",
+			source:          "---\ntitle: Code Review\ndescription: Review code carefully.\nmetadata:\n  title: Internal\n  description: Not the skill's description.\n---\n\nDo the thing.\n",
+			wantTitle:       "Code Review",
+			wantDescription: "Review code carefully.",
+		},
+		{
+			name:            "trailing-quote",
+			source:          "---\ndescription: Use when asked to \"review this\"\n---\n\nDo the thing.\n",
+			wantTitle:       "trailing-quote",
+			wantDescription: `Use when asked to "review this"`,
+		},
+		{
+			name:            "crlf",
+			source:          "---\r\ntitle: Code Review\r\ndescription: Review code carefully.\r\n---\r\n\r\nDo the thing.\r\n",
+			wantTitle:       "Code Review",
+			wantDescription: "Review code carefully.",
+		},
+	}
+	dir := t.TempDir()
+	for _, tt := range tests {
+		if err := os.MkdirAll(filepath.Join(dir, tt.name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, tt.name, "SKILL.md"), []byte(tt.source), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := (&skills.Source{Dir: dir}).Load(context.Background())
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			skill, ok := skills.Find(got, tt.name)
+			if !ok {
+				t.Fatal("skill was dropped from the catalog")
+			}
+			if skill.Title != tt.wantTitle {
+				t.Errorf("title: want %q, got %q", tt.wantTitle, skill.Title)
+			}
+			if skill.Description != tt.wantDescription {
+				t.Errorf("description: want %q, got %q", tt.wantDescription, skill.Description)
+			}
+			if skill.Body != tt.source {
+				t.Errorf("body must stay the SKILL.md source verbatim, got %q", skill.Body)
+			}
+		})
+	}
+}
+
+// The Library is whatever the skills repository says it is, so a commit to it
+// must not be able to point SKILL.md at a file outside the Library: anything
+// that happens to open with a frontmatter block would be served to every
+// member and every agent as a skill.
+func TestLoadDirDoesNotFollowSymlinks(t *testing.T) {
+	outside := t.TempDir()
+	secret := "---\ndescription: Not a skill.\n---\n\noutside-the-library\n"
+	if err := os.WriteFile(filepath.Join(outside, "values.yaml"), []byte(secret), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeSkill(t, outside, "elsewhere", "description: A skill directory that lives outside.")
+
+	dir := t.TempDir()
+	writeSkill(t, dir, "good-one", "description: Fine.")
+	if err := os.Mkdir(filepath.Join(dir, "innocent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "values.yaml"), filepath.Join(dir, "innocent", "SKILL.md")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "elsewhere"), filepath.Join(dir, "linked-dir")); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	restore := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(restore) })
+
+	got, err := (&skills.Source{Dir: dir}).Load(context.Background())
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "good-one" {
+		t.Fatalf("want only good-one, got %+v", got)
+	}
+	// Both skips are visible, named by skill and nothing else: where the
+	// link pointed is not something to repeat in a log.
+	for _, name := range []string{"innocent", "linked-dir"} {
+		if !strings.Contains(logs.String(), "skill="+name) {
+			t.Errorf("the skipped %s was not logged: %s", name, logs.String())
+		}
+	}
+	if strings.Contains(logs.String(), outside) {
+		t.Errorf("the log repeats the link target: %s", logs.String())
 	}
 }
 
@@ -166,5 +297,93 @@ func TestLoadFromGitSubDir(t *testing.T) {
 	}
 	if len(root) != 0 {
 		t.Fatalf("root scan must find no skills, got %+v", root)
+	}
+}
+
+// A source with no valid skills is still a loaded catalog. The cache used to
+// tell "never loaded" from "loaded" by the slice being non-nil, so an empty
+// Library was never cached and every request inside the TTL ran git again.
+func TestCatalogCachesAnEmptyCatalog(t *testing.T) {
+	// The developer's git configuration must not change the outcome.
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# skills\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"init", "--initial-branch=main"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "Test"},
+		{"add", "-A"},
+		{"commit", "-m", "seed"},
+	} {
+		out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+
+	// From here on `git` is a wrapper that records each invocation before
+	// handing over to the real one.
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	calls := filepath.Join(bin, "calls")
+	wrapper := "#!/bin/sh\necho \"$1\" >> '" + calls + "'\nexec '" + realGit + "' \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	gitCalls := func() int {
+		raw, err := os.ReadFile(calls)
+		if err != nil {
+			t.Fatalf("git was never run through the wrapper: %v", err)
+		}
+		return strings.Count(string(raw), "\n")
+	}
+
+	cat := skills.NewCatalog(skills.Source{GitURL: repo, CacheDir: t.TempDir()})
+	list, err := cat.All(context.Background())
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("the seed repo has no skills, got %+v", list)
+	}
+	first := gitCalls()
+
+	for range 4 {
+		if _, err := cat.All(context.Background()); err != nil {
+			t.Fatalf("cached load: %v", err)
+		}
+	}
+	if again := gitCalls() - first; again != 0 {
+		t.Fatalf("an empty catalog must be cached for the TTL, but 4 more requests ran git %d more times", again)
+	}
+}
+
+// A frontmatter block that is not valid YAML is still read line by line:
+// skills are written for agents that tolerate keys such as
+// `argument-hint: [a] [b]`, and a key the loader never reads must not drop a
+// skill it was serving. Indented lines belong to another key and are not
+// taken for the skill's own.
+func TestLoadDirReadsFrontmatterThatIsNotValidYAML(t *testing.T) {
+	dir := t.TempDir()
+	writeSkill(t, dir, "with-hint", "title: With Hint\ndescription: \"Use when asked.\"\nargument-hint: [a] [b]\nmetadata:\n  description: not this one")
+	writeSkill(t, dir, "hint-only", "argument-hint: [a] [b]")
+
+	got, err := (&skills.Source{Dir: dir}).Load(context.Background())
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "with-hint" {
+		t.Fatalf("want only with-hint (hint-only has no description), got %+v", got)
+	}
+	if got[0].Title != "With Hint" || got[0].Description != "Use when asked." {
+		t.Fatalf("title %q description %q", got[0].Title, got[0].Description)
 	}
 }

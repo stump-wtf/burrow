@@ -56,14 +56,23 @@ Each row's `models[]` SHALL be the model ids its key reports from
 with `Authorization: Bearer <the row's key>` from `apiKeyEnv`. The fetch
 SHALL be cached per row for `BURROW_MODELS_TTL` (default 60s) and, on fetch
 failure, the last-known ids SHALL be served; a row with no key set or a
-never-succeeded fetch serves no models. `GET` for the desktop-facing surface
-SHALL NOT be blocked on a live gateway call beyond the cached fetch. A
+never-succeeded fetch serves no models. A `200` whose body carries no
+`data` array is a fetch failure, not an empty menu; `{"data":[]}` is the
+key's real, empty scope. `GET` for the desktop-facing surface
+SHALL NOT be blocked on a live gateway call beyond the cached fetch: a row
+that already has an answer (a menu, or a recorded failure) SHALL be served
+as last known while at most one gateway call per row runs outside the
+request; rows with no answer yet MAY be waited for, together and for a
+bound well inside the client's 12-second request timeout; and `/connect`
+SHALL NOT wait on the gateway at all. A gateway call SHALL NOT be cancelled
+by, or count as failed because of, the request that started it. A
 model's display name SHALL be its name override when present, else its id.
 
 #### Scenario: Model added in LiteLLM
 
 - **GIVEN** a row whose key's scope gains a model at the gateway
-- **WHEN** the row's cache TTL next expires
+- **WHEN** the row's cache TTL has expired and the refresh the next request
+  starts has landed
 - **THEN** the row lists the new model and the row's `updated_at` advances,
   so the client's resource snapshot triggers a re-sync
 
@@ -71,7 +80,17 @@ model's display name SHALL be its name override when present, else its id.
 
 - **WHEN** a cache refresh fails
 - **THEN** the last-known menu is served and the failure is retried after a
-  bounded cooldown, not once per request
+  bounded cooldown counted from when the failed call returned, not once per
+  request
+
+#### Scenario: Gateway hung
+
+- **GIVEN** a gateway that accepts a row's `GET {baseURL}/models` and never
+  answers
+- **WHEN** a member lists providers, polls the resource snapshot, or connects
+- **THEN** `/connect` answers at once with the menu known so far, and the
+  listing and the snapshot answer after at most one bounded wait for all the
+  rows that have no answer yet, serving those rows with no models
 
 ### Requirement: Admin surface
 

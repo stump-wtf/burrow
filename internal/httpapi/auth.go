@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -40,6 +41,7 @@ func (s *Server) requireSession(next func(http.ResponseWriter, *http.Request)) f
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := bearerToken(r)
 		if token == "" {
+			slog.Warn("session refused", "reason", "unauthorized", "path", r.URL.Path)
 			writeError(w, http.StatusUnauthorized, "unauthorized", "missing bearer token")
 			return
 		}
@@ -47,8 +49,10 @@ func (s *Server) requireSession(next func(http.ResponseWriter, *http.Request)) f
 		if err != nil {
 			switch {
 			case errors.Is(err, store.ErrExpired):
+				slog.Warn("session refused", "reason", "session_expired", "path", r.URL.Path)
 				writeError(w, http.StatusUnauthorized, "session_expired", "session has expired")
 			case errors.Is(err, store.ErrNotFound):
+				slog.Warn("session refused", "reason", "invalid_session", "path", r.URL.Path)
 				writeError(w, http.StatusUnauthorized, "invalid_session", "session not found")
 			default:
 				// A transient store failure is not a session problem. Any
@@ -144,16 +148,61 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	_ = pageTmpl.Execute(w, data)
 }
 
+// oidcStateCookieName carries the state of the sign-in this browser started.
+// The stored row proves only that burrow issued a state, not who holds it:
+// without the cookie an attacker can start a flow, authenticate as
+// themselves, stop before the redirect, and hand the callback URL to someone
+// else, whose browser (or desktop app, through the deep link) is then signed
+// in to the attacker's account. The cookie is scoped to the sign-in routes so
+// no other request carries it.
+const (
+	oidcStateCookieName = "burrow_oidc_state"
+	oidcStateCookiePath = "/auth/oidc"
+)
+
 // handleOIDCStart begins the authorization-code-with-PKCE flow.
 func (s *Server) handleOIDCStart(w http.ResponseWriter, r *http.Request) {
 	state := randomState()
 	verifier := randomVerifier()
 	desktop := r.URL.Query().Get("desktop") == "1"
 	if err := s.store.SaveOIDCState(r.Context(), state, verifier, desktop, s.cfg.OIDCStateTTL); err != nil {
+		slog.Error("sign-in state save failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "server_error", "could not start sign-in")
 		return
 	}
+	// SameSite=Lax still sends the cookie on the issuer's redirect back, a
+	// top-level GET; it lives exactly as long as the stored state.
+	http.SetCookie(w, &http.Cookie{
+		Name:     oidcStateCookieName,
+		Value:    state,
+		Path:     oidcStateCookiePath,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   strings.HasPrefix(s.origin(r), "https://"),
+		MaxAge:   int(s.cfg.OIDCStateTTL.Seconds()),
+	})
 	http.Redirect(w, r, s.oidc.AuthCodeURL(state, verifier), http.StatusFound)
+}
+
+// oidcStateFromThisBrowser reports whether state is the one this browser was
+// handed at /auth/oidc/start, and clears the cookie when it is. A mismatch
+// leaves the cookie alone, so a link to someone else's callback cannot cancel
+// a sign-in this browser has in flight.
+func (s *Server) oidcStateFromThisBrowser(w http.ResponseWriter, r *http.Request, state string) bool {
+	cookie, err := r.Cookie(oidcStateCookieName)
+	if err != nil || subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(state)) != 1 {
+		slog.Warn("oidc: callback refused", "reason", "state_not_from_this_browser", "cookie_present", err == nil)
+		return false
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     oidcStateCookieName,
+		Path:     oidcStateCookiePath,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   strings.HasPrefix(s.origin(r), "https://"),
+		MaxAge:   -1,
+	})
+	return true
 }
 
 // handleOIDCCallback finishes the flow: exchange, verify, upsert the user,
@@ -165,13 +214,30 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "missing state or code")
 		return
 	}
+	// Checked before the stored state is consumed: a callback from a browser
+	// that did not start the flow must not burn it either.
+	if !s.oidcStateFromThisBrowser(w, r, state) {
+		writeError(w, http.StatusBadRequest, "invalid_state", "sign-in attempt expired or unknown; start again")
+		return
+	}
 	verifier, desktop, err := s.store.TakeOIDCState(r.Context(), state)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_state", "sign-in attempt expired or unknown; start again")
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			slog.Warn("sign-in refused", "reason", "invalid_state")
+			writeError(w, http.StatusBadRequest, "invalid_state", "sign-in attempt expired or unknown; start again")
+		default:
+			// A store failure is not a stale sign-in. Answered as
+			// invalid_state it told the member to start again, which
+			// fails the same way, and left the outage out of the log.
+			slog.Error("sign-in state lookup failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "server_error", "could not look up the sign-in attempt")
+		}
 		return
 	}
 	rawIDToken, err := s.oidc.Exchange(r.Context(), code, verifier)
 	if err != nil {
+		slog.Error("oidc exchange failed", "desktop", desktop, "error", err)
 		writeError(w, http.StatusBadGateway, "oidc_exchange_failed", "the identity provider rejected the sign-in")
 		return
 	}
@@ -185,11 +251,13 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	// later requests (SPEC-0003 REQ "Groups claim").
 	user := store.User{ID: claims.Subject, Email: claims.Email, Name: claims.Name, Groups: claims.Groups}
 	if err := s.store.UpsertUser(r.Context(), user); err != nil {
+		slog.Error("sign-in user upsert failed", "user", user.ID, "error", err)
 		writeError(w, http.StatusInternalServerError, "server_error", "could not record the user")
 		return
 	}
 	grant, err := s.store.MintGrant(r.Context(), user.ID, s.cfg.GrantTTL)
 	if err != nil {
+		slog.Error("sign-in grant mint failed", "user", user.ID, "error", err)
 		writeError(w, http.StatusInternalServerError, "server_error", "could not mint a grant")
 		return
 	}
@@ -210,6 +278,7 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	if !desktop {
 		token, err := s.store.CreateSession(r.Context(), user.ID, s.cfg.SessionTTL)
 		if err != nil {
+			slog.Error("sign-in session create failed", "user", user.ID, "error", err)
 			writeError(w, http.StatusInternalServerError, "server_error", "could not create a session")
 			return
 		}
@@ -303,17 +372,28 @@ func (s *Server) handleExchange(w http.ResponseWriter, r *http.Request) {
 	}
 	uid, notAfter, err := s.store.ConsumeGrant(r.Context(), body.Grant)
 	if err != nil {
-		// invalid_grant is deliberately not a session-terminating code.
-		writeError(w, http.StatusUnauthorized, "invalid_grant", "grant is unknown, used, or expired")
+		switch {
+		case errors.Is(err, store.ErrGrantInvalid):
+			// invalid_grant is deliberately not a session-terminating code.
+			slog.Warn("grant exchange refused", "reason", "invalid_grant")
+			writeError(w, http.StatusUnauthorized, "invalid_grant", "grant is unknown, used, or expired")
+		default:
+			// A store failure is not a bad grant: the member's grant may
+			// be perfectly good, and the outage has to reach the log.
+			slog.Error("grant lookup failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "server_error", "could not exchange the grant")
+		}
 		return
 	}
 	user, err := s.store.GetUser(r.Context(), uid)
 	if err != nil {
+		slog.Error("grant exchange user lookup failed", "user", uid, "error", err)
 		writeError(w, http.StatusInternalServerError, "server_error", "grant pointed at a missing user")
 		return
 	}
 	token, err := s.store.CreateSessionCapped(r.Context(), user.ID, s.cfg.SessionTTL, notAfter)
 	if err != nil {
+		slog.Error("grant exchange session create failed", "user", user.ID, "error", err)
 		writeError(w, http.StatusInternalServerError, "server_error", "could not create a session")
 		return
 	}

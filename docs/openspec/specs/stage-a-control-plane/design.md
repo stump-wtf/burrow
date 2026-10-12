@@ -57,11 +57,20 @@ internal/httpapi    routes: auth pages, /api/den/v1/*, /mcp/agent
   `invalid_session`; expired → `session_expired`. Exchange failures use
   `invalid_grant`, which the client does not treat as session-terminating —
   right, since a typo'd paste must not sign the desktop app out.
-- **OIDC state without cookies.** The client contract forbids cookies on the
-  API, not on the browser flow, but burrow still keeps the sign-in flow
-  cookie-free: the state parameter is the key to a server-side (state,
-  verifier, desktop) row with a 10-minute TTL. The `OIDCClient` interface in
-  httpapi exists so the full flow is testable against a fake issuer.
+- **OIDC state bound to the browser.** The state parameter is the key to a
+  server-side (state, verifier, desktop) row with a 10-minute TTL, and
+  `/auth/oidc/start` also hands the same state to the browser in a
+  `burrow_oidc_state` cookie (HttpOnly, SameSite=Lax, `Path=/auth/oidc`,
+  Secure on https, same TTL). The callback refuses a state that does not
+  match the cookie, before the row is consumed, and clears the cookie when it
+  does. The row alone proves burrow issued the state, not who holds it: the
+  flow was cookie-free at first, and a callback URL from a flow someone else
+  had started and authenticated signed whoever opened it into that account
+  (login CSRF). The client contract forbids cookies on the API, not on the
+  browser flow, and the desktop sign-in is one: the app opens `/` in a
+  browser, and start, issuer and callback all happen there. The `OIDCClient`
+  interface in httpapi exists so the full flow is testable against a fake
+  issuer.
 - **Expired rows are swept, not just refused.** Every lookup checks
   `expires_at` itself, and that check is the enforcement. Separately,
   `Store.PurgeExpired` deletes sessions, grants, sign-in states and MCP tokens
@@ -76,10 +85,18 @@ internal/httpapi    routes: auth pages, /api/den/v1/*, /mcp/agent
 - **User id = OIDC subject.** Stable across email changes; email/name claims
   refresh on every sign-in (upsert). Member ids are `mem_<sub>`.
 - **Skills source.** `BURROW_SKILLS_DIR` reads a directory directly;
-  `BURROW_SKILLS_GIT_URL` shallow-clones into the cache dir and `git
-  pull --ff-only`s on refresh (a failed pull serves the cached clone). The
+  `BURROW_SKILLS_GIT_URL` shallow-clones into the cache dir and on refresh
+  re-points origin at the configured URL, fetches the remote's default branch
+  and hard-resets to it, so a changed URL or an upstream force-push is
+  followed (a failed refresh serves the cached clone). The
   catalog caches for 30s so the client's polling does not hit git. Frontmatter
-  is parsed by hand — `key: value` lines between `---` markers; no dependency.
+  is the YAML block between `---` markers, decoded with `gopkg.in/yaml.v3`;
+  only `title` and `description` are read. A block that is not valid YAML
+  (an unread key such as `argument-hint: [a] [b]`) falls back to the
+  top-level `title:` and `description:` lines with a Warn, so it is not
+  dropped.
+  A symlinked skill directory or `SKILL.md` is skipped: Library content
+  cannot point the loader at a file outside the Library.
 - **Marketplace naming.** One marketplace named `<OrgName> Library` with id
   `mkt_<org slug>`; plugin `plg_<skill>`, config object `cfo_<skill>`,
   membership `pm_<skill>`, latest version `cfv_<skill>`. IDs are derived, not
@@ -100,6 +117,14 @@ internal/httpapi    routes: auth pages, /api/den/v1/*, /mcp/agent
   Auth failures return JSON-RPC error bodies whose message and `data.code`
   carry the remint codes (`missing_mcp_token`, `invalid_mcp_token`,
   `expired_mcp_token`).
+- **A store failure is not a credential failure.** The codes above are for
+  a credential the store answered for: unknown, used, or expired. When the
+  lookup itself fails, burrow answers 500 and logs it at Error — `internal`
+  on the session path, `server_error` on the sign-in callback and the grant
+  exchange, and a JSON-RPC error with `data.code: internal` on the MCP
+  endpoint — so a database outage neither signs the desktop app out, nor
+  tells a member to start again, nor sends the client off to re-mint a token.
+  Refusals are logged at Warn with the reason and never the credential.
 - **Origin handling.** `BURROW_BASE_URL` overrides; otherwise the origin is
   derived per request from `X-Forwarded-Proto` (first hop) / TLS / Host, so
   loopback dev (http) and proxied production (https) both produce correct

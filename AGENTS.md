@@ -61,12 +61,17 @@ Required contexts in CI: `ci / lint*`, `ci / test*`, `secret-scan / gitleaks*`.
 
 ## Configuration
 
-`BURROW_OIDC_ISSUER_URL` and `BURROW_OIDC_CLIENT_ID` are required;
+Boot fails without `BURROW_DATABASE_URL` (a `postgres://` URL, ADR-0002),
+`BURROW_OIDC_ISSUER_URL`, `BURROW_OIDC_CLIENT_ID`, and one of
+`BURROW_BASE_URL` or `BURROW_OIDC_REDIRECT_URL` — the OIDC redirect has to be
+absolute, which `cmd/burrow/main.go` checks after the config loads.
 `BURROW_OIDC_CLIENT_SECRET` stays empty for a public PKCE client. Skills need
 either `BURROW_SKILLS_DIR` (a directory of `<name>/SKILL.md`) or
 `BURROW_SKILLS_GIT_URL`. The rest have defaults you can read in
 `internal/config/config.go` — that file is the list; do not read an env var
-anywhere else.
+anywhere else. A default applies only when a variable is unset or blank: a
+duration or boolean that is set but unreadable (`7d`, `300`, `off`) stops
+burrow at boot instead of quietly running on the default.
 
 Secrets never live in the repo. Credentials arrive from the environment at
 runtime (OpenBao in deployment). Never log a token, session id, or provider key:

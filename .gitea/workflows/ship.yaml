@@ -55,8 +55,16 @@ jobs:
     env:
       REG: ${{ secrets.REGISTRY_TOKEN }}
     steps:
+      # persist-credentials: false keeps the job token out of .git/config.
+      # The default leaves it there for later git commands, and nothing in
+      # this job runs one: the tags come from the event context and both
+      # builds read the working tree. Left in place it rides `COPY . .` into
+      # a build-stage layer that the push step exports to the registry as
+      # build cache; .dockerignore keeps .git out of the context as well.
       - if: ${{ env.REG != '' }}
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - if: ${{ env.REG != '' }}
         name: Set up Docker Buildx
@@ -72,6 +80,16 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=sha,prefix=sha-,format=short
+
+      # The version the binary reports in its startup log line and in the MCP
+      # `initialize` serverInfo: the same `sha-<short sha>` string as the sha
+      # tag computed above (metadata-action's short form is 7 characters), so
+      # a log line names the image it came from. Both builds below take it —
+      # the image Trivy scans has to be the build that is pushed.
+      - if: ${{ env.REG != '' }}
+        name: Compute build version
+        id: version
+        run: echo "version=sha-$(echo "${{ gitea.sha }}" | cut -c1-7)" >> "$GITHUB_OUTPUT"
 
       - if: ${{ env.REG != '' }}
         name: Log in to Gitea container registry
@@ -90,6 +108,8 @@ jobs:
           platforms: linux/amd64
           load: true
           tags: gitea.stump.rocks/stump.wtf/burrow:scan-${{ gitea.run_id }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
           # The runtime stage's `apk upgrade` layer must never come from the
           # cache: a cached layer pins whatever package snapshot was current
           # when it was first built, so the Trivy gate below scans (and the
@@ -117,9 +137,22 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
           no-cache-filters: runtime
           cache-from: type=registry,ref=gitea.stump.rocks/stump.wtf/burrow:buildcache
           cache-to: type=registry,ref=gitea.stump.rocks/stump.wtf/burrow:buildcache,mode=max
+
+      # `load: true` in the scan build puts that image in the runner's Docker
+      # daemon, which every job on the host shares, and nothing removed it:
+      # one image per run, kept until someone prunes the host. always(), so a
+      # failed scan or a failed push cleans up too; the image may not exist if
+      # the build itself failed, hence the `|| true`. A cancelled run never
+      # gets here (cancel-in-progress kills the job container before its
+      # always() steps), and that one still leaks.
+      - if: ${{ always() && env.REG != '' }}
+        name: Remove the scan image from the runner
+        run: docker image rm "gitea.stump.rocks/stump.wtf/burrow:scan-${{ gitea.run_id }}" >/dev/null 2>&1 || true
 
   # Deploy to cloud01 (ansible). Inert until DEPLOY_ON_MERGE=true and the
   # deploy secrets are set; the variable gate is repo VARIABLES (readable in

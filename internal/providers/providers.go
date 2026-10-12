@@ -1,8 +1,8 @@
 // Package providers serves the org's LLM provider rows to the OpenWork
 // desktop client (contract, Stage B). Rows live in the Postgres store; each
 // row's model menu is derived from the row's own gateway key via
-// GET {baseURL}/models, cached, and served stale when the gateway is
-// unreachable.
+// GET {baseURL}/models, cached, refreshed behind the requests that read it,
+// and served stale when the gateway is unreachable.
 //
 // Governing: ADR-0001 (org LLM providers pointing at LiteLLM), ADR-0004
 // (gateway-derived model menus, store-backed rows), SPEC-0004. API keys are
@@ -14,6 +14,7 @@ package providers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -311,7 +312,8 @@ func lookupKey(env string) (string, bool) {
 // menuEntry is the per-row derived-menu cache (SPEC-0004 REQ "Gateway-derived
 // model menus"). known distinguishes "never fetched" from "fetched empty";
 // nextTryAt is the failure cooldown (~TTL/4) that keeps a downed gateway
-// from being re-queried once per request.
+// from being re-queried once per request. mu guards the fields and is never
+// held across a gateway call: a hung gateway must not hold up a reader.
 type menuEntry struct {
 	mu        sync.Mutex
 	source    string // baseURL and apiKeyEnv the cached ids came from
@@ -319,6 +321,16 @@ type menuEntry struct {
 	ids       []string
 	fetchedAt time.Time
 	nextTryAt time.Time
+	// served is whether ids has gone out to a reader since the row took
+	// its current source. An unanswered or failing row serves no models,
+	// and that empty menu is as much a served set as a full one.
+	served bool
+	// inFlight is the row's one gateway call, closed when its answer has
+	// been recorded; nil when none is running.
+	inFlight chan struct{}
+	// bumpedAt is the updated_at the last menu change wrote, for a reader
+	// whose copy of the row predates that write.
+	bumpedAt time.Time
 }
 
 // Runtime serves the store's provider rows with gateway-derived menus. A nil
@@ -327,10 +339,25 @@ type Runtime struct {
 	st   *store.Store
 	ttl  time.Duration
 	http *http.Client
+	// coldWait is the longest one request waits for rows that have no
+	// answer yet; http's Timeout is what bounds a gateway call.
+	coldWait time.Duration
+	// calls counts gateway calls in flight, so tests can wait them out.
+	calls sync.WaitGroup
 
 	mu    sync.Mutex
 	cache map[string]*menuEntry
 }
+
+// The desktop client gives every request 12 seconds (contract §3), and a
+// listing, the resource snapshot and /connect all read menus. A gateway call
+// keeps the whole fetchTimeout, because it runs behind the requests; a
+// request waits at most firstFetchWait, once, and only for rows that have
+// never had an answer.
+const (
+	fetchTimeout   = 10 * time.Second
+	firstFetchWait = 4 * time.Second
+)
 
 // NewRuntime builds the store-backed runtime. modelsTTL bounds how long a
 // derived menu is trusted before the gateway is asked again.
@@ -339,10 +366,11 @@ func NewRuntime(st *store.Store, modelsTTL time.Duration) *Runtime {
 		modelsTTL = time.Minute
 	}
 	return &Runtime{
-		st:    st,
-		ttl:   modelsTTL,
-		http:  &http.Client{Timeout: 10 * time.Second},
-		cache: map[string]*menuEntry{},
+		st:       st,
+		ttl:      modelsTTL,
+		http:     &http.Client{Timeout: fetchTimeout},
+		coldWait: firstFetchWait,
+		cache:    map[string]*menuEntry{},
 	}
 }
 
@@ -358,11 +386,10 @@ func (r *Runtime) RowsFor(ctx context.Context, memberGroups []string) ([]Row, er
 		return nil, err
 	}
 	r.prune(rows)
+	rows = visibleTo(rows, memberGroups)
+	r.awaitFirst(ctx, rows)
 	out := make([]Row, 0, len(rows))
 	for _, p := range rows {
-		if !allowed(p.Groups, memberGroups) {
-			continue
-		}
 		out = append(out, r.row(ctx, p))
 	}
 	return out, nil
@@ -371,15 +398,42 @@ func (r *Runtime) RowsFor(ctx context.Context, memberGroups []string) ([]Row, er
 // MenuFor returns the row's current derived model ids and whether its key is
 // provisioned in this process's environment — the admin console's model
 // counts and editor view (SPEC-0004 REQ "Admin console"). It runs the same
-// cache/TTL path a desktop listing would, so the count is the menu the
-// runtime serves. A nil Runtime answers no menu and no key.
+// cache/TTL path a desktop listing would, first-fetch wait included, so the
+// count is the menu the runtime serves. A nil Runtime answers no menu and no
+// key.
+//
+// The ids are the caller's own copy: the console sorts them for display, and
+// sorting the cache's slice would reorder the menu every member is served,
+// outside the entry lock.
 func (r *Runtime) MenuFor(ctx context.Context, p store.ProviderRow) ([]string, bool) {
 	if r == nil {
 		return nil, false
 	}
 	_, hasKey := lookupKey(p.APIKeyEnv)
+	r.awaitFirst(ctx, []store.ProviderRow{p})
 	ids, _ := r.menuIDs(ctx, p)
-	return ids, hasKey
+	return append([]string(nil), ids...), hasKey
+}
+
+// MenuKnown reports whether the menu MenuFor returns for row id is an answer
+// from the row's gateway or the lack of one. It is false until a fetch from
+// the row's current baseURL and key has succeeded — a failed or refused
+// fetch, the failure cooldown, and an unprovisioned key all leave it false —
+// so the console can say "unknown" where it would otherwise print a count of
+// zero it never established. A nil Runtime knows no menu.
+func (r *Runtime) MenuKnown(id string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	e := r.cache[id]
+	r.mu.Unlock()
+	if e == nil {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.known
 }
 
 // SnapshotFor is the resource snapshot for one member: id→updatedAt for the
@@ -396,13 +450,12 @@ func (r *Runtime) SnapshotFor(ctx context.Context, memberGroups []string) (map[s
 	if err != nil {
 		return nil, err
 	}
+	rows = visibleTo(rows, memberGroups)
+	r.awaitFirst(ctx, rows)
 	snapshot := map[string]string{}
 	for _, p := range rows {
-		if !allowed(p.Groups, memberGroups) {
-			continue
-		}
-		_, bumpedAt := r.menuIDs(ctx, p) // may advance updated_at (ADR-0004)
-		if !bumpedAt.IsZero() {
+		_, bumpedAt := r.menuIDs(ctx, p) // starts the refresh that may advance updated_at (ADR-0004)
+		if bumpedAt.After(p.UpdatedAt) {
 			p.UpdatedAt = bumpedAt
 		}
 		snapshot[p.ID] = FormatUpdatedAt(p.UpdatedAt)
@@ -413,6 +466,8 @@ func (r *Runtime) SnapshotFor(ctx context.Context, memberGroups []string) (map[s
 // ConnectFor is /connect for a member: a row the member cannot see answers
 // exactly like an unknown id, so its key is never handed out and its
 // existence is not revealed (SPEC-0003 REQ "Connect follows visibility").
+// It hands over the key with whatever menu is known and never waits on the
+// gateway, not even for a row's first fetch (ADR-0004).
 func (r *Runtime) ConnectFor(ctx context.Context, id string, memberGroups []string) (Row, *string, bool, error) {
 	if r == nil {
 		return Row{}, nil, false, nil
@@ -435,12 +490,12 @@ func (r *Runtime) ConnectFor(ctx context.Context, id string, memberGroups []stri
 	return row, key, true, nil
 }
 
-// row builds the client-facing row for one stored provider, deriving its
-// menu and computing hasApiKey from the live environment.
+// row builds the client-facing row for one stored provider from the menu the
+// cache holds now, computing hasApiKey from the live environment.
 func (r *Runtime) row(ctx context.Context, p store.ProviderRow) Row {
 	_, hasKey := lookupKey(p.APIKeyEnv)
 	ids, bumpedAt := r.menuIDs(ctx, p)
-	if !bumpedAt.IsZero() {
+	if bumpedAt.After(p.UpdatedAt) {
 		p.UpdatedAt = bumpedAt
 	}
 	models := make([]ModelRow, 0, len(ids))
@@ -495,101 +550,227 @@ func (r *Runtime) prune(rows []store.ProviderRow) {
 	}
 }
 
-// menuIDs returns the row's derived model ids, beside the moment its stored
-// updated_at was advanced because the derived set changed (zero when it was
-// not). Fresh menus come straight from cache; expired ones from the gateway;
-// failures serve last-known ids with a cooldown so a downed gateway is
-// retried at most once per TTL/4 (SPEC-0004 REQ "Gateway-derived model
-// menus", scenario "Gateway unreachable"). A row whose key is not
-// provisioned serves no models and never calls out.
+// menuIDs returns the row's last-known model ids without waiting on the
+// gateway, beside the updated_at the menu's last change wrote (zero when it
+// never changed). A menu that is due a gateway call gets one started behind
+// this request; until it lands the last-known ids stand, which is nothing
+// for a row with no key or no successful fetch (SPEC-0004 REQ
+// "Gateway-derived model menus").
 func (r *Runtime) menuIDs(ctx context.Context, p store.ProviderRow) ([]string, time.Time) {
 	e := r.entry(p.ID)
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	r.refresh(ctx, p, e)
+	e.served = true
+	return e.ids, e.bumpedAt
+}
 
+// awaitFirst starts the gateway call for every row that is due one, then
+// waits for the rows that have no answer yet — together, and for coldWait at
+// most. Asking them one after another, each for the gateway's full timeout,
+// put a listing over two rows of a hung gateway past the client's 12 seconds.
+// A caller that gives up stops waiting; the calls carry on for the next one.
+func (r *Runtime) awaitFirst(ctx context.Context, rows []store.ProviderRow) {
+	var first []<-chan struct{}
+	for _, p := range rows {
+		e := r.entry(p.ID)
+		e.mu.Lock()
+		if landed := r.refresh(ctx, p, e); landed != nil {
+			first = append(first, landed)
+		}
+		e.mu.Unlock()
+	}
+	if len(first) == 0 {
+		return
+	}
+	patience := time.NewTimer(r.coldWait)
+	defer patience.Stop()
+	for _, landed := range first {
+		select {
+		case <-landed:
+		case <-patience.C:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// refresh starts the row's gateway call when its menu is due one and none is
+// in flight: at most one call per row, however many requests arrive. Fresh
+// menus need none; a failure is retried at most once per TTL/4 (scenario
+// "Gateway unreachable"); a row whose key is not provisioned never calls
+// out. It returns the call's channel only for a row with no answer yet —
+// neither a menu nor a recorded failure — the one case worth a request's
+// wait. The caller holds e.mu.
+func (r *Runtime) refresh(ctx context.Context, p store.ProviderRow, e *menuEntry) <-chan struct{} {
 	// A row repointed at another gateway or key starts over: the old ids
-	// are another key's scope. The admin write already advanced updated_at,
-	// so the first fetch from the new source need not bump it again.
+	// are another key's scope, and so is the answer to a call still in
+	// flight. The admin write already advanced updated_at, so the first
+	// fetch from the new source need not bump it again — unless the row
+	// is served empty before that fetch succeeds.
 	if source := p.BaseURL + "\x00" + p.APIKeyEnv; e.source != source {
-		e.source, e.known, e.ids, e.fetchedAt, e.nextTryAt = source, false, nil, time.Time{}, time.Time{}
+		e.source, e.known, e.ids, e.fetchedAt, e.nextTryAt, e.inFlight = source, false, nil, time.Time{}, time.Time{}, nil
+		e.served = false
 	}
 
 	now := time.Now()
 	if now.Before(e.nextTryAt) {
-		return e.ids, time.Time{} // cooling down after a failure; serve last-known
+		return nil // cooling down after a failure; serve last-known
 	}
 	if e.known && now.Before(e.fetchedAt.Add(r.ttl)) {
-		return e.ids, time.Time{} // fresh cache: no gateway call
+		return nil // fresh cache: no gateway call
 	}
 	key, ok := lookupKey(p.APIKeyEnv)
 	if !ok {
-		return e.ids, time.Time{} // no key: no menu, and nothing to fetch
+		return nil // no key: no menu, and nothing to fetch
 	}
+	if e.inFlight == nil {
+		e.inFlight = make(chan struct{})
+		r.calls.Add(1)
+		// The call belongs to the row, not to the request that happened
+		// to trigger it. A member who closes the laptop mid-fetch has not
+		// made the gateway fail: on the request's own context that
+		// cancellation started the cooldown, and every other member got
+		// an empty menu until it ran out. The client's own timeout still
+		// bounds the call.
+		go r.derive(context.WithoutCancel(ctx), p, key, e, e.inFlight)
+	}
+	if e.known || !e.nextTryAt.IsZero() {
+		return nil // a last-known answer stands while the call runs
+	}
+	return e.inFlight
+}
+
+// derive is one gateway call for one row, run behind the requests: it
+// records the answer, or the failure and its cooldown, and advances the
+// stored updated_at when the derived set changed.
+func (r *Runtime) derive(ctx context.Context, p store.ProviderRow, key string, e *menuEntry, landed chan struct{}) {
+	defer r.calls.Done()
 	ids, err := r.fetch(ctx, p.BaseURL, key)
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	defer close(landed)
+	if e.inFlight != landed {
+		return // the row was repointed meanwhile: this is another key's answer
+	}
+	e.inFlight = nil
+	// Counted from now, not from when the call started: a gateway that
+	// takes its whole timeout to fail would otherwise have spent the
+	// cooldown before it began, and be asked again by the next request.
+	now := time.Now()
 	if err != nil {
+		// A failed request has to show in production logs (AGENTS.md):
+		// once per failed call, which the cooldown keeps to once per
+		// TTL/4 for each row rather than once per request. fetch's
+		// errors name the gateway without its credentials, and never
+		// the key.
+		slog.Warn("providers: model menu fetch failed; serving the last-known menu", "provider", p.ID, "error", err)
 		e.nextTryAt = now.Add(r.ttl / 4)
 		if !e.nextTryAt.After(now) {
 			e.nextTryAt = now.Add(time.Second)
 		}
-		return e.ids, time.Time{} // serve stale
+		return // serve stale
 	}
-	changed := e.known && !sameIDSet(e.ids, ids)
+	changed := e.served && !sameIDSet(e.ids, ids)
 	e.ids, e.known, e.fetchedAt, e.nextTryAt = ids, true, now, time.Time{}
 	if !changed {
-		return ids, time.Time{}
+		return
 	}
-	// The derived set changed since this process last served it: advance
-	// the stored updated_at so resource snapshots trigger a re-sync
-	// (ADR-0004). The first fetch after boot never bumps — there is no
-	// previously served set to differ from.
+	// The derived set differs from the one this process last served:
+	// advance the stored updated_at so resource snapshots trigger a
+	// re-sync (ADR-0004). What was served counts, not what was fetched: a
+	// row that went out with no models while its first fetch failed, or
+	// was still in flight, has to be re-synced when the menu fills, or the
+	// client keeps the empty one. A first fetch that lands before anything
+	// was served has no served set to differ from, and never bumps — nor
+	// does the first one after a repoint, whose admin write already
+	// advanced the stamp. The entry stays locked across the write so no
+	// reader pairs the new menu with the old stamp.
+	ctx, cancel := context.WithTimeout(ctx, r.http.Timeout)
+	defer cancel()
 	bumpedAt, err := r.st.BumpProviderUpdatedAt(ctx, p.ID)
 	if err != nil {
 		// The menu is still correct; the snapshot just stays quiet.
 		slog.Warn("advance provider updated_at after menu change", "provider", p.ID, "error", err)
-		return ids, time.Time{}
+		return
 	}
-	return ids, bumpedAt
+	e.bumpedAt = bumpedAt
 }
 
 // fetch asks the gateway what the key may use: the OpenAI-compatible
-// GET {baseURL}/models, answered as {"data":[{"id":…}]}.
+// GET {baseURL}/models, answered as {"data":[{"id":…}]}. Only a body that
+// carries the data array is an answer: {"data":[]} says the key may use
+// nothing, while a 200 with an error envelope, {} or null says nothing
+// about the key, and reading it as an empty menu would wipe the last-known
+// one and re-sync every client to it.
 func (r *Runtime) fetch(ctx context.Context, baseURL, key string) ([]string, error) {
 	// Joined as a path element: appended as text, "/models" lands in the
 	// query of a baseURL that carries one.
 	endpoint, err := url.JoinPath(baseURL, "models")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("providers: gateway baseURL is not a URL: %w", withoutURL(err))
 	}
+	// Every error below is logged, so each names the gateway as where —
+	// the endpoint without userinfo or query — and none repeats the URL
+	// net/http and net/url quote in theirs.
+	where := loggableURL(endpoint)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("providers: gateway %s: %w", where, withoutURL(err))
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	resp, err := r.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("providers: gateway %s: %w", where, withoutURL(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("providers: gateway %s returned %s", endpoint, resp.Status)
+		return nil, fmt.Errorf("providers: gateway %s returned %s", where, resp.Status)
 	}
 	var body struct {
-		Data []struct {
+		Data *[]struct {
 			ID string `json:"id"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&body); err != nil {
-		return nil, fmt.Errorf("providers: gateway %s sent unparseable models: %w", endpoint, err)
+		return nil, fmt.Errorf("providers: gateway %s sent unparseable models: %w", where, err)
 	}
-	ids := make([]string, 0, len(body.Data))
+	if body.Data == nil {
+		return nil, fmt.Errorf("providers: gateway %s answered %s without a models listing (no data array)", where, resp.Status)
+	}
+	ids := make([]string, 0, len(*body.Data))
 	seen := map[string]bool{}
-	for _, m := range body.Data {
+	for _, m := range *body.Data {
 		if m.ID != "" && !seen[m.ID] {
 			seen[m.ID] = true
 			ids = append(ids, m.ID)
 		}
 	}
 	return ids, nil
+}
+
+// loggableURL is a gateway endpoint as it may appear in an error or a log
+// line: a baseURL can carry credentials as userinfo or in its query, and
+// neither belongs in a log.
+func loggableURL(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return "(unparseable baseURL)"
+	}
+	u.User, u.RawQuery, u.Fragment, u.RawFragment = nil, "", "", ""
+	return u.String()
+}
+
+// withoutURL unwraps the *url.Error net/http and net/url return, whose text
+// quotes the request URL with only the password masked.
+func withoutURL(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return urlErr.Err
+	}
+	return err
 }
 
 func sameIDSet(a, b []string) bool {
@@ -607,6 +788,17 @@ func sameIDSet(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// visibleTo keeps the rows a member holding memberGroups may see.
+func visibleTo(rows []store.ProviderRow, memberGroups []string) []store.ProviderRow {
+	out := make([]store.ProviderRow, 0, len(rows))
+	for _, p := range rows {
+		if allowed(p.Groups, memberGroups) {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // allowed reports whether a member holding memberGroups may see something

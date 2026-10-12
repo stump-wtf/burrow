@@ -14,11 +14,15 @@ implements: [ADR-0004]
   `storetest.Open` like the httpapi tests do.
 - **Model cache inside the providers package.** Per-row entry
   `{ids []string, fetchedAt, changeAt, nextTryAt, err}` under a mutex, keyed
-  by row id; per-row fetch happens on first need and on TTL expiry, inline
-  (one gateway GET per expired row per request wave), with `nextTryAt`
+  by row id; per-row fetch happens on first need and on TTL expiry (one
+  gateway GET per expired row per request wave; off the request path since
+  2026-10-12, see "Menu refresh off the request path"), with `nextTryAt`
   providing the failure cooldown (~TTL/4). `changeAt` advances the stored
   `updated_at` (single `UPDATE`, single process) only when the id set
   differs from the previously served set — the snapshot stays quiet otherwise.
+  "Served" includes the empty menu a row goes out with while its first
+  fetch is failing or still in flight: when that menu fills, the stamp
+  advances. Served sets are per process; a restart forgets them.
 - **ETag = quoted `updated_at` RFC3339Nano.** PUT is a full replace; a
   missing `If-Match` is `428 Precondition Required` rather than a silent
   clobber, because the whole point of the API is automation without lost
@@ -62,10 +66,47 @@ implements: [ADR-0004]
   no capability.
 - **Etags on forms.** The editor carries the fetched etag in a hidden field;
   a 412 re-renders with the API's current row, a 409/400 re-renders the
-  typed values with the API's message.
+  typed values with the API's message, and a 428 (the form lost its etag)
+  re-renders them asking for a reload. A re-rendered form reads the key
+  light and the org-wide warning back from the stored row (2026-10-12).
+- **Audience is one group per line.** The editor's `groups` field is a
+  textarea split on newlines, each line taken whole, so every group the API
+  accepts survives an untouched save. It was a comma-separated input, which
+  split a group containing a comma (an LDAP DN) into several (2026-10-12).
 - **Preview is the runtime's own answer.** `/admin/preview?group=` calls
   `RowsFor` with that single group; there is no second matching rule to
   drift.
 - **Menus come from `Runtime.MenuFor`.** The same cache a listing serves, so
   counts and display names match what members see. Overrides for ids the
   current menu lacks ride as hidden inputs: a PUT is a full replace.
+  `Runtime.MenuKnown` says whether that menu is an answer from the gateway;
+  until one has answered (unreachable, key refused, failure cooldown, key
+  variable unset) the list, the preview, and the delete confirm say the
+  model count is unknown instead of printing 0 (2026-10-12).
+
+## Menu refresh off the request path (2026-10-12)
+
+- **Why.** The first cut fetched inline, serially, under the entry mutex and
+  on the request's context, 10 s per row. A gateway that accepted and never
+  answered then cost a listing 10 s per row and `/connect` 10 s — past the
+  desktop client's 12 s request timeout — and a request cancelled mid-fetch
+  recorded its own cancellation as a gateway failure for everyone.
+- **One call per row, behind the requests.** A menu that is due a fetch gets
+  one goroutine (`inFlight` on the entry: at most one per row) on
+  `context.WithoutCancel` of the request that started it, bounded by the
+  runtime HTTP client's 10 s timeout. The entry mutex guards fields only and
+  is never held across the gateway call. The call records the menu, or the
+  failure and a cooldown counted from when it returned, and writes the
+  `updated_at` bump itself.
+- **What a request waits for.** Nothing, when the row has a last-known
+  answer — a menu, or a recorded failure: it is served and the call runs
+  behind it (stale-while-revalidate). Only rows with no answer yet are
+  waited for, and by `RowsFor`, `SnapshotFor` and `MenuFor` alone:
+  `ConnectFor` never waits. Those calls are started together and the request
+  waits for all of them once, 4 s at most. Concurrency rather than a shorter
+  first-fetch timeout, because a per-row timeout still multiplies by the row
+  count, while one shared wait is the same for two rows or twenty; and a
+  wait cap rather than a shorter call, so a gateway that needs 6 s still
+  fills the cache for the next poll instead of never being heard.
+- **Tests wait, they do not sleep.** `export_test.go` exposes
+  `WaitRefreshes` (the in-flight call count) and `SetTimeouts`.
