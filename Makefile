@@ -107,9 +107,12 @@ endif
 db-down:
 	@docker rm -f $(PG_NAME) >/dev/null 2>&1 && echo "test-db: removed $(PG_NAME)" || true
 
-# Apply formatting in place. Uses gofumpt if installed, falls back to gofmt.
+# Apply formatting in place: the same tool over the same files as the `fmt`
+# gate, so `make tidy` produces exactly the tree CI calls clean. Not gofumpt,
+# which rewrites files gofmt accepts, and not `.`, which walks into every other
+# worktree parked under .claude/worktrees/ and reformats their files too.
 tidy:
-	@command -v gofumpt >/dev/null 2>&1 && gofumpt -w . || gofmt -w .
+	@gofmt -w $$(git ls-files '*.go' | grep -v '^vendor/')
 	$(GO) mod tidy
 
 # Build and run burrow against its default address.

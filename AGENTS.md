@@ -55,7 +55,7 @@ These rules bind every session, human or agent:
 | `make check` | `fmt vet test race`. This is the CI gate; run it before every push |
 | `make lint` | static checks only (`fmt vet`) |
 | `make test` / `make race` | tests; the race run needs CGO, which the Makefile sets |
-| `make tidy` | gofumpt/gofmt in place plus `go mod tidy` |
+| `make tidy` | gofmt in place on tracked files, plus `go mod tidy` |
 
 Required contexts in CI: `ci / lint*`, `ci / test*`, `secret-scan / gitleaks*`.
 
