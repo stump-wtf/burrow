@@ -29,6 +29,22 @@ var seq atomic.Int64
 func Open(t *testing.T) *store.Store {
 	t.Helper()
 
+	st, err := store.Open(context.Background(), DSN(t))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	return st
+}
+
+// DSN creates an empty schema only this test can see, dropped when the test
+// finishes, and returns a postgres:// URL whose connections start in it. It
+// does not open a store: the tests of the boot path need the schema before
+// burrow has touched it, to open it more than once, or to hold a lock in it
+// from a connection of their own.
+func DSN(t *testing.T) string {
+	t.Helper()
+
 	dsn := os.Getenv("BURROW_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Fatalf("BURROW_TEST_DATABASE_URL is unset, and burrow's tests only run against a real Postgres.\n" +
@@ -61,12 +77,7 @@ func Open(t *testing.T) *store.Store {
 		admin.Close()
 	})
 
-	st, err := store.Open(ctx, withSearchPath(t, dsn, schema))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { st.Close() })
-	return st
+	return withSearchPath(t, dsn, schema)
 }
 
 // withSearchPath repoints a postgres:// URL at one schema. Every connection

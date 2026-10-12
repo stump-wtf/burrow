@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -44,8 +45,10 @@ type Store struct {
 }
 
 // Open connects to the Postgres database named by dsn and applies the schema.
-// The schema statements are idempotent, so every start converges it; burrow is
-// one service with one schema and carries no migration history.
+// Every start converges it — burrow is one service with one schema and carries
+// no migration history — and a start that finds it already current changes
+// nothing and waits on no table lock. ctx bounds the whole of it: the connect,
+// and any wait for a lock a schema change needs.
 func Open(ctx context.Context, dsn string) (*Store, error) {
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
@@ -61,7 +64,7 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		return nil, fmt.Errorf("store: connect: %w", err)
 	}
 	s := &Store{db: db}
-	if err := s.migrate(); err != nil {
+	if err := s.migrate(ctx); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -71,14 +74,73 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 // Close closes the pool.
 func (s *Store) Close() error { return s.db.Close() }
 
-func (s *Store) migrate() error {
+// migrateLockKey is the advisory lock a boot holds while it converges the
+// schema ("burrow" in ASCII). Advisory locks are scoped to the database, which
+// burrow has to itself, so the key only has to be the same in every burrow.
+const migrateLockKey int64 = 0x627572726f77
+
+// migrateLockTimeout bounds each lock wait of a boot. It is short on purpose:
+// a queued ACCESS EXCLUSIVE request makes every new query on the table wait
+// behind it, so a boot that waits for its lock stalls the instance that is
+// already serving for exactly as long. A var so the tests can shorten it.
+var migrateLockTimeout = 5 * time.Second
+
+// schemaChanges are the changes to objects a deployed database already has —
+// what CREATE ... IF NOT EXISTS cannot express. Each runs only while its
+// pending query still answers true.
+//
+// Governing: ADR-0002 (the store is Postgres, converged at boot).
+//
+// The check is not an optimisation. ALTER TABLE takes ACCESS EXCLUSIVE, and
+// CREATE INDEX takes SHARE, before IF [NOT] EXISTS is ever evaluated, so an
+// unguarded statement here locks its table on every boot: behind one idle
+// reader the boot hangs, and every request queues behind the boot. A new
+// column goes in its CREATE TABLE below (for a fresh database) and in a
+// guarded entry here (for an existing one).
+var schemaChanges = []struct {
+	name    string
+	pending string // answers true while the change has yet to be made
+	ddl     string
+}{
+	{
+		// SPEC-0003 REQ "Groups claim": databases older than the column.
+		name:    "users.oidc_groups",
+		pending: `SELECT NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('users') AND attname = 'oidc_groups' AND NOT attisdropped)`,
+		ddl:     `ALTER TABLE users ADD COLUMN IF NOT EXISTS oidc_groups TEXT NOT NULL DEFAULT '[]'`,
+	},
+	{
+		// users.email was UNIQUE in the first Postgres schema. Identity is the
+		// OIDC subject and nothing looks a user up by email, so all the
+		// constraint did was refuse sign-in to a re-created account (new
+		// subject, same email) and to the second account with no email claim.
+		name:    "users.email unique",
+		pending: `SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = to_regclass('users') AND conname = 'users_email_key')`,
+		ddl:     `ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_key`,
+	},
+	{
+		// SPEC-0001 REQ "Session lifetime": databases older than the column.
+		name:    "grants.session_expires_at",
+		pending: `SELECT NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('grants') AND attname = 'session_expires_at' AND NOT attisdropped)`,
+		ddl:     `ALTER TABLE grants ADD COLUMN IF NOT EXISTS session_expires_at TIMESTAMPTZ`,
+	},
+	{
+		name:    "llm_provider_audit_provider_idx",
+		pending: `SELECT to_regclass('llm_provider_audit_provider_idx') IS NULL`,
+		ddl:     `CREATE INDEX IF NOT EXISTS llm_provider_audit_provider_idx ON llm_provider_audit (provider_id)`,
+	},
+}
+
+func (s *Store) migrate(ctx context.Context) error {
 	const schema = `
 CREATE TABLE IF NOT EXISTS users (
 	id         TEXT PRIMARY KEY,
-	email      TEXT NOT NULL UNIQUE,
+	email      TEXT NOT NULL,
 	name       TEXT NOT NULL DEFAULT '',
 	created_at TIMESTAMPTZ NOT NULL,
-	updated_at TIMESTAMPTZ NOT NULL
+	updated_at TIMESTAMPTZ NOT NULL,
+	-- SPEC-0003 REQ "Groups claim": the member's groups as of their last
+	-- sign-in, a JSON array. Named oidc_groups because GROUPS is a reserved word.
+	oidc_groups TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS sessions (
 	token_hash TEXT PRIMARY KEY,
@@ -90,12 +152,12 @@ CREATE TABLE IF NOT EXISTS grants (
 	token_hash TEXT PRIMARY KEY,
 	user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 	created_at TIMESTAMPTZ NOT NULL,
-	expires_at TIMESTAMPTZ NOT NULL
+	expires_at TIMESTAMPTZ NOT NULL,
+	-- SPEC-0001 REQ "Session lifetime": the expiry of the session that minted
+	-- this grant, which the session it buys may not outlive. NULL for a grant
+	-- minted by the OIDC callback, which has no parent session.
+	session_expires_at TIMESTAMPTZ
 );
--- SPEC-0001 REQ "Session lifetime": the expiry of the session that minted this
--- grant, which the session it buys may not outlive. NULL for a grant minted by
--- the OIDC callback, which has no parent session.
-ALTER TABLE grants ADD COLUMN IF NOT EXISTS session_expires_at TIMESTAMPTZ;
 CREATE TABLE IF NOT EXISTS oidc_states (
 	state      TEXT PRIMARY KEY,
 	verifier   TEXT NOT NULL,
@@ -103,9 +165,6 @@ CREATE TABLE IF NOT EXISTS oidc_states (
 	created_at TIMESTAMPTZ NOT NULL,
 	expires_at TIMESTAMPTZ NOT NULL
 );
--- SPEC-0003 REQ "Groups claim": the member's groups as of their last sign-in,
--- a JSON array. Named oidc_groups because GROUPS is a reserved word.
-ALTER TABLE users ADD COLUMN IF NOT EXISTS oidc_groups TEXT NOT NULL DEFAULT '[]';
 CREATE TABLE IF NOT EXISTS mcp_tokens (
 	token_hash TEXT PRIMARY KEY,
 	user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -141,7 +200,6 @@ CREATE TABLE IF NOT EXISTS llm_provider_audit (
 	before      TEXT,
 	after       TEXT
 );
-CREATE INDEX IF NOT EXISTS llm_provider_audit_provider_idx ON llm_provider_audit (provider_id);
 -- SPEC-0004 REQ "Admin authorization": machine tokens for automation, stored
 -- only as SHA-256 hashes like every other credential burrow carries.
 CREATE TABLE IF NOT EXISTS api_tokens (
@@ -169,10 +227,55 @@ CREATE TABLE IF NOT EXISTS skill_pack_skills (
 	PRIMARY KEY (pack_group, skill)
 );
 `
-	if _, err := s.db.Exec(schema); err != nil {
-		return fmt.Errorf("store: migrate: %w", err)
+	// One transaction: the lock_timeout is local to it, so it bounds the boot's
+	// lock waits and nothing the pool does afterwards. It is the server's own
+	// deadline, and holds even where cancelling ctx cannot reach the server.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return migrateError("begin", err)
+	}
+	defer tx.Rollback()
+	timeout := fmt.Sprintf("%dms", migrateLockTimeout.Milliseconds())
+	if _, err := tx.ExecContext(ctx, `SELECT set_config('lock_timeout', $1, true)`, timeout); err != nil {
+		return migrateError("set lock_timeout", err)
+	}
+	// Boots take turns, and the lock lets go on its own however this one ends.
+	// Without it two boots on an empty database both see no tables and both
+	// create them, and all but one die on the catalog's unique index — and a
+	// catalog check below could be stale by the time its statement runs.
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, migrateLockKey); err != nil {
+		return migrateError("wait for another boot's migration", err)
+	}
+	if _, err := tx.ExecContext(ctx, schema); err != nil {
+		return migrateError("create tables", err)
+	}
+	for _, change := range schemaChanges {
+		var pending bool
+		if err := tx.QueryRowContext(ctx, change.pending).Scan(&pending); err != nil {
+			return migrateError("check "+change.name, err)
+		}
+		if !pending {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, change.ddl); err != nil {
+			return migrateError(change.name, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return migrateError("commit", err)
 	}
 	return nil
+}
+
+// migrateError names the step that failed, and says in words when the failure
+// is a lock wait that ran out: "lock_not_available" alone does not tell an
+// operator that some other session is sitting on one of burrow's tables.
+func migrateError(step string, err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "55P03" {
+		return fmt.Errorf("store: migrate: %s: gave up after %s waiting for a lock another session holds: %w", step, migrateLockTimeout, err)
+	}
+	return fmt.Errorf("store: migrate: %s: %w", step, err)
 }
 
 func now() time.Time { return time.Now().UTC() }

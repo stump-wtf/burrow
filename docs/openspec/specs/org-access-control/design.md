@@ -15,7 +15,10 @@ implements: [ADR-0003]
 - **A JSON column, not `TEXT[]`.** The store uses `database/sql` over pgx, and
   a JSON-encoded `TEXT` column round-trips without pulling pgtype into the
   store's signatures. The store has no migration history (ADR-0002), so the
-  column arrives with `ADD COLUMN IF NOT EXISTS`.
+  column is in `CREATE TABLE` for a fresh database and arrives on an existing
+  one with an `ADD COLUMN` that the boot runs only when the catalog says the
+  column is missing — unguarded, it would take an exclusive lock on `users`
+  at every start.
 - **Scope requested by default.** Provider rows and Library rules are edited
   at runtime, so whether groups are needed cannot be decided at boot the way
   it could be when only the providers file declared them. burrow asks the

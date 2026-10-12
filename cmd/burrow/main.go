@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
 	"gitea.stump.rocks/stump.wtf/burrow/internal/buildinfo"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/config"
@@ -20,6 +21,9 @@ import (
 	"gitea.stump.rocks/stump.wtf/burrow/internal/store"
 )
 
+// storeOpenTimeout bounds connecting to Postgres and converging the schema.
+const storeOpenTimeout = 30 * time.Second
+
 func main() {
 	cfg, err := config.FromEnv()
 	if err != nil {
@@ -27,7 +31,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	st, err := store.Open(context.Background(), cfg.DatabaseURL)
+	// Bounded: a boot that cannot reach the database, or cannot get a lock its
+	// schema change needs, exits with an error instead of hanging unstarted.
+	openCtx, cancelOpen := context.WithTimeout(context.Background(), storeOpenTimeout)
+	st, err := store.Open(openCtx, cfg.DatabaseURL)
+	cancelOpen()
 	if err != nil {
 		slog.Error("open database", "error", err)
 		os.Exit(1)
