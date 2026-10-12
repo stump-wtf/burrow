@@ -588,3 +588,86 @@ func TestSkillMatrixSaveIsGatedByAdminGroups(t *testing.T) {
 		t.Fatalf("a refused save writes nothing: %v", packs)
 	}
 }
+
+// signInThroughIssuer signs the fake issuer's member in through the real OIDC
+// callback, so the groups claim reaches the store the way production records
+// it rather than the way a test would write it.
+func signInThroughIssuer(t *testing.T, e *testEnv, browser *http.Client) {
+	t.Helper()
+	followed := browser.CheckRedirect
+	browser.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	defer func() { browser.CheckRedirect = followed }()
+
+	start, err := browser.Get(e.srv.URL + "/auth/oidc/start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start.Body.Close()
+	authorize, err := url.Parse(start.Header.Get("Location"))
+	if err != nil || start.StatusCode != http.StatusFound {
+		t.Fatalf("start: status %d, location error %v", start.StatusCode, err)
+	}
+	// An issuer that redirects back names the callback itself; one that only
+	// renders its authorize page leaves the test to open the callback.
+	callback := e.srv.URL + "/auth/oidc/callback?code=c&state=" + url.QueryEscape(authorize.Query().Get("state"))
+	approved, err := browser.Get(authorize.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	approved.Body.Close()
+	if approved.StatusCode == http.StatusFound {
+		callback = approved.Header.Get("Location")
+	}
+	done, err := browser.Get(callback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done.Body.Close()
+	if done.StatusCode != http.StatusOK {
+		t.Fatalf("callback: status %d", done.StatusCode)
+	}
+}
+
+// A group that reaches burrow with stray whitespace is still one group. The
+// console trims the names it lists and the rules it saves, so a claim kept
+// verbatim would put the member under a column whose rule can never match
+// them: shown as restricted, served the whole Library.
+func TestSkillPackAppliesToAGroupClaimedWithPadding(t *testing.T) {
+	e := newConsoleEnv(t)
+	issuer := newFakeIssuer(t, "burrow-desktop")
+	issuer.groups = []any{"contractors "}
+	signInThroughIssuer(t, e, newOIDCClientFor(t, e, issuer))
+
+	// The admin sees the member's group as a column and restricts it.
+	resp, page := e.consoleGet(t, "/admin/skills")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("matrix status %d", resp.StatusCode)
+	}
+	form, groups, skills := matrixForm(t, page)
+	column, listed := groups["contractors"]
+	if !listed {
+		t.Fatalf("the member's group must be a column named contractors: %v", groups)
+	}
+	form.Set("declare."+column, "1")
+	form.Set("cell."+column+"."+skills["code-review"], "1")
+	if resp, _ = e.consolePost(t, "/admin/skills", form); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("save status %d", resp.StatusCode)
+	}
+
+	// The rest of the test is the member: their session, their MCP token.
+	member, err := e.st.CreateSession(context.Background(), "signer-sub-1", e.cfg.SessionTTL)
+	if err != nil {
+		t.Fatalf("member session: %v", err)
+	}
+	e.token = member
+	if got := libraryNames(t, e); strings.Join(got, ",") != "Code Review" {
+		t.Fatalf("the rule saved for the member's column must apply to them: %v", got)
+	}
+	if _, code := mcpToolCall(t, e, "get_skill", map[string]any{"name": "deploy-helper"}); code != -32002 {
+		t.Fatalf("get_skill on a skill outside the member's rule must answer unknown skill, got code %d", code)
+	}
+	if text, code := mcpToolCall(t, e, "get_skill", map[string]any{"name": "code-review"}); code != 0 ||
+		!strings.Contains(text, "Follow this skill for code-review") {
+		t.Fatalf("get_skill on the allowed skill (code %d): %s", code, text)
+	}
+}

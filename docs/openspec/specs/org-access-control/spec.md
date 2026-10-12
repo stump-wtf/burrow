@@ -31,14 +31,24 @@ Burrow SHALL request the `groups` scope at sign-in unless the operator opts out
 rules are edited at runtime and their need cannot be decided at boot). At every
 sign-in burrow SHALL record the member's groups from the ID token's `groups`
 claim, accepting a JSON array of strings or a single string, and replacing what
-was recorded before. A missing or empty claim SHALL record no groups. Groups
-SHALL be read from that record for every later request, so a change in the
-identity provider takes effect at the member's next sign-in.
+was recorded before. Each name SHALL be recorded with surrounding whitespace
+removed and once; a name that is empty after that is dropped. Group names are
+compared exactly everywhere else, against names that are trimmed when they are
+configured, so the recorded claim has to be the same spelling. A missing or
+empty claim SHALL record no groups. Groups SHALL be read from that record for
+every later request, so a change in the identity provider takes effect at the
+member's next sign-in.
 
 #### Scenario: claim recorded at sign-in
 
 - **WHEN** a member signs in with `groups: ["family", "everyone"]`
 - **THEN** later requests from that member's session use those two groups
+
+#### Scenario: padded name in the claim
+
+- **WHEN** a member signs in with `groups: ["contractors "]`
+- **THEN** the member is recorded in `contractors`, and a Library rule saved
+  for the console's `contractors` column applies to them
 
 ### Requirement: Group declarations
 

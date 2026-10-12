@@ -9,6 +9,7 @@ package oidc
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
@@ -113,17 +114,29 @@ func (c *Client) Verify(ctx context.Context, rawIDToken string) (Claims, error) 
 // GroupsFromClaim normalizes a groups claim: a JSON array of strings, or a
 // single string from issuers that collapse a one-element array. Anything else,
 // and empty entries, yield nothing; the result is never nil.
+//
+// Each name is trimmed and listed once. This is the one place the claim enters
+// burrow, and everything downstream compares group names exactly — the admin
+// gate, a provider row's audience, a skill pack — against names that were
+// trimmed when an operator or admin wrote them. A claim kept verbatim as
+// "contractors " put its member under the console's "contractors" column while
+// matching no rule saved for it, so the member kept the whole Library.
 func GroupsFromClaim(v any) []string {
 	groups := []string{}
+	seen := map[string]bool{}
+	add := func(g string) {
+		if g = strings.TrimSpace(g); g != "" && !seen[g] {
+			seen[g] = true
+			groups = append(groups, g)
+		}
+	}
 	switch claim := v.(type) {
 	case string:
-		if claim != "" {
-			groups = append(groups, claim)
-		}
+		add(claim)
 	case []any:
 		for _, item := range claim {
-			if g, ok := item.(string); ok && g != "" {
-				groups = append(groups, g)
+			if g, ok := item.(string); ok {
+				add(g)
 			}
 		}
 	}
