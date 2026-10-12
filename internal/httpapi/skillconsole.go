@@ -28,11 +28,15 @@ package httpapi
 // (the same gate), ADR-0003 (option 2 for skills: no key to keep in step).
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
+
+	"gitea.stump.rocks/stump.wtf/burrow/internal/store"
 )
 
 // skillMatrix is the matrix page's data: one column per group, one row per
@@ -49,6 +53,9 @@ type skillMatrix struct {
 	// UnnamedGroups lists groups whose rule no member has signed in under yet
 	// — a misspelled group name is otherwise invisible on this page.
 	UntaggedGroups []string
+	// Revision fingerprints the rules this page was rendered from; the form
+	// posts it back so a save can be refused once they have moved on.
+	Revision string
 }
 
 type skillMatrixRow struct {
@@ -60,7 +67,19 @@ type skillMatrixRow struct {
 // skillPackFormCount names the hidden field carrying how many group columns the
 // rendered form covers. The save rewrites exactly those, so an older page left
 // open cannot silently overwrite a group added since it was rendered.
-const skillPackFormCount = "groupCount"
+//
+// skillPackFormRevision names the hidden field carrying the fingerprint of the
+// rules the page was rendered from. A browser posts an untouched column exactly
+// as it was drawn, so without it a page left open would put back whatever
+// another admin had changed in the meantime — and read a rule declared since as
+// a column "switched off", withdrawing it.
+const (
+	skillPackFormCount    = "groupCount"
+	skillPackFormRevision = "revision"
+)
+
+// skillPacksStale is what an admin reads when the save is refused.
+const skillPacksStale = "the skill packs changed after this page was loaded, so nothing was saved — reload the page and make the change again"
 
 // handleConsoleSkills answers GET /admin/skills.
 func (s *Server) handleConsoleSkills(w http.ResponseWriter, r *http.Request) {
@@ -94,18 +113,29 @@ func (s *Server) handleConsoleSkillsSave(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var rowSkills []string
+	rendered := map[string]bool{}
 	for i := 0; ; i++ {
 		name := form.Get(fmt.Sprintf("skill.%d", i))
 		if name == "" {
 			break
 		}
 		rowSkills = append(rowSkills, name)
+		rendered[name] = true
 	}
 	packs, err := s.store.ListSkillPacks(r.Context())
 	if err != nil {
+		slog.Error("skills: load packs for save", "error", err)
 		s.renderConsoleError(w, http.StatusInternalServerError, "could not load the skill packs")
 		return
 	}
+	revision := form.Get(skillPackFormRevision)
+	if store.SkillPacksRevision(packs) != revision {
+		slog.Warn("skills: stale pack save refused", "actor", adminActor(r))
+		s.renderConsoleError(w, http.StatusConflict, skillPacksStale)
+		return
+	}
+	declare := map[string][]string{}
+	var forget []string
 	for column := 0; column < count; column++ {
 		group := strings.TrimSpace(form.Get(fmt.Sprintf("group.%d", column)))
 		if group == "" {
@@ -114,10 +144,7 @@ func (s *Server) handleConsoleSkillsSave(w http.ResponseWriter, r *http.Request)
 		}
 		if !form.Has(fmt.Sprintf("declare.%d", column)) {
 			if _, wasDeclared := packs[group]; wasDeclared {
-				if err := s.store.ForgetSkillPack(r.Context(), group); err != nil {
-					s.renderConsoleError(w, http.StatusInternalServerError, "could not clear the rule for "+group+": "+err.Error())
-					return
-				}
+				forget = append(forget, group)
 			}
 			continue
 		}
@@ -127,10 +154,33 @@ func (s *Server) handleConsoleSkillsSave(w http.ResponseWriter, r *http.Request)
 				allowed = append(allowed, skill)
 			}
 		}
-		if err := s.store.SetSkillPack(r.Context(), group, allowed); err != nil {
-			s.renderConsoleError(w, http.StatusInternalServerError, "could not save the rule for "+group+": "+err.Error())
+		// A skill the page had no row for was not unchecked by anyone: it
+		// dropped out of the catalog (a broken SKILL.md is skipped by the
+		// loader) and the admin could not see it. Keep it in the rule, so
+		// saving an unrelated change does not quietly strip it from every
+		// group — it would stay stripped after the file was fixed.
+		for _, skill := range packs[group] {
+			if !rendered[skill] {
+				allowed = append(allowed, skill)
+			}
+		}
+		declare[group] = allowed
+	}
+	if err := s.store.SaveSkillPacks(r.Context(), revision, declare, forget); err != nil {
+		if errors.Is(err, store.ErrSkillPacksChanged) {
+			slog.Warn("skills: stale pack save refused", "actor", adminActor(r))
+			s.renderConsoleError(w, http.StatusConflict, skillPacksStale)
 			return
 		}
+		slog.Error("skills: save packs", "actor", adminActor(r), "error", err)
+		s.renderConsoleError(w, http.StatusInternalServerError, "could not save the skill packs")
+		return
+	}
+	for _, group := range forget {
+		slog.Info("skills: pack withdrawn", "actor", adminActor(r), "group", group)
+	}
+	for _, group := range sortedKeys(declare) {
+		slog.Info("skills: pack saved", "actor", adminActor(r), "group", group, "skills", len(declare[group]))
 	}
 	http.Redirect(w, r, "/admin/skills?saved=1", http.StatusSeeOther)
 }
@@ -166,6 +216,7 @@ func (s *Server) skillMatrix(r *http.Request) (*skillMatrix, string) {
 		Declared:       declared,
 		NoRules:        len(packs) == 0,
 		UntaggedGroups: untagged,
+		Revision:       store.SkillPacksRevision(packs),
 	}
 	for _, skill := range catalog {
 		row := skillMatrixRow{Name: skill.Name, Title: skill.Title, Cells: make([]bool, len(groups))}
@@ -196,6 +247,12 @@ func mapKeys[V any](m map[string]V) []string {
 	for k := range m {
 		out = append(out, k)
 	}
+	return out
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	out := mapKeys(m)
+	sort.Strings(out)
 	return out
 }
 

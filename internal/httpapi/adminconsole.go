@@ -14,6 +14,7 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"html/template"
@@ -72,7 +73,9 @@ func (s *Server) requireAdminPage(next func(http.ResponseWriter, *http.Request))
 			s.renderConsoleError(w, http.StatusForbidden, "admin_required: this member is not in an admin group (BURROW_ADMIN_GROUPS)")
 			return
 		}
-		next(w, r)
+		// The actor rides the context the way requireAdmin wires it, so a
+		// page handler that writes can say who did.
+		next(w, r.WithContext(context.WithValue(r.Context(), adminActorKey, userID)))
 	})
 }
 
@@ -336,6 +339,7 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 {{if .Matrix.UntaggedGroups}}<p class="note">A rule names {{range .Matrix.UntaggedGroups}}<span class="badge">{{.}}</span> {{end}}but no member has signed in with that group yet — check the spelling in the identity provider.</p>{{end}}
 <form method="post" action="/admin/skills">
 <input type="hidden" name="groupCount" value="{{len .Matrix.Groups}}">
+<input type="hidden" name="revision" value="{{.Matrix.Revision}}">
 {{range $column, $group := .Matrix.Groups}}<input type="hidden" name="group.{{$column}}" value="{{$group}}">
 {{end}}{{range $row, $skill := .Matrix.Rows}}<input type="hidden" name="skill.{{$row}}" value="{{$skill.Name}}">
 {{end}}<table class="matrix">

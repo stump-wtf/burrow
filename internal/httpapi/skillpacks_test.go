@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"gitea.stump.rocks/stump.wtf/burrow/internal/store"
 )
 
 // Governing: SPEC-0003 REQ "Library audience", REQ "Compatibility"
@@ -282,6 +284,7 @@ var (
 	skillFieldRE  = regexp.MustCompile(`name="skill\.(\d+)" value="([^"]*)"`)
 	declareFormRE = regexp.MustCompile(`name="declare\.(\d+)" value="1" checked`)
 	checkedCellRE = regexp.MustCompile(`name="cell\.(\d+)\.(\d+)" value="1" checked`)
+	revisionRE    = regexp.MustCompile(`name="revision" value="([0-9a-f]+)"`)
 )
 
 // matrixForm rebuilds the posted form from the rendered page, carrying every
@@ -296,6 +299,9 @@ func matrixForm(t *testing.T, page string) (url.Values, map[string]string, map[s
 		form.Set("group."+m[1], m[2])
 	}
 	form.Set("groupCount", strconv.Itoa(len(groups)))
+	if m := revisionRE.FindStringSubmatch(page); m != nil {
+		form.Set("revision", m[1])
+	}
 	skills := map[string]string{}
 	for _, m := range skillFieldRE.FindAllStringSubmatch(page, -1) {
 		skills[m[2]] = m[1]
@@ -354,12 +360,15 @@ func TestConsoleMatrixRendersAndSaves(t *testing.T) {
 	// Switching the column back off withdraws the rule rather than emptying
 	// it, which returns everyone to the org-wide default.
 	resp, page = e.consoleGet(t, "/admin/skills")
-	if !strings.Contains(page, "checked") {
-		t.Fatalf("the saved rule must come back switched on: %s", page)
+	// Match the switch and the cell themselves: the page's own help text
+	// says "checked", so a bare substring test passes on any render.
+	if len(declareFormRE.FindAllString(page, -1)) != 1 || len(checkedCellRE.FindAllString(page, -1)) != 1 {
+		t.Fatalf("the saved rule must come back switched on with its one cell checked: %s", page)
 	}
 	form, groups, _ = matrixForm(t, page)
 	off := url.Values{}
 	off.Set("groupCount", strconv.Itoa(len(groups)))
+	off.Set("revision", form.Get("revision"))
 	for name, column := range groups {
 		off.Set("group."+column, name)
 	}
@@ -437,5 +446,145 @@ func TestConsoleFlagsARuleNamingAnUnseenGroup(t *testing.T) {
 	}
 	if _, declared := packs["typo-group"]; !declared {
 		t.Fatalf("typo-group: %v", packs)
+	}
+}
+
+// A page left open while another admin saves is drawn from rules that no longer
+// exist. Its save must change nothing: posted as-is it would read a rule
+// declared since as a column "switched off" and withdraw it, and put back any
+// skill removed since.
+func TestConsoleRefusesASaveFromAStalePage(t *testing.T) {
+	e := newConsoleEnv(t)
+	ctx := context.Background()
+	if err := e.st.UpsertUser(ctx, store.User{
+		ID: "bob-sub", Email: "bob@example.test", Name: "Bob", Groups: []string{"contractors"},
+	}); err != nil {
+		t.Fatalf("seed a contractor: %v", err)
+	}
+	if err := e.st.SetSkillPack(ctx, "family", []string{"code-review", "deploy-helper"}); err != nil {
+		t.Fatalf("declare family: %v", err)
+	}
+	_, stale := e.consoleGet(t, "/admin/skills") // admin A's tab
+
+	// Admin B, meanwhile: restrict contractors, and take a skill off family.
+	if err := e.st.SetSkillPack(ctx, "contractors", []string{"code-review"}); err != nil {
+		t.Fatalf("declare contractors: %v", err)
+	}
+	if err := e.st.SetSkillPack(ctx, "family", []string{"code-review"}); err != nil {
+		t.Fatalf("narrow family: %v", err)
+	}
+
+	// Admin A saves a change to their own column from the old page.
+	form, groups, skills := matrixForm(t, stale)
+	own := groups[adminGroup]
+	form.Set("declare."+own, "1")
+	form.Set("cell."+own+"."+skills["code-review"], "1")
+	resp, body := e.consolePost(t, "/admin/skills", form)
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(body, "reload the page") {
+		t.Fatalf("a stale save must be refused with a reload hint, got %d: %s", resp.StatusCode, body)
+	}
+
+	packs, err := e.st.ListSkillPacks(ctx)
+	if err != nil {
+		t.Fatalf("list packs: %v", err)
+	}
+	if got := strings.Join(packs["contractors"], ","); got != "code-review" {
+		t.Fatalf("the rule declared since the page rendered must survive: %v", packs)
+	}
+	if got := strings.Join(packs["family"], ","); got != "code-review" {
+		t.Fatalf("a skill removed since the page rendered must stay removed: %v", packs)
+	}
+	if _, declared := packs[adminGroup]; declared {
+		t.Fatalf("a refused save writes nothing, not even its own column: %v", packs)
+	}
+
+	// Reloading gives a page that saves.
+	_, fresh := e.consoleGet(t, "/admin/skills")
+	form, groups, skills = matrixForm(t, fresh)
+	own = groups[adminGroup]
+	form.Set("declare."+own, "1")
+	form.Set("cell."+own+"."+skills["code-review"], "1")
+	if resp, body = e.consolePost(t, "/admin/skills", form); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("a fresh page must save, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+// A form with no revision at all — a page rendered by an older build — is
+// stale by definition.
+func TestConsoleRefusesASaveWithNoRevision(t *testing.T) {
+	e := newConsoleEnv(t)
+	_, page := e.consoleGet(t, "/admin/skills")
+	form, groups, _ := matrixForm(t, page)
+	form.Del("revision")
+	form.Set("declare."+groups[adminGroup], "1")
+	if resp, _ := e.consolePost(t, "/admin/skills", form); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status %d, want 409", resp.StatusCode)
+	}
+	packs, err := e.st.ListSkillPacks(context.Background())
+	if err != nil {
+		t.Fatalf("list packs: %v", err)
+	}
+	if len(packs) != 0 {
+		t.Fatalf("nothing may be written: %v", packs)
+	}
+}
+
+// A SKILL.md with broken frontmatter is skipped by the loader, so its row is
+// not on the page. Saving anything then must not strip that skill from the
+// groups that had it: nobody unchecked it, and it would stay gone after the
+// file was fixed.
+func TestConsoleSaveKeepsSkillsThePageCouldNotShow(t *testing.T) {
+	e := newConsoleEnv(t)
+	ctx := context.Background()
+	if err := e.st.SetSkillPack(ctx, "family", []string{"code-review", "deploy-helper"}); err != nil {
+		t.Fatalf("declare family: %v", err)
+	}
+	// The page arrives as if deploy-helper had dropped out of the catalog:
+	// same rules, one row fewer.
+	_, page := e.consoleGet(t, "/admin/skills")
+	form, _, skills := matrixForm(t, page)
+	gone := skills["deploy-helper"]
+	form.Del("skill." + gone)
+	for key := range form {
+		if strings.HasPrefix(key, "cell.") && strings.HasSuffix(key, "."+gone) {
+			form.Del(key)
+		}
+	}
+	if gone != strconv.Itoa(len(skills)-1) {
+		t.Fatalf("this test drops the last row; deploy-helper is row %s of %d", gone, len(skills))
+	}
+	if resp, body := e.consolePost(t, "/admin/skills", form); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("save status %d: %s", resp.StatusCode, body)
+	}
+	packs, err := e.st.ListSkillPacks(ctx)
+	if err != nil {
+		t.Fatalf("list packs: %v", err)
+	}
+	if got := strings.Join(packs["family"], ","); got != "code-review,deploy-helper" {
+		t.Fatalf("family's allowance after an untouched save = %q, want both skills", got)
+	}
+}
+
+// The matrix's write is behind the same gate as its page: a signed-in member
+// outside the admin groups changes nothing.
+func TestSkillMatrixSaveIsGatedByAdminGroups(t *testing.T) {
+	e := newConsoleEnv(t)
+	_, page := e.consoleGet(t, "/admin/skills")
+	form, groups, skills := matrixForm(t, page)
+	own := groups[adminGroup]
+	form.Set("declare."+own, "1")
+	form.Set("cell."+own+"."+skills["code-review"], "1")
+
+	signInAs(t, e, "family") // alice's next sign-in no longer carries the admin group
+	resp, body := e.consolePost(t, "/admin/skills", form)
+	if resp.StatusCode != http.StatusForbidden || !strings.Contains(body, "admin_required") {
+		t.Fatalf("status %d: a non-admin save must answer admin_required: %s", resp.StatusCode, body)
+	}
+	packs, err := e.st.ListSkillPacks(context.Background())
+	if err != nil {
+		t.Fatalf("list packs: %v", err)
+	}
+	if len(packs) != 0 {
+		t.Fatalf("a refused save writes nothing: %v", packs)
 	}
 }
