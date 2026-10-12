@@ -62,10 +62,20 @@ implements: [ADR-0004]
   no capability.
 - **Etags on forms.** The editor carries the fetched etag in a hidden field;
   a 412 re-renders with the API's current row, a 409/400 re-renders the
-  typed values with the API's message.
+  typed values with the API's message, and a 428 (the form lost its etag)
+  re-renders them asking for a reload. A re-rendered form reads the key
+  light and the org-wide warning back from the stored row (2026-10-12).
+- **Audience is one group per line.** The editor's `groups` field is a
+  textarea split on newlines, each line taken whole, so every group the API
+  accepts survives an untouched save. It was a comma-separated input, which
+  split a group containing a comma (an LDAP DN) into several (2026-10-12).
 - **Preview is the runtime's own answer.** `/admin/preview?group=` calls
   `RowsFor` with that single group; there is no second matching rule to
   drift.
 - **Menus come from `Runtime.MenuFor`.** The same cache a listing serves, so
   counts and display names match what members see. Overrides for ids the
   current menu lacks ride as hidden inputs: a PUT is a full replace.
+  `Runtime.MenuKnown` says whether that menu is an answer from the gateway;
+  until one has answered (unreachable, key refused, failure cooldown, key
+  variable unset) the list, the preview, and the delete confirm say the
+  model count is unknown instead of printing 0 (2026-10-12).

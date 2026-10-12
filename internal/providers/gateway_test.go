@@ -330,6 +330,66 @@ func TestNameOverridesApplyToDerivedModels(t *testing.T) {
 
 // A gateway that answers with an unparseable body or a wrong shape is a
 // fetch failure, not a panic: the stale menu stands.
+// The console must be able to tell "the gateway said zero models" from "the
+// gateway was never heard from": MenuKnown is false for an unprovisioned
+// key, a failed first fetch and its cooldown, and true once the gateway has
+// answered — even with an empty menu, and through a later outage that
+// serves the last-known ids.
+func TestMenuKnownSeparatesUnansweredFromEmpty(t *testing.T) {
+	st := storetest.Open(t)
+	gw := newFakeGateway(t)
+	row := gatewayRow(gw.URL())
+	seedRow(t, st, row)
+	// TTL 80ms → cooldown 20ms.
+	runtime := providers.NewRuntime(st, 80*time.Millisecond)
+	ctx := context.Background()
+	menu := func() (int, bool) {
+		ids, _ := runtime.MenuFor(ctx, row)
+		return len(ids), runtime.MenuKnown(row.ID)
+	}
+
+	if runtime.MenuKnown(row.ID) {
+		t.Fatal("a row never asked about has no known menu")
+	}
+	if n, known := menu(); n != 0 || known {
+		t.Fatalf("an unset key: want 0 ids and unknown, got %d known=%v", n, known)
+	}
+
+	t.Setenv("GW_KEY", "sk-gateway-secret")
+	gw.setFail(true)
+	if n, known := menu(); n != 0 || known {
+		t.Fatalf("a failed first fetch: want 0 ids and unknown, got %d known=%v", n, known)
+	}
+	hits := gw.count()
+	if n, known := menu(); n != 0 || known || gw.count() != hits {
+		t.Fatalf("inside the cooldown: want 0 ids, unknown, and no gateway call, got %d known=%v calls %d→%d", n, known, hits, gw.count())
+	}
+
+	// The gateway answers, with nothing in scope: zero is now a fact.
+	gw.setFail(false)
+	time.Sleep(40 * time.Millisecond)
+	if n, known := menu(); n != 0 || !known {
+		t.Fatalf("an answered empty menu: want 0 ids and known, got %d known=%v", n, known)
+	}
+
+	// A later outage serves the last-known menu, which is still an answer.
+	gw.setIDs("gpt-5")
+	time.Sleep(90 * time.Millisecond)
+	if n, known := menu(); n != 1 || !known {
+		t.Fatalf("a refreshed menu: want 1 id and known, got %d known=%v", n, known)
+	}
+	gw.setFail(true)
+	time.Sleep(90 * time.Millisecond)
+	if n, known := menu(); n != 1 || !known {
+		t.Fatalf("an outage after an answer: want the last-known id and known, got %d known=%v", n, known)
+	}
+
+	var none *providers.Runtime
+	if none.MenuKnown(row.ID) {
+		t.Fatal("a nil Runtime knows no menu")
+	}
+}
+
 func TestGarbageGatewayResponseServesStale(t *testing.T) {
 	st := storetest.Open(t)
 	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

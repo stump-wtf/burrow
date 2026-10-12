@@ -382,6 +382,27 @@ func (r *Runtime) MenuFor(ctx context.Context, p store.ProviderRow) ([]string, b
 	return ids, hasKey
 }
 
+// MenuKnown reports whether the menu MenuFor returns for row id is an answer
+// from the row's gateway or the lack of one. It is false until a fetch from
+// the row's current baseURL and key has succeeded — a failed or refused
+// fetch, the failure cooldown, and an unprovisioned key all leave it false —
+// so the console can say "unknown" where it would otherwise print a count of
+// zero it never established. A nil Runtime knows no menu.
+func (r *Runtime) MenuKnown(id string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	e := r.cache[id]
+	r.mu.Unlock()
+	if e == nil {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.known
+}
+
 // SnapshotFor is the resource snapshot for one member: id→updatedAt for the
 // rows they may see (SPEC-0003 REQ "Resource snapshot follows visibility").
 // Deriving each row's menu is what advances updated_at when the gateway's
