@@ -66,7 +66,9 @@ Required contexts in CI: `ci / lint*`, `ci / test*`, `secret-scan / gitleaks*`.
 either `BURROW_SKILLS_DIR` (a directory of `<name>/SKILL.md`) or
 `BURROW_SKILLS_GIT_URL`. The rest have defaults you can read in
 `internal/config/config.go` — that file is the list; do not read an env var
-anywhere else.
+anywhere else. A default applies only when a variable is unset or blank: a
+duration or boolean that is set but unreadable (`7d`, `300`, `off`) stops
+burrow at boot instead of quietly running on the default.
 
 Secrets never live in the repo. Credentials arrive from the environment at
 runtime (OpenBao in deployment). Never log a token, session id, or provider key:
