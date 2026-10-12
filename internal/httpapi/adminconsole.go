@@ -605,10 +605,23 @@ func (s *Server) handleConsoleConfirmDelete(w http.ResponseWriter, r *http.Reque
 // the confirm step. The etag the confirm page carried rides to the API as
 // If-Match, so a row that changed since the confirm step is not deleted
 // blind; the API's own handler, store path, and audit do the work.
+//
+// The API's DELETE is unconditional when If-Match is absent (automation may
+// delete by id alone), so a POST without a usable etag is refused here: sent
+// on, it would delete whatever the row has become, which is exactly what the
+// confirm step exists to prevent.
 func (s *Server) handleConsoleDelete(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		s.renderConsoleError(w, http.StatusBadRequest, "could not read the form")
+		return
+	}
 	id := r.PathValue("id")
-	_ = r.ParseForm()
-	rec, _ := s.consoleCall(r, http.MethodDelete, "/v1/admin/llm-providers/"+url.PathEscape(id), nil, r.FormValue("etag"))
+	etag := r.PostForm.Get("etag")
+	if _, err := time.Parse(time.RFC3339Nano, unquoteETag(etag)); err != nil {
+		s.renderConsoleError(w, http.StatusBadRequest, "the delete did not carry the etag from the confirm step; open the row again and delete from there")
+		return
+	}
+	rec, _ := s.consoleCall(r, http.MethodDelete, "/v1/admin/llm-providers/"+url.PathEscape(id), nil, etag)
 	switch rec.Code {
 	case http.StatusNoContent:
 		http.Redirect(w, r, "/admin?saved=deleted", http.StatusSeeOther)

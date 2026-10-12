@@ -799,8 +799,12 @@ WHERE id = $1 RETURNING updated_at`,
 }
 
 // DeleteProvider removes one row and appends its audit entry in one
-// transaction. It returns ErrNotFound when the row does not exist.
-func (s *Store) DeleteProvider(ctx context.Context, id, actor string) error {
+// transaction. A non-zero expectUpdatedAt is the same precondition
+// UpdateProvider takes, checked inside the same row lock: a row that changed
+// since the caller read it is not deleted — the caller gets ErrStale, and a
+// delete racing an update on one etag cannot remove the version nobody
+// looked at. It returns ErrNotFound when the row does not exist.
+func (s *Store) DeleteProvider(ctx context.Context, id string, expectUpdatedAt time.Time, actor string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("store: begin delete provider: %w", err)
@@ -809,6 +813,9 @@ func (s *Store) DeleteProvider(ctx context.Context, id, actor string) error {
 	before, err := getProviderTx(ctx, tx, id)
 	if err != nil {
 		return err
+	}
+	if !expectUpdatedAt.IsZero() && !before.UpdatedAt.Equal(expectUpdatedAt) {
+		return ErrStale
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM llm_providers WHERE id = $1`, id); err != nil {
 		return fmt.Errorf("store: delete provider: %w", err)

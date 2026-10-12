@@ -98,10 +98,21 @@ model's display name SHALL be its name override when present, else its id.
 with its stored fields and per-row `etag`), `POST` (create; `409` on an
 existing id), `GET|PUT|DELETE /{id}` (PUT replaces; `404` unknown id; `428`
 PUT without `If-Match`; `412` stale `If-Match`, whose body carries the
-current row). `etag` SHALL be the row's `updated_at` (quoted). These routes
+current row). `If-Match` is optional on DELETE, so automation may delete by
+id alone, but a DELETE that carries it SHALL be held to it exactly as PUT
+is: a stale `If-Match` is `412` with the current row and deletes nothing.
+`etag` SHALL be the row's `updated_at` (quoted). These routes
 are burrow-designed (outside the client contract): error codes are burrow's
 own, and unknown fields SHALL be rejected rather than ignored, as SHALL a
 body that carries anything after its one JSON object.
+
+#### Scenario: Delete races an update
+
+- **GIVEN** a caller that read a row's `etag`, and another writer that has
+  since replaced the row
+- **WHEN** the caller sends `DELETE` with that `etag` as `If-Match`
+- **THEN** the answer is `412` carrying the current row, the row is not
+  deleted, and no audit entry is written
 
 ### Requirement: Admin authorization
 
@@ -149,7 +160,10 @@ before/after detail). Every console mutation SHALL go through the write
 API's own handlers - its validation, its `If-Match` etag handling (412 shows
 the carried current row; 409 surfaces duplicate_id; 400 shows the field
 errors) and its audit records - so the console is a client of the API, never
-a second management path. A web (non-desktop) OIDC sign-in SHALL establish
+a second management path. A console delete SHALL pass through a confirm step
+and send the etag that step showed as `If-Match`; a row that changed since
+the confirm step, or a confirm that carries no usable etag, SHALL NOT be
+deleted. A web (non-desktop) OIDC sign-in SHALL establish
 the browser session the console reads: an HttpOnly, SameSite=Lax cookie
 carrying the session token (the desktop grant flow is unchanged). The
 cookie's attributes are not a cross-origin defense - SameSite is scoped to
@@ -174,6 +188,14 @@ key rotation stays an OpenBao/LiteLLM operation outside burrow.
 - **WHEN** the first admin saves with the stale etag
 - **THEN** the editor re-renders with the API's current row and an
   explanation, and no change is lost silently
+
+#### Scenario: Delete confirm races another admin
+
+- **GIVEN** one admin on a row's delete confirm page while another admin
+  saves that row
+- **WHEN** the first admin confirms the delete
+- **THEN** the row is kept and the console says it changed since the confirm
+  step
 
 #### Scenario: Forged write from a sibling subdomain
 

@@ -324,8 +324,36 @@ func writeETagStale(w http.ResponseWriter, current store.ProviderRow) {
 	})
 }
 
+// handleAdminDeleteProvider deletes one row. If-Match is optional here —
+// automation that only knows an id may delete without one — but when the
+// caller sends it, it is honored exactly as PUT honors it: a stale etag is
+// 412 with the current row and nothing is deleted. A caller that confirmed
+// one version of a row (the console's confirm step) must not remove a
+// different one.
 func (s *Server) handleAdminDeleteProvider(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.DeleteProvider(r.Context(), r.PathValue("id"), adminActor(r)); err != nil {
+	id := r.PathValue("id")
+	var expected time.Time
+	if ifMatch := r.Header.Get("If-Match"); ifMatch != "" {
+		var err error
+		expected, err = time.Parse(time.RFC3339Nano, unquoteETag(ifMatch))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", "If-Match must be the row's etag: the quoted RFC3339Nano updated_at")
+			return
+		}
+	}
+	// The store checks the precondition inside its row lock, so an update
+	// that lands between the caller's read and this delete answers 412
+	// rather than losing the row it just wrote.
+	if err := s.store.DeleteProvider(r.Context(), id, expected, adminActor(r)); err != nil {
+		if errors.Is(err, store.ErrStale) {
+			current, err := s.store.GetProvider(r.Context(), id)
+			if err != nil {
+				s.adminProviderError(w, err)
+				return
+			}
+			writeETagStale(w, current)
+			return
+		}
 		s.adminProviderError(w, err)
 		return
 	}

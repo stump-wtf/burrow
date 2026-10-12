@@ -35,8 +35,9 @@ cannot drift from it (ADR-0004).
 Rows are managed at `/api/den/v1/admin/llm-providers` — burrow's own routes,
 outside the client contract — which a member of a `BURROW_ADMIN_GROUPS` group
 or an `llm-admin` API token may reach. `PUT` requires `If-Match` with the
-row's `etag`, so automation cannot clobber a concurrent change, and every
-write is audited in `llm_provider_audit`.
+row's `etag`, so automation cannot clobber a concurrent change; `DELETE`
+honors `If-Match` when it is sent (`412` if the row changed) and deletes by
+id without it. Every write is audited in `llm_provider_audit`.
 
 `BURROW_PROVIDERS_FILE` is a **first-boot seed**: consulted only while the
 table is empty, after which the store is the source of truth and the file is
