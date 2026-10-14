@@ -126,3 +126,40 @@ jobs:
             echo "::warning::$NET could not be removed, still attached:"
             docker network inspect "$NET" -f '{{range .Containers}}  {{println .Name}}{{end}}' || true
           fi
+
+  # Nothing above builds the Dockerfile, and ship.yaml, which does, runs only
+  # on main: a pull request that breaks the image build (a Dockerfile edit, a
+  # base-image bump from Renovate, a file the build needs dropped from the
+  # context) passed every check and failed after it merged. Build it here,
+  # with the builder and the build step ship.yaml uses, minus everything that
+  # needs a credential or leaves something behind: no registry login, no
+  # push, no cache import or export, and no `load`, so nothing lands in the
+  # runner's shared Docker daemon. Pull requests only; on main ship.yaml is
+  # the build.
+  #
+  # ADVISORY. Its status context is `ci / image (pull_request)`, which the
+  # required patterns (`ci / lint*`, `ci / test*`, `secret-scan / gitleaks*`)
+  # do not match, so a red build here does not block a merge until someone
+  # adds `ci / image*` to branch protection. Keep the job id clear of `lint`
+  # and `test` prefixes, or it becomes required by accident.
+  image:
+    if: ${{ gitea.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `COPY . .` takes the tree, .git included, into a build layer;
+          # the job token has no business in it and no later step uses git.
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: false

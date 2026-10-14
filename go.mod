@@ -2,6 +2,13 @@ module gitea.stump.rocks/stump.wtf/burrow
 
 go 1.26.0
 
+// The toolchain line, not the go line, is the release CI tests with:
+// setup-go installs what the go line names, and the go command then switches
+// to this one (GOTOOLCHAIN=auto). Keep it on the same minor as the golang
+// image in the Dockerfile, so the release that tests the code is the one
+// that builds the image.
+toolchain go1.27.1
+
 require (
 	github.com/coreos/go-oidc/v3 v3.21.0
 	github.com/jackc/pgx/v5 v5.11.0

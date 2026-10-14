@@ -23,6 +23,7 @@
     "enabled": true,
     "automerge": true
   },
+  "osvVulnerabilityAlerts": true,
   "packageRules": [
     {
       "description": "Do not automerge dev dependencies",
@@ -31,6 +32,31 @@
         "dev-dependencies"
       ],
       "automerge": false
+    },
+    {
+      "description": "Track indirect Go modules. Renovate skips them unless told otherwise, so a fix for an advisory in one (golang.org/x/text, CVE-2026-56852) was never proposed and had to be bumped by hand after the image scan failed on main",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchDepTypes": [
+        "indirect"
+      ],
+      "enabled": true
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The Postgres image the suites run against. It is pinned twice, in the Makefile for local runs and in ci.yaml for CI, and no built-in manager reads either place; one rule so the two move in one PR",
+      "managerFilePatterns": [
+        "/^Makefile$/",
+        "/^\\.gitea/workflows/ci\\.yaml$/"
+      ],
+      "matchStrings": [
+        "(?<depName>postgres):(?<currentValue>\\d+(?:\\.\\d+)*-alpine)"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
     }
   ]
 }
