@@ -123,7 +123,7 @@ jobs:
         # Pinned, not :latest — act_runner pulls a Docker action's image with
         # forcePull=false, so a runner holding a cached :latest never sees a
         # rebuild (stumpcloud-ci trap 6). Bump this tag deliberately.
-        uses: docker://aquasec/trivy:0.75.0
+        uses: docker://aquasec/trivy:0.76.0
         with:
           args: image --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 --format table gitea.stump.rocks/stump.wtf/burrow:scan-${{ gitea.run_id }}
 
