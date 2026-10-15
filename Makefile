@@ -52,7 +52,7 @@ race: test-db
 # The store is Postgres (ADR-0002), so the suites need a real server. Locally
 # this starts a disposable container and points the tests at it; CI exports
 # BURROW_TEST_DATABASE_URL for its own sidecar and the target does nothing.
-PG_IMAGE ?= postgres:17-alpine
+PG_IMAGE ?= postgres:18-alpine
 PG_NAME  ?= burrow-test-pg
 PG_PORT  ?= 55432
 BURROW_TEST_DATABASE_URL ?= postgres://burrow:burrow@127.0.0.1:$(PG_PORT)/burrow?sslmode=disable
