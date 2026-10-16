@@ -11,7 +11,8 @@ package skills
 // group to the skills that group may see.
 //
 // Governing: SPEC-0003 REQ "Library audience", REQ "Compatibility"
-// (stump.wtf/burrow#12), ADR-0003 (option 2: a console-edited mapping, where
+// (stump.wtf/burrow#12, amended by ADR-0006 for the fail-closed default,
+// stump.wtf/burrow#39), ADR-0003 (option 2: a console-edited mapping, where
 // there is no key whose scope could drift from the menu).
 
 import "strings"
@@ -23,13 +24,17 @@ type Packs map[string][]string
 
 // Visible returns the entries one member sees, keeping the catalog's order.
 //
-// The union of the member's declared groups is their allowance. A member
-// holding no declared group keeps the whole catalog: writing a rule for one
-// group must not hide the Library from everyone else, and an org with no rules
-// behaves exactly as it did before this existed. A declared group contributes
-// its own list, so a member whose only group declares an empty allowance sees
-// nothing — "these members get nothing" is a thing an admin means, and it is
-// not the same statement as "nobody has written a rule about this group".
+// The union of the member's declared groups is their allowance. Once any
+// rule exists, a member holding no declared group sees nothing: writing a
+// rule for any group is a statement that the Library is restricted, and an
+// undeclared group — one not yet seen, one the identity provider renamed or
+// recased, one a sign-in stopped carrying — must not be the widest door in
+// the system (ADR-0006, stump.wtf/burrow#39). While no rule exists anywhere
+// the org behaves exactly as it did before this existed, which is what makes
+// shipping the change a no-op. A declared group contributes its own list, so
+// a member whose only group declares an empty allowance sees nothing —
+// "these members get nothing" is a thing an admin means, and it is not the
+// same statement as "nobody has written a rule about this group".
 func Visible(list []Skill, groups []string, packs Packs) []Skill {
 	if len(packs) == 0 {
 		return list
@@ -48,7 +53,7 @@ func Visible(list []Skill, groups []string, packs Packs) []Skill {
 		}
 	}
 	if allowed == nil {
-		return list
+		return nil
 	}
 	out := make([]Skill, 0, len(list))
 	for _, skill := range list {
@@ -57,6 +62,21 @@ func Visible(list []Skill, groups []string, packs Packs) []Skill {
 		}
 	}
 	return out
+}
+
+// HoldsDeclared reports whether any group the member holds carries a rule.
+// It is false wherever the fail-closed default applies to them: a group
+// nobody has declared, a sign-in that carried no groups at all, or a rename
+// or recase that left the declared name behind. Callers log or surface that
+// state so an admin sees the drift instead of learning about it from a member
+// whose Library went quiet (stump.wtf/burrow#39).
+func HoldsDeclared(groups []string, packs Packs) bool {
+	for _, group := range groups {
+		if _, declared := packs[group]; declared {
+			return true
+		}
+	}
+	return false
 }
 
 // Search returns the entries whose name, title, or description contain every

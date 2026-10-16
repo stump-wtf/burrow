@@ -144,12 +144,12 @@ func mcpToolCall(t *testing.T, e *testEnv, tool string, args map[string]any) (st
 
 func TestLibraryIsWholeCatalogWithNoRules(t *testing.T) {
 	e := newTestEnv(t)
-	if err := e.st.SetSkillPack(context.Background(), "family", []string{"code-review"}); err != nil {
-		t.Fatalf("declare pack: %v", err)
-	}
-	// alice holds no group, so no rule applies to her: REQ "Compatibility".
+	// No rule written anywhere: REQ "Compatibility". An org that has never
+	// touched the matrix behaves exactly as it did before it existed — this
+	// is the one whole-catalog answer the fail-closed default still gives
+	// (ADR-0006, stump.wtf/burrow#39).
 	if got := libraryNames(t, e); strings.Join(got, ",") != "Code Review,Deploy Helper" {
-		t.Fatalf("a member no rule mentions must see everything: %v", got)
+		t.Fatalf("a member before the first rule must see everything: %v", got)
 	}
 	if got := mcpIndexNames(t, e); strings.Join(got, ",") != "code-review,deploy-helper" {
 		t.Fatalf("the agent's index must match: %v", got)
@@ -242,6 +242,65 @@ func TestDeclaredEmptyAllowanceShowsNothing(t *testing.T) {
 	}
 }
 
+// The three drift paths of stump.wtf/burrow#39, failed closed on every face.
+// Before the change each of these lifted every restriction — the member got
+// the whole catalog, bodies included over MCP. The undeclared group is the
+// path a brand-new IdP group takes before any rule names it; the others are
+// recorded here once, and all three meet the same empty slice.
+func TestUndeclaredGroupFailsClosedOnEverySurface(t *testing.T) {
+	e := newTestEnv(t)
+	declareFamily(t, e, "code-review")
+	signInAs(t, e, "strangers")
+
+	if got := libraryNames(t, e); len(got) != 0 {
+		t.Fatalf("a member holding only an undeclared group must see nothing: %v", got)
+	}
+	if got := snapshotSkillIDs(t, e); len(got) != 0 {
+		t.Fatalf("the resource snapshot must be empty: %v", got)
+	}
+	if got := mcpIndexNames(t, e); len(got) != 0 {
+		t.Fatalf("the agent's index must be empty: %v", got)
+	}
+	if _, code := mcpToolCall(t, e, "get_skill", map[string]any{"name": "code-review"}); code != -32002 {
+		t.Fatalf("get_skill for a failed-closed member must answer unknown skill, got code %d", code)
+	}
+}
+
+// A sign-in that carried no groups claim at all (IdP config drift, or
+// BURROW_OIDC_GROUPS_SCOPE=false) used to lift every restriction while rules
+// existed. It now lands on the fail-closed default.
+func TestSignInWithoutGroupsClaimFailsClosed(t *testing.T) {
+	e := newTestEnv(t)
+	declareFamily(t, e, "code-review")
+	signInAs(t, e)
+
+	if got := libraryNames(t, e); len(got) != 0 {
+		t.Fatalf("an empty groups claim must see nothing while rules exist: %v", got)
+	}
+	if got := mcpIndexNames(t, e); len(got) != 0 {
+		t.Fatalf("the agent's index must be empty too: %v", got)
+	}
+}
+
+// An IdP rename or re-case of a declared group lifted its restriction at the
+// next sign-in. Now the renamed group is simply undeclared — nothing until an
+// admin declares the new name, which restores the pack.
+func TestRenamedGroupFailsClosedUntilDeclaredAgain(t *testing.T) {
+	e := newTestEnv(t)
+	declareFamily(t, e, "code-review")
+	signInAs(t, e, "Family")
+
+	if got := libraryNames(t, e); len(got) != 0 {
+		t.Fatalf("a renamed group must not lift its rule: %v", got)
+	}
+	if err := e.st.SetSkillPack(context.Background(), "Family", []string{"code-review"}); err != nil {
+		t.Fatalf("declare the renamed group: %v", err)
+	}
+	if got := libraryNames(t, e); strings.Join(got, ",") != "Code Review" {
+		t.Fatalf("declaring the renamed group restores its pack: %v", got)
+	}
+}
+
 // Two groups on one member union their allowances; a group with no rule adds
 // nothing to the union.
 func TestTwoGroupsUnionTheirAllowances(t *testing.T) {
@@ -270,8 +329,11 @@ func TestMCPTokenCarriesItsMembersAudience(t *testing.T) {
 	e := newTestEnv(t)
 	declareFamily(t, e, "code-review")
 
-	if got := mcpIndexNames(t, e); strings.Join(got, ",") != "code-review,deploy-helper" {
-		t.Fatalf("before the group exists, everything is visible: %v", got)
+	// alice holds no group yet: a rule exists, so the fail-closed default
+	// answers — the agent's view is its member's view, quiet included
+	// (ADR-0006, stump.wtf/burrow#39).
+	if got := mcpIndexNames(t, e); len(got) != 0 {
+		t.Fatalf("before the group exists the fail-closed default applies: %v", got)
 	}
 	signInAs(t, e, "family")
 	if got := mcpIndexNames(t, e); strings.Join(got, ",") != "code-review" {
@@ -446,6 +508,82 @@ func TestConsoleFlagsARuleNamingAnUnseenGroup(t *testing.T) {
 	}
 	if _, declared := packs["typo-group"]; !declared {
 		t.Fatalf("typo-group: %v", packs)
+	}
+}
+
+// The other half of the drift picture (stump.wtf/burrow#39): a group members
+// sign in under that no rule names now puts them on the fail-closed default,
+// so the page must name it — an admin has to be able to see the drift, not
+// wait for a member to report a quiet Library.
+func TestConsoleNamesASignedInGroupWithNoRule(t *testing.T) {
+	e := newConsoleEnv(t)
+	if err := e.st.SetSkillPack(context.Background(), "family", []string{"code-review"}); err != nil {
+		t.Fatalf("declare family: %v", err)
+	}
+	signInAs(t, e, "drifted", adminGroup)
+	resp, page := e.consoleGet(t, "/admin/skills")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	if !strings.Contains(page, "drifted") || !strings.Contains(page, "no rule names that group") {
+		t.Fatalf("the page must name signed-in groups no rule declares: %s", page)
+	}
+}
+
+// Declaring a group by name gives it a column before any of its members has
+// ever signed in — the fail-closed default would otherwise leave a new IdP
+// group on an invisible rule of nothing (stump.wtf/burrow#39).
+func TestConsoleDeclaresAGroupByName(t *testing.T) {
+	e := newConsoleEnv(t)
+	resp, page := e.consoleGet(t, "/admin/skills")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	form, _, _ := matrixForm(t, page)
+	form.Set("newGroup", " newteam ")
+	if resp, _ = e.consolePost(t, "/admin/skills", form); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("declare status %d", resp.StatusCode)
+	}
+	packs, err := e.st.ListSkillPacks(context.Background())
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	allowed, declared := packs["newteam"]
+	if !declared || len(allowed) != 0 {
+		t.Fatalf("declaring by name writes a rule that allows nothing: %v", packs)
+	}
+	// The reloaded page gives it a column, so its cells can be checked.
+	_, page = e.consoleGet(t, "/admin/skills")
+	if !strings.Contains(page, `value="newteam"`) {
+		t.Fatalf("the declared group must render as a column: %s", page)
+	}
+}
+
+// A name typed into the box that the page already renders as a column is that
+// column's business: re-declaring it empty from the text field would erase
+// the rule drawn on the page.
+func TestConsoleDeclareByNameLeavesRenderedColumnsAlone(t *testing.T) {
+	e := newConsoleEnv(t)
+	if err := e.st.SetSkillPack(context.Background(), "family", []string{"code-review"}); err != nil {
+		t.Fatalf("declare family: %v", err)
+	}
+	resp, page := e.consoleGet(t, "/admin/skills")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	form, groups, skills := matrixForm(t, page)
+	form.Set("declare."+groups["family"], "1")
+	form.Set("cell."+groups["family"]+"."+skills["code-review"], "1")
+	form.Set("newGroup", "family")
+	if resp, _ = e.consolePost(t, "/admin/skills", form); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("save status %d", resp.StatusCode)
+	}
+	packs, err := e.st.ListSkillPacks(context.Background())
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if got := strings.Join(packs["family"], ","); got != "code-review" {
+		t.Fatalf("a name typed that is already a column must not erase it: %v", packs)
 	}
 }
 

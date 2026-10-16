@@ -6,9 +6,11 @@ package store
 // rows in skill_pack_skills.
 //
 // The two tables keep two different states apart. No row at all for a group
-// means no rule written, so a member holding only such groups keeps the whole
-// catalog — that is the org-wide default, and it is what makes shipping this
-// change nothing. A group with a row and no skills has declared an empty
+// means no rule written: while no group has a row the whole org sees the whole
+// catalog (which is what makes shipping this change nothing), but once any
+// rule exists a member holding only undeclared groups falls to the fail-closed
+// default and sees nothing (SPEC-0003 as amended by ADR-0006,
+// stump.wtf/burrow#39). A group with a row and no skills has declared an empty
 // allowance: its members see no Library entries. Collapsing the two would
 // remove the admin's ability to say "nobody in this group", which is a thing
 // an admin means.

@@ -2,6 +2,7 @@ package httpapi_test
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
@@ -217,6 +218,52 @@ func TestAccessGroupsClaimRecordedAtSignIn(t *testing.T) {
 	}
 	if got := signIn(nil); len(got) != 0 || got == nil {
 		t.Fatalf("a missing claim must record no groups (non-nil), got %#v", got)
+	}
+}
+
+// A sign-in that holds no declared group while rules exist is identity
+// provider drift — the claim that stopped arriving, the group renamed or
+// recased (stump.wtf/burrow#39). Under the fail-closed default that member's
+// Library goes quiet at once, so the sign-in itself must be logged: an admin
+// connects the two without waiting for a complaint.
+func TestAccessSignInHoldingNoDeclaredGroupIsLogged(t *testing.T) {
+	e := newAccessTestEnv(t)
+	issuer := newFakeIssuer(t, "burrow-desktop")
+	client, err := oidc.New(context.Background(), issuer.srv.URL, "burrow-desktop", "secret",
+		e.srv.URL+"/auth/oidc/callback", true)
+	if err != nil {
+		t.Fatalf("oidc client against fake issuer: %v", err)
+	}
+	e.srv.Config.Handler = httpapi.New(e.cfg, e.st, skills.NewCatalog(skills.Source{Dir: e.cfg.SkillsDir}), nil, client).Routes()
+	if err := e.st.SetSkillPack(context.Background(), "family", []string{"code-review"}); err != nil {
+		t.Fatalf("declare pack: %v", err)
+	}
+	var logs strings.Builder
+	restore := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(restore) })
+
+	issuer.groups = []any{"drifted"}
+	noRedirect := newBrowser(t)
+	start, err := noRedirect.Get(e.srv.URL + "/auth/oidc/start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start.Body.Close()
+	loc, err := url.Parse(start.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cb, err := noRedirect.Get(approve(t, loc.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cb.Body.Close()
+	if cb.StatusCode != http.StatusOK {
+		t.Fatalf("callback: status %d", cb.StatusCode)
+	}
+	if !strings.Contains(logs.String(), "sign-in holds no declared group") {
+		t.Fatalf("a sign-in the fail-closed default applies to must be logged: %s", logs.String())
 	}
 }
 

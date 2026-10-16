@@ -369,8 +369,9 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 
 {{if .Matrix}}
 <h1 style="font-size:19px;font-weight:600;margin:0 0 16px">Skill packs</h1>
-{{if .Matrix.NoRules}}<p class="note">Nothing configured yet, so every member sees the whole catalog. Switch a group on and check the skills its members may see; nobody else changes.</p>{{else}}<p class="note">A group sees the skills checked in its column. A column switched off carries no rule, so its members keep the whole catalog; switched on with nothing checked, they see no skills.</p>{{end}}
+{{if .Matrix.NoRules}}<p class="note">Nothing configured yet, so every member sees the whole catalog. Switch a group on and check the skills its members may see. Once the first rule exists the Library is restricted: members holding no declared group see nothing, so declare each group before its first member signs in.</p>{{else}}<p class="note">A group sees the skills checked in its column. A column switched off carries no rule: while any rule exists its members see no skills, and only when no rule is written anywhere does the Library open again; switched on with nothing checked, they likewise see no skills.</p>{{end}}
 {{if .Matrix.UntaggedGroups}}<p class="note">A rule names {{range .Matrix.UntaggedGroups}}<span class="badge">{{.}}</span> {{end}}but no member has signed in with that group yet — check the spelling in the identity provider.</p>{{end}}
+{{if .Matrix.UndeclaredGroups}}<p class="note">Members have signed in under {{range .Matrix.UndeclaredGroups}}<span class="badge">{{.}}</span> {{end}}but no rule names that group. Since the Library is restricted, those members see no skills until a rule names it — declare it below or switch a column on. A rename or re-case in the identity provider shows up here.</p>{{end}}
 <form method="post" action="/admin/skills">
 <input type="hidden" name="groupCount" value="{{len .Matrix.Groups}}">
 <input type="hidden" name="revision" value="{{.Matrix.Revision}}">
@@ -386,7 +387,9 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 </tr>
 {{end}}
 </tbody></table>
-<div class="actions"><button class="button inline" type="submit">Save</button></div>
+<div class="actions"><button class="button inline" type="submit">Save</button>
+<label class="sub" for="newGroup">Declare a group by name:</label>
+<input type="text" id="newGroup" name="newGroup" placeholder="a group that has not signed in yet" autocomplete="off"></div>
 </form>
 {{if not .Matrix.Groups}}<p class="note">No group has reached burrow yet. A group's column appears after one of its members signs in, or once a rule names it.</p>{{end}}
 {{end}}

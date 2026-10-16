@@ -11,13 +11,15 @@ package httpapi
 // skill list, and never a member list.
 //
 // Saving declares a rule for every column whose switch is on, so the state has
-// two distinct shapes: a group nobody has switched on has no rule and its
-// members keep the whole catalog (the org-wide default), while a group switched
-// on with nothing checked has a rule that allows nothing. Those are different
-// statements and the store keeps them apart, which is why the switch is on the
-// page at all — without it, saving the matrix would write a rule for every
-// group burrow has ever seen, and a group nobody had configured yet would
-// suddenly see nothing.
+// two distinct shapes: a group switched on with nothing checked has a rule that
+// allows nothing, while a column switched off carries no rule — which, since
+// ADR-0006, means its members see no skills as soon as any rule exists, the
+// fail-closed default that replaced the old "keeps the whole catalog" (the
+// switch still matters: with no rules written anywhere the Library stays
+// entirely open, and switching a group off after declaring an empty allowance
+// returns it to "no rule written", which is not the same statement). Without
+// the switch, saving the matrix would write a rule for every group burrow has
+// ever seen, and a group nobody had configured yet would suddenly see nothing.
 //
 // Unlike a provider row, saving here changes no key's scope: the Library is
 // served by burrow itself, so the filter takes effect on the next request
@@ -35,6 +37,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"gitea.stump.rocks/stump.wtf/burrow/internal/store"
 )
@@ -53,6 +56,11 @@ type skillMatrix struct {
 	// UnnamedGroups lists groups whose rule no member has signed in under yet
 	// — a misspelled group name is otherwise invisible on this page.
 	UntaggedGroups []string
+	// UndeclaredGroups lists groups members have signed in under that no rule
+	// names. While any rule exists these members sit on the fail-closed
+	// default and see no skills (ADR-0006), so the page says so instead of
+	// leaving the drift invisible (stump.wtf/burrow#39).
+	UndeclaredGroups []string
 	// Revision fingerprints the rules this page was rendered from; the form
 	// posts it back so a save can be refused once they have moved on.
 	Revision string
@@ -73,9 +81,16 @@ type skillMatrixRow struct {
 // as it was drawn, so without it a page left open would put back whatever
 // another admin had changed in the meantime — and read a rule declared since as
 // a column "switched off", withdrawing it.
+//
+// skillPackFormNewGroup carries an optional group name typed into the matrix.
+// Under the fail-closed default a group nobody has declared is a group whose
+// members see nothing, so declaring one by name — before any of its members has
+// ever signed in — is how an admin brings a new IdP group into the matrix
+// (stump.wtf/burrow#39).
 const (
 	skillPackFormCount    = "groupCount"
 	skillPackFormRevision = "revision"
+	skillPackFormNewGroup = "newGroup"
 )
 
 // skillPacksStale is what an admin reads when the save is refused.
@@ -113,6 +128,7 @@ func (s *Server) handleConsoleSkillsSave(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var rowSkills []string
+	var columnGroups []string
 	rendered := map[string]bool{}
 	for i := 0; ; i++ {
 		name := form.Get(fmt.Sprintf("skill.%d", i))
@@ -142,6 +158,7 @@ func (s *Server) handleConsoleSkillsSave(w http.ResponseWriter, r *http.Request)
 			s.renderConsoleError(w, http.StatusBadRequest, "a group column arrived without a name — reload the page")
 			return
 		}
+		columnGroups = append(columnGroups, group)
 		if !form.Has(fmt.Sprintf("declare.%d", column)) {
 			if _, wasDeclared := packs[group]; wasDeclared {
 				forget = append(forget, group)
@@ -165,6 +182,21 @@ func (s *Server) handleConsoleSkillsSave(w http.ResponseWriter, r *http.Request)
 			}
 		}
 		declare[group] = allowed
+	}
+	// A name typed into the page declares that group with an empty allowance,
+	// so a new IdP group can be brought under the matrix before any of its
+	// members ever signs in — the fail-closed default would otherwise leave
+	// them on an invisible rule of nothing (stump.wtf/burrow#39). A name the
+	// page already renders as a column is that column's business: its cells
+	// and switch say what was meant, and re-declaring it empty from the text
+	// box would erase the rule on the page.
+	if group := strings.TrimSpace(form.Get(skillPackFormNewGroup)); group != "" && !contains(columnGroups, group) {
+		if hasControlRune(group) {
+			s.renderConsoleError(w, http.StatusBadRequest, "a group name cannot contain control characters")
+			return
+		}
+		declare[group] = nil
+		slog.Info("skills: group declared by name", "actor", adminActor(r), "group", group)
 	}
 	if err := s.store.SaveSkillPacks(r.Context(), revision, declare, forget); err != nil {
 		if errors.Is(err, store.ErrSkillPacksChanged) {
@@ -203,6 +235,7 @@ func (s *Server) skillMatrix(r *http.Request) (*skillMatrix, string) {
 	groups := union(memberGroups, mapKeys(packs))
 
 	var untagged []string
+	var undeclared []string
 	var declared []bool
 	for _, group := range groups {
 		_, isDeclared := packs[group]
@@ -210,13 +243,21 @@ func (s *Server) skillMatrix(r *http.Request) (*skillMatrix, string) {
 		if isDeclared && !contains(memberGroups, group) {
 			untagged = append(untagged, group)
 		}
+		// The other half of the drift picture: a group members sign in under
+		// that no rule names sits on the fail-closed default, so the page
+		// names it instead of leaving its members quietly empty
+		// (stump.wtf/burrow#39, ADR-0006).
+		if !isDeclared && len(packs) > 0 && contains(memberGroups, group) {
+			undeclared = append(undeclared, group)
+		}
 	}
 	matrix := &skillMatrix{
-		Groups:         groups,
-		Declared:       declared,
-		NoRules:        len(packs) == 0,
-		UntaggedGroups: untagged,
-		Revision:       store.SkillPacksRevision(packs),
+		Groups:           groups,
+		Declared:         declared,
+		NoRules:          len(packs) == 0,
+		UntaggedGroups:   untagged,
+		UndeclaredGroups: undeclared,
+		Revision:         store.SkillPacksRevision(packs),
 	}
 	for _, skill := range catalog {
 		row := skillMatrixRow{Name: skill.Name, Title: skill.Title, Cells: make([]bool, len(groups))}
@@ -263,4 +304,12 @@ func contains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// hasControlRune reports whether s carries a control character. Postgres TEXT
+// cannot hold one, and the group is compared exactly against the claim, so a
+// name carrying one could only ever name an audience no member holds — the
+// same check the provider surface makes (SPEC-0004).
+func hasControlRune(s string) bool {
+	return strings.ContainsFunc(s, unicode.IsControl)
 }
