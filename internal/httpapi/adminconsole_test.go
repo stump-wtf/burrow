@@ -326,7 +326,7 @@ func TestConsoleProviderLifecycle(t *testing.T) {
 		t.Fatalf("created groups %v", created.Groups)
 	}
 	audit := consoleAuditOf(t, e)
-	if audit[0].Actor != aliceSub || audit[0].Action != "create" || audit[0].ProviderID != "lpr_console" {
+	if audit[0].Actor != "user:"+aliceSub || audit[0].Action != "create" || audit[0].ProviderID != "lpr_console" {
 		t.Fatalf("create audit %+v", audit[0])
 	}
 

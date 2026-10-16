@@ -214,7 +214,7 @@ func TestAdminProviderCRUDAndAudit(t *testing.T) {
 		t.Fatalf("audit must be newest-first over all three writes, got %v", actions)
 	}
 	for _, actor := range actors {
-		if actor != aliceSub {
+		if actor != "user:"+aliceSub {
 			t.Fatalf("a session write must be audited as the member, got %q", actor)
 		}
 	}
@@ -510,7 +510,7 @@ func TestAdminWriteReachesDesktopListing(t *testing.T) {
 }
 
 // Machine automation authenticates with a bat_ token, is audited by token
-// name, and stops the moment it is revoked.
+// identity, and stops the moment it is revoked.
 func TestAdminAPITokenLifecycle(t *testing.T) {
 	e := newAdminTestEnv(t)
 	signInAs(t, e, "stumpcloud-admins")
@@ -526,8 +526,9 @@ func TestAdminAPITokenLifecycle(t *testing.T) {
 		t.Fatalf("admin tokens must carry the %s prefix, got %q", store.AdminTokenPrefix, raw)
 	}
 
-	// The token writes a row, and the audit names the token, not the human
-	// who minted it.
+	// The token writes a row, and the audit names the token by its own hash
+	// beside the member whose admin rights it borrows, so the row cannot be
+	// mistaken for that member's own.
 	var created any
 	if resp := adminDo(t, e, http.MethodPost, "/api/den/v1/admin/llm-providers",
 		providerBody("lpr_ci", "CI Row", "https://gw.example/v1", "KEY_CI"), &created, raw, ""); resp.StatusCode != http.StatusCreated {
@@ -536,8 +537,11 @@ func TestAdminAPITokenLifecycle(t *testing.T) {
 	var audit any
 	e.getJSON(t, "/api/den/v1/admin/audit", &audit)
 	first := mapOf(t, listOf(t, mapOf(t, audit)["audit"])[0])
-	if first["actor"] != "ci" || first["action"] != "create" {
-		t.Fatalf("audit must name the machine behind the change: %#v", first)
+	hash := nonEmptyString(t, mapOf(t, mapOf(t, minted)["apiToken"]), "hash")
+	actor, _ := first["actor"].(string)
+	if first["action"] != "create" || !strings.HasPrefix(actor, "token:ci#") ||
+		!strings.Contains(actor, hash[:12]) || !strings.HasSuffix(actor, "@user:"+aliceSub) {
+		t.Fatalf("audit must name the machine behind the change, not a bare name: %#v", first)
 	}
 
 	// Listing shows hashes, never the value that was just shown once.

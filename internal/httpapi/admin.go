@@ -6,7 +6,7 @@ package httpapi
 // ignored, and etags are the row's quoted updated_at (SPEC-0004 REQ "Admin
 // surface", "Admin authorization", "Audit").
 //
-// Governing: SPEC-0004, ADR-0004.
+// Governing: SPEC-0004, ADR-0004, ADR-0005.
 
 import (
 	"context"
@@ -33,7 +33,7 @@ const (
 )
 
 const (
-	adminActorKey ctxKey = iota + 1 // audit identity: user id or token name
+	adminActorKey ctxKey = iota + 1 // audit identity: user:<sub> or token:<name>#<hash>@user:<sub>
 	adminUserKey                    // user id for the api_tokens FK lineage
 )
 
@@ -44,7 +44,29 @@ const (
 // session-terminating vocabulary for sessions only, plus the
 // BURROW_ADMIN_GROUPS check. With no groups configured and no tokens minted
 // the surface is closed to everyone.
+//
+// A token's reach is its minter's admin rights as of this request: minting is
+// the one thing a token may not do (ADR-0005).
 func (s *Server) requireAdmin(next func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
+	return s.adminGate(next, false)
+}
+
+// requireAdminSession gates the routes that extend the admin surface itself —
+// minting, listing, and revoking API tokens — to a member's session. A bat_
+// token that arrives here did authenticate, so it is refused 403 rather than
+// the 401 an unknown token earns: it is the wrong kind of credential for the
+// route, not a dead one. This is what bounds a leaked token's blast radius
+// (stump.wtf/burrow#37): it cannot mint a successor that outlives its own
+// revocation.
+func (s *Server) requireAdminSession(next func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
+	return s.adminGate(next, true)
+}
+
+// adminGate is the shared body of both gates: authenticate, then check the
+// admin right against the member record rather than against whatever the
+// credential asserts. sessionOnly adds only the credential-kind rule, because
+// a session that reaches an admin group is already a member's decision.
+func (s *Server) adminGate(next func(http.ResponseWriter, *http.Request), sessionOnly bool) func(http.ResponseWriter, *http.Request) {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := bearerToken(r)
 		if token == "" {
@@ -66,8 +88,30 @@ func (s *Server) requireAdmin(next func(http.ResponseWriter, *http.Request)) fun
 				writeError(w, http.StatusUnauthorized, "invalid_token", "API token lacks the "+ScopeLLMAdmin+" scope")
 				return
 			}
-			ctx := context.WithValue(r.Context(), adminActorKey, tok.Name)
-			ctx = context.WithValue(ctx, adminUserKey, tok.UserID)
+			if sessionOnly {
+				writeError(w, http.StatusForbidden, "session_required",
+					"managing API tokens takes a member's session, not an API token")
+				return
+			}
+			// The minter is re-read on every use: a token carries no admin right
+			// of its own, so demoting the member who minted it ends what the
+			// token can do even while its row survives.
+			minter, err := s.store.GetUser(r.Context(), tok.UserID)
+			if err != nil {
+				if errors.Is(err, store.ErrNotFound) {
+					writeError(w, http.StatusForbidden, "admin_required", "the member who minted this token is gone")
+					return
+				}
+				slog.Error("load minter for admin check", "error", err)
+				writeError(w, http.StatusInternalServerError, "internal", "member store unavailable")
+				return
+			}
+			if !holdsAny(minter.Groups, s.cfg.AdminGroups) {
+				writeError(w, http.StatusForbidden, "admin_required", "the member who minted this token is not in an admin group")
+				return
+			}
+			ctx := context.WithValue(r.Context(), adminActorKey, tokenActor(tok))
+			ctx = context.WithValue(ctx, adminUserKey, minter.ID)
 			next(w, r.WithContext(ctx))
 			return
 		}
@@ -94,7 +138,7 @@ func (s *Server) requireAdmin(next func(http.ResponseWriter, *http.Request)) fun
 			writeError(w, http.StatusForbidden, "admin_required", "not a member of an admin group")
 			return
 		}
-		ctx := context.WithValue(r.Context(), adminActorKey, userID)
+		ctx := context.WithValue(r.Context(), adminActorKey, userActor(userID))
 		ctx = context.WithValue(ctx, adminUserKey, userID)
 		next(w, r.WithContext(ctx))
 	})
@@ -127,6 +171,31 @@ func adminActor(r *http.Request) string {
 	actor, _ := r.Context().Value(adminActorKey).(string)
 	return actor
 }
+
+// The audit actor names the principal behind a change with its kind, so the
+// two kinds can never be confused for one another in one column
+// (ADR-0005): a caller-chosen token name could otherwise read exactly like a
+// member's id. A row written before this format exists keeps its bare value;
+// a value with no kind prefix is one of those, or the boot seed's "seed".
+
+func userActor(userID string) string {
+	return "user:" + userID
+}
+
+// tokenActor is a token plus the member whose admin rights it borrows: the
+// name alone proves nothing, so the row also carries the token's own hash
+// prefix, which no caller chooses.
+func tokenActor(tok store.APIToken) string {
+	short := tok.TokenHash
+	if len(short) > tokenActorHashLen {
+		short = short[:tokenActorHashLen]
+	}
+	return "token:" + tok.Name + "#" + short + "@user:" + tok.UserID
+}
+
+// tokenActorHashLen is how much of the token's SHA-256 hash the actor names:
+// enough to tell two same-named tokens apart, short enough to read.
+const tokenActorHashLen = 12
 
 func adminUser(r *http.Request) string {
 	id, _ := r.Context().Value(adminUserKey).(string)

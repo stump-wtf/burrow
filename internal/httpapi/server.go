@@ -105,9 +105,11 @@ func (s *Server) Routes() http.Handler {
 	api.HandleFunc("PUT /v1/admin/llm-providers/{id}", s.requireAdmin(s.handleAdminUpdateProvider))
 	api.HandleFunc("DELETE /v1/admin/llm-providers/{id}", s.requireAdmin(s.handleAdminDeleteProvider))
 	api.HandleFunc("GET /v1/admin/audit", s.requireAdmin(s.handleAdminAudit))
-	api.HandleFunc("GET /v1/admin/api-tokens", s.requireAdmin(s.handleAdminListTokens))
-	api.HandleFunc("POST /v1/admin/api-tokens", s.requireAdmin(s.handleAdminMintToken))
-	api.HandleFunc("DELETE /v1/admin/api-tokens/{hashOrToken}", s.requireAdmin(s.handleAdminRevokeToken))
+	// Token management is a member's decision: a bat_ bearer is refused here,
+	// so a leaked token cannot mint a successor (ADR-0005, #37).
+	api.HandleFunc("GET /v1/admin/api-tokens", s.requireAdminSession(s.handleAdminListTokens))
+	api.HandleFunc("POST /v1/admin/api-tokens", s.requireAdminSession(s.handleAdminMintToken))
+	api.HandleFunc("DELETE /v1/admin/api-tokens/{hashOrToken}", s.requireAdminSession(s.handleAdminRevokeToken))
 
 	// The console drives these exact handlers in-process (consoleCall), so
 	// there is exactly one management path for provider rows.
