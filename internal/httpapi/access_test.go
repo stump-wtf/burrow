@@ -235,7 +235,7 @@ func TestAccessSignInHoldingNoDeclaredGroupIsLogged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("oidc client against fake issuer: %v", err)
 	}
-	e.srv.Config.Handler = httpapi.New(e.cfg, e.st, skills.NewCatalog(skills.Source{Dir: e.cfg.SkillsDir}), nil, client).Routes()
+	e.srv.Config.Handler = httpapi.New(e.cfg, e.st, skills.NewCatalog(skills.Source{Dir: e.cfg.SkillsDir}), nil, providers.Unconstrained(), client).Routes()
 	if err := e.st.SetSkillPack(context.Background(), "family", []string{"code-review"}); err != nil {
 		t.Fatalf("declare pack: %v", err)
 	}
