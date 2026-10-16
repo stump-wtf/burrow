@@ -160,7 +160,7 @@ func TestMenuForHandsOutItsOwnCopy(t *testing.T) {
 	t.Setenv("GW_KEY", "sk-gateway-secret")
 	row := gatewayRow(gw.URL())
 	seedRow(t, st, row)
-	runtime := providers.NewRuntime(st, time.Minute)
+	runtime := providers.NewRuntime(st, time.Minute, providers.Unconstrained())
 	ctx := context.Background()
 
 	ids, _ := runtime.MenuFor(ctx, row)
@@ -187,7 +187,7 @@ func TestMenuForCallerMayWriteWhileListingsRead(t *testing.T) {
 	t.Setenv("GW_KEY", "sk-gateway-secret")
 	row := gatewayRow(gw.URL())
 	seedRow(t, st, row)
-	runtime := providers.NewRuntime(st, time.Minute)
+	runtime := providers.NewRuntime(st, time.Minute, providers.Unconstrained())
 	ctx := context.Background()
 	if _, err := runtime.RowsFor(ctx, nil); err != nil {
 		t.Fatal(err)
@@ -234,7 +234,7 @@ func TestCancelledCallerDoesNotPoisonTheRow(t *testing.T) {
 	seedRow(t, st, gatewayRow(gw.URL()))
 	// An hour's TTL is a fifteen-minute cooldown: a poisoned row stays
 	// empty for longer than this test lives.
-	runtime := providers.NewRuntime(st, time.Hour)
+	runtime := providers.NewRuntime(st, time.Hour, providers.Unconstrained())
 
 	ctxA, cancelA := context.WithCancel(context.Background())
 	defer cancelA()
@@ -275,7 +275,7 @@ func TestConnectNeverWaitsOnTheGateway(t *testing.T) {
 	defer gw.letGo()
 	t.Setenv("GW_KEY", "sk-gateway-secret")
 	seedRow(t, st, gatewayRow(gw.URL()))
-	runtime := providers.NewRuntime(st, time.Minute)
+	runtime := providers.NewRuntime(st, time.Minute, providers.Unconstrained())
 	ctx := context.Background()
 
 	var (
@@ -319,7 +319,7 @@ func TestHungGatewayCostsARequestOneBoundedWait(t *testing.T) {
 				row.ID = id
 				seedRow(t, st, row)
 			}
-			runtime := providers.NewRuntime(st, time.Minute)
+			runtime := providers.NewRuntime(st, time.Minute, providers.Unconstrained())
 			runtime.SetTimeouts(10*time.Second, 200*time.Millisecond)
 			ctx := context.Background()
 			request := func() {
@@ -365,7 +365,7 @@ func TestCooldownStartsWhenTheFetchReturns(t *testing.T) {
 	t.Setenv("GW_KEY", "sk-gateway-secret")
 	seedRow(t, st, gatewayRow(gw.URL()))
 	// TTL 2s → cooldown 500ms, shorter than the 700ms the call takes to fail.
-	runtime := providers.NewRuntime(st, 2*time.Second)
+	runtime := providers.NewRuntime(st, 2*time.Second, providers.Unconstrained())
 	runtime.SetTimeouts(700*time.Millisecond, 50*time.Millisecond)
 	ctx := context.Background()
 
@@ -394,7 +394,7 @@ func TestExpiredMenuIsServedWhileOneRefreshRuns(t *testing.T) {
 	gw.letGo()
 	t.Setenv("GW_KEY", "sk-gateway-secret")
 	seedRow(t, st, gatewayRow(gw.URL()))
-	runtime := providers.NewRuntime(st, 60*time.Millisecond)
+	runtime := providers.NewRuntime(st, 60*time.Millisecond, providers.Unconstrained())
 	ctx := context.Background()
 
 	rows, err := runtime.RowsFor(ctx, nil)
@@ -453,7 +453,7 @@ func TestMenuThatFillsAfterServingEmptyAdvancesUpdatedAt(t *testing.T) {
 	t.Setenv("GW_KEY", "sk-gateway-secret")
 	seedRow(t, st, gatewayRow(gw.URL()))
 	// TTL 80ms → cooldown 20ms.
-	runtime := providers.NewRuntime(st, 80*time.Millisecond)
+	runtime := providers.NewRuntime(st, 80*time.Millisecond, providers.Unconstrained())
 	ctx := context.Background()
 
 	rows, err := runtime.RowsFor(ctx, nil)
@@ -510,7 +510,7 @@ func TestRepointWhoseFirstAnswerFailsAdvancesOnRecovery(t *testing.T) {
 	t.Setenv("GW_KEY", "sk-gateway-secret")
 	row := gatewayRow(oldGW.URL())
 	seedRow(t, st, row)
-	runtime := providers.NewRuntime(st, 80*time.Millisecond)
+	runtime := providers.NewRuntime(st, 80*time.Millisecond, providers.Unconstrained())
 	ctx := context.Background()
 
 	if _, err := runtime.RowsFor(ctx, nil); err != nil {
@@ -592,7 +592,7 @@ func TestOKWithoutAModelListingIsAFailedFetch(t *testing.T) {
 		gw := newScriptedGateway(t, listing)
 		t.Setenv("GW_KEY", "sk-gateway-secret")
 		seedRow(t, st, gatewayRow(gw.srv.URL))
-		runtime := providers.NewRuntime(st, 60*time.Millisecond)
+		runtime := providers.NewRuntime(st, 60*time.Millisecond, providers.Unconstrained())
 		ctx := context.Background()
 
 		rows, err := runtime.RowsFor(ctx, nil)
@@ -715,7 +715,7 @@ func TestFailedGatewayFetchIsLoggedAtWarn(t *testing.T) {
 				BaseURL: tc.baseURL, APIKeyEnv: "GW_KEY",
 			})
 			// An hour's TTL: one failed call, then the cooldown.
-			runtime := providers.NewRuntime(st, time.Hour)
+			runtime := providers.NewRuntime(st, time.Hour, providers.Unconstrained())
 			ctx := context.Background()
 			for i := 0; i < 3; i++ {
 				if _, err := runtime.RowsFor(ctx, nil); err != nil {

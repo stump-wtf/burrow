@@ -21,6 +21,17 @@ import (
 	"gitea.stump.rocks/stump.wtf/burrow/internal/store/storetest"
 )
 
+// seedIfEmpty and seedFromFile are the seeding entry points under the policy
+// these tests are not about: the rows here are the deployment's own file, and
+// the allowlists (ADR-0005) have their own tests.
+func seedIfEmpty(ctx context.Context, st *store.Store, path string) (int, []string, bool, error) {
+	return providers.SeedIfEmpty(ctx, st, path, providers.Unconstrained())
+}
+
+func seedFromFile(ctx context.Context, st *store.Store, path string) (int, []string, error) {
+	return providers.SeedFromFile(ctx, st, path, providers.Unconstrained())
+}
+
 const seedFile = `{
   "providers": [
     {"id": "lpr_local", "providerId": "litellm", "name": "Local",
@@ -36,7 +47,7 @@ func TestSeedFromFile(t *testing.T) {
 	st := storetest.Open(t)
 	ctx := context.Background()
 
-	seeded, warnings, err := providers.SeedFromFile(ctx, st, writeProvidersFile(t, seedFile))
+	seeded, warnings, err := seedFromFile(ctx, st, writeProvidersFile(t, seedFile))
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -91,7 +102,7 @@ func TestSeedIfEmptySkipsNonEmptyTable(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	seeded, warnings, skipped, err := providers.SeedIfEmpty(ctx, st, writeProvidersFile(t, seedFile))
+	seeded, warnings, skipped, err := seedIfEmpty(ctx, st, writeProvidersFile(t, seedFile))
 	if err != nil {
 		t.Fatalf("seed if empty: %v", err)
 	}
@@ -109,12 +120,12 @@ func TestSeedIfEmptySkipsNonEmptyTable(t *testing.T) {
 func TestSeededRowServesNoModelsWithoutKey(t *testing.T) {
 	st := storetest.Open(t)
 	ctx := context.Background()
-	if _, _, err := providers.SeedFromFile(ctx, st, writeProvidersFile(t, seedFile)); err != nil {
+	if _, _, err := seedFromFile(ctx, st, writeProvidersFile(t, seedFile)); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	t.Setenv("KEY_LOCAL", "")
 	t.Setenv("KEY_OWNER", "")
-	runtime := providers.NewRuntime(st, time.Minute)
+	runtime := providers.NewRuntime(st, time.Minute, providers.Unconstrained())
 	rows, err := runtime.RowsFor(ctx, []string{"family"})
 	if err != nil {
 		t.Fatalf("rows: %v", err)
@@ -138,7 +149,7 @@ func TestSeedIfEmptyDoesNotReseedAfterEveryRowIsDeleted(t *testing.T) {
 	path := writeProvidersFile(t, seedFile)
 
 	// A brand-new database still takes the file.
-	seeded, _, skipped, err := providers.SeedIfEmpty(ctx, st, path)
+	seeded, _, skipped, err := seedIfEmpty(ctx, st, path)
 	if err != nil || skipped || seeded != 2 {
 		t.Fatalf("first boot must seed both rows: seeded=%d skipped=%v err=%v", seeded, skipped, err)
 	}
@@ -148,7 +159,7 @@ func TestSeedIfEmptyDoesNotReseedAfterEveryRowIsDeleted(t *testing.T) {
 		}
 	}
 
-	seeded, _, skipped, err = providers.SeedIfEmpty(ctx, st, path)
+	seeded, _, skipped, err = seedIfEmpty(ctx, st, path)
 	if err != nil {
 		t.Fatalf("restart after the deletes: %v", err)
 	}
@@ -191,7 +202,7 @@ func TestSeedIfEmptySkipsAStoreAnAdminAlreadyWrote(t *testing.T) {
 		t.Fatalf("delete: %v", err)
 	}
 
-	seeded, _, skipped, err := providers.SeedIfEmpty(ctx, st, writeProvidersFile(t, seedFile))
+	seeded, _, skipped, err := seedIfEmpty(ctx, st, writeProvidersFile(t, seedFile))
 	if err != nil {
 		t.Fatalf("seed if empty: %v", err)
 	}
@@ -237,7 +248,7 @@ func TestSeedIfEmptyLandsWholeOrNotAtAll(t *testing.T) {
 	}
 
 	// Boot 1: the seed fails.
-	seeded, _, skipped, err := providers.SeedIfEmpty(ctx, st, path)
+	seeded, _, skipped, err := seedIfEmpty(ctx, st, path)
 	if err == nil {
 		t.Fatalf("a seed with an unstorable row must fail: seeded=%d skipped=%v", seeded, skipped)
 	}
@@ -246,13 +257,13 @@ func TestSeedIfEmptyLandsWholeOrNotAtAll(t *testing.T) {
 	}
 
 	// Boot 2, same file: the failure must repeat, not turn into a skip.
-	seeded, _, skipped, err = providers.SeedIfEmpty(ctx, st, path)
+	seeded, _, skipped, err = seedIfEmpty(ctx, st, path)
 	if rows, _ := count(); skipped || err == nil || rows != 0 {
 		t.Errorf("boot 2: a failed seed must not read as already seeded: seeded=%d skipped=%v err=%v, %d of 3 rows served", seeded, skipped, err, rows)
 	}
 
 	// Boot 3, with the file repaired: the whole seed lands.
-	seeded, _, skipped, err = providers.SeedIfEmpty(ctx, st, writeProvidersFile(t, strings.ReplaceAll(partialSeedFile, `\u0000`, "")))
+	seeded, _, skipped, err = seedIfEmpty(ctx, st, writeProvidersFile(t, strings.ReplaceAll(partialSeedFile, `\u0000`, "")))
 	if rows, audit := count(); err != nil || skipped || seeded != 3 || rows != 3 || audit != 3 {
 		t.Errorf("boot 3: the repaired file must seed whole: seeded=%d skipped=%v err=%v, %d rows and %d audit entries", seeded, skipped, err, rows, audit)
 	}
@@ -281,7 +292,7 @@ func TestSeedIfEmptyConcurrentSeeders(t *testing.T) {
 			defer wg.Done()
 			<-start
 			r := &results[i]
-			r.seeded, _, r.skipped, r.err = providers.SeedIfEmpty(ctx, st, path)
+			r.seeded, _, r.skipped, r.err = seedIfEmpty(ctx, st, path)
 		}()
 	}
 	close(start)
@@ -348,7 +359,7 @@ const driftedFile = `{
 func TestSeedIfEmptyWarnsOncePerDriftedRow(t *testing.T) {
 	st := storetest.Open(t)
 	ctx := context.Background()
-	if _, _, _, err := providers.SeedIfEmpty(ctx, st, writeProvidersFile(t, seedFile)); err != nil {
+	if _, _, _, err := seedIfEmpty(ctx, st, writeProvidersFile(t, seedFile)); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if err := st.CreateProvider(ctx, store.ProviderRow{
@@ -361,7 +372,7 @@ func TestSeedIfEmptyWarnsOncePerDriftedRow(t *testing.T) {
 	t.Setenv("KEY_ROTATED", "sk-rotated-key-value")
 
 	logs := captureLogs(t)
-	_, _, skipped, err := providers.SeedIfEmpty(ctx, st, writeProvidersFile(t, driftedFile))
+	_, _, skipped, err := seedIfEmpty(ctx, st, writeProvidersFile(t, driftedFile))
 	if err != nil || !skipped {
 		t.Fatalf("a seeded store skips the file: skipped=%v err=%v", skipped, err)
 	}
@@ -399,12 +410,12 @@ func TestSeedIfEmptyQuietWhenFileMatchesStore(t *testing.T) {
 	ctx := context.Background()
 	const file = `{"providers": [{"id": "lpr_a", "providerId": "litellm", "name": "A",
 		"baseURL": "https://gw.example/v1", "apiKeyEnv": "KEY_A", "groups": %s, "models": []}]}`
-	if _, _, _, err := providers.SeedIfEmpty(ctx, st, writeProvidersFile(t, fmt.Sprintf(file, `["family", "owner"]`))); err != nil {
+	if _, _, _, err := seedIfEmpty(ctx, st, writeProvidersFile(t, fmt.Sprintf(file, `["family", "owner"]`))); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
 	logs := captureLogs(t)
-	_, _, skipped, err := providers.SeedIfEmpty(ctx, st, writeProvidersFile(t, fmt.Sprintf(file, `["owner", "family"]`)))
+	_, _, skipped, err := seedIfEmpty(ctx, st, writeProvidersFile(t, fmt.Sprintf(file, `["owner", "family"]`)))
 	if err != nil || !skipped {
 		t.Fatalf("a seeded store skips the file: skipped=%v err=%v", skipped, err)
 	}
@@ -418,12 +429,12 @@ func TestSeedIfEmptyQuietWhenFileMatchesStore(t *testing.T) {
 func TestSeedIfEmptyUnreadableFileAfterSeedOnlyWarns(t *testing.T) {
 	st := storetest.Open(t)
 	ctx := context.Background()
-	if _, _, _, err := providers.SeedIfEmpty(ctx, st, writeProvidersFile(t, seedFile)); err != nil {
+	if _, _, _, err := seedIfEmpty(ctx, st, writeProvidersFile(t, seedFile)); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
 	logs := captureLogs(t)
-	seeded, _, skipped, err := providers.SeedIfEmpty(ctx, st, writeProvidersFile(t, `{"providers": [`))
+	seeded, _, skipped, err := seedIfEmpty(ctx, st, writeProvidersFile(t, `{"providers": [`))
 	if err != nil || !skipped || seeded != 0 {
 		t.Fatalf("a broken file must not stop a seeded deployment: seeded=%d skipped=%v err=%v", seeded, skipped, err)
 	}
@@ -446,7 +457,7 @@ func TestSeedRejectsControlCharactersBeforeInserting(t *testing.T) {
      "baseURL": "https://gw.example/v1", "apiKeyEnv": "KEY_OWNER"}
   ]}`
 
-	seeded, _, err := providers.SeedFromFile(ctx, st, writeProvidersFile(t, file))
+	seeded, _, err := seedFromFile(ctx, st, writeProvidersFile(t, file))
 	if err == nil {
 		t.Fatal("a NUL in a name must fail the seed")
 	}

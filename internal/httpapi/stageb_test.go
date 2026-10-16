@@ -84,7 +84,7 @@ func seedProviders(t *testing.T, e *testEnv, rows ...store.ProviderRow) {
 func withProviderRuntime(e *testEnv) *testEnv {
 	e.srv.Config.Handler = httpapi.New(e.cfg, e.st,
 		skills.NewCatalog(skills.Source{Dir: e.cfg.SkillsDir}),
-		providers.NewRuntime(e.st, e.cfg.ModelsTTL), nil).Routes()
+		providers.NewRuntime(e.st, e.cfg.ModelsTTL, providers.Unconstrained()), providers.Unconstrained(), nil).Routes()
 	return e
 }
 

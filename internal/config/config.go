@@ -64,6 +64,21 @@ type Config struct {
 	// group-based administration; API tokens still work, SPEC-0004).
 	AdminGroups []string
 
+	// KeyEnvPrefixes are the prefixes a provider row's apiKeyEnv may start
+	// with (BURROW_PROVIDER_API_KEY_ENV_PREFIXES, comma list, default
+	// LITELLM_, ADR-0005). A row's key is served to members on /connect and
+	// sent to the row's gateway as a bearer, so what a row may name has to
+	// be the deployment's provider keys and nothing else.
+	KeyEnvPrefixes []string
+
+	// GatewayHosts are the hosts a provider row's baseURL may point at
+	// (BURROW_PROVIDER_BASE_URL_HOSTS, comma list, ADR-0005). Unset or blank
+	// means the empty list, which allows no host at all: a row can then
+	// reach no gateway, chosen over a default that would let a written row
+	// send a key anywhere. An entry is a lowercase host, optionally with a
+	// non-default port.
+	GatewayHosts []string
+
 	// APITokenTTL is the lifetime of a minted admin API token
 	// (BURROW_API_TOKEN_TTL, default 90 days).
 	APITokenTTL time.Duration
@@ -116,6 +131,8 @@ func FromEnv() (*Config, error) {
 		ProvidersFile:    os.Getenv("BURROW_PROVIDERS_FILE"),
 		ModelsTTL:        duration("BURROW_MODELS_TTL", 60*time.Second),
 		AdminGroups:      envList("BURROW_ADMIN_GROUPS"),
+		KeyEnvPrefixes:   envListDefault("BURROW_PROVIDER_API_KEY_ENV_PREFIXES", []string{"LITELLM_"}),
+		GatewayHosts:     envList("BURROW_PROVIDER_BASE_URL_HOSTS"),
 		APITokenTTL:      duration("BURROW_API_TOKEN_TTL", 90*24*time.Hour),
 		OIDCGroupsScope:  boolean("BURROW_OIDC_GROUPS_SCOPE", true),
 		GrantTTL:         duration("BURROW_GRANT_TTL", 5*time.Minute),
@@ -190,6 +207,17 @@ func envList(key string) []string {
 		}
 	}
 	return out
+}
+
+// envListDefault is envList for a list that has to name something: unset or
+// blank means def, exactly as a blank duration means its default. Listing a
+// variable as nothing at all cannot mean "allow nothing", because that is
+// what forgetting it looks like too.
+func envListDefault(key string, def []string) []string {
+	if list := envList(key); len(list) > 0 {
+		return list
+	}
+	return def
 }
 
 // envBool reads a switch. Unset or blank means def; a value that is set but
