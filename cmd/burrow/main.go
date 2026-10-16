@@ -122,9 +122,18 @@ func main() {
 
 	// Provider rows live in the store (SPEC-0004); the model menus are
 	// derived from each row's own gateway key at request time (ADR-0004).
-	llmRuntime := providers.NewRuntime(st, cfg.ModelsTTL)
+	// What a row may name is the pair of allowlists, applied here and again
+	// wherever a row is used (ADR-0005); the server builds the same policy
+	// from the same config for the write gate.
+	llmPolicy := providers.NewPolicy(cfg.KeyEnvPrefixes, cfg.GatewayHosts)
+	if len(cfg.GatewayHosts) == 0 {
+		// An unset list allows no host, so the symptom is every row serving
+		// no models. Say it once, at boot, where an operator is looking.
+		slog.Warn("no provider gateway host is configured; provider rows will serve no models until BURROW_PROVIDER_BASE_URL_HOSTS names one (ADR-0005)")
+	}
+	llmRuntime := providers.NewRuntime(st, cfg.ModelsTTL, llmPolicy)
 	if cfg.ProvidersFile != "" {
-		seeded, warnings, skipped, err := providers.SeedIfEmpty(ctx, st, cfg.ProvidersFile)
+		seeded, warnings, skipped, err := providers.SeedIfEmpty(ctx, st, cfg.ProvidersFile, llmPolicy)
 		if err != nil {
 			slog.Error("seed llm providers", "error", err)
 			os.Exit(1)
@@ -169,7 +178,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	srv := newServer(cfg.Addr, httpapi.New(cfg, st, catalog, llmRuntime, client).Routes())
+	srv := newServer(cfg.Addr, httpapi.New(cfg, st, catalog, llmRuntime, llmPolicy, client).Routes())
 	ln, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		slog.Error("listen", "addr", cfg.Addr, "error", err)

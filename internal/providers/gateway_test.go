@@ -125,7 +125,7 @@ func TestMenuDerivedFromGatewayWithCacheHit(t *testing.T) {
 	gw.add("gpt-5", "claude-opus-5")
 	t.Setenv("GW_KEY", "sk-gateway-secret")
 	seedRow(t, st, gatewayRow(gw.URL()))
-	runtime := providers.NewRuntime(st, time.Minute)
+	runtime := providers.NewRuntime(st, time.Minute, providers.Unconstrained())
 
 	for i := 0; i < 3; i++ {
 		rows, err := runtime.RowsFor(context.Background(), nil)
@@ -147,7 +147,7 @@ func TestMenuRefetchedAfterTTL(t *testing.T) {
 	gw.add("gpt-5")
 	t.Setenv("GW_KEY", "sk-gateway-secret")
 	seedRow(t, st, gatewayRow(gw.URL()))
-	runtime := providers.NewRuntime(st, 60*time.Millisecond)
+	runtime := providers.NewRuntime(st, 60*time.Millisecond, providers.Unconstrained())
 
 	if _, err := runtime.RowsFor(context.Background(), nil); err != nil {
 		t.Fatal(err)
@@ -184,7 +184,7 @@ func TestGatewayFailureServesStaleWithCooldown(t *testing.T) {
 	t.Setenv("GW_KEY", "sk-gateway-secret")
 	seedRow(t, st, gatewayRow(gw.URL()))
 	// TTL 80ms → cooldown 20ms.
-	runtime := providers.NewRuntime(st, 80*time.Millisecond)
+	runtime := providers.NewRuntime(st, 80*time.Millisecond, providers.Unconstrained())
 
 	rows, err := runtime.RowsFor(context.Background(), nil)
 	if err != nil {
@@ -243,7 +243,7 @@ func TestMenuChangeBumpsUpdatedAtOnce(t *testing.T) {
 	gw.add("gpt-5")
 	t.Setenv("GW_KEY", "sk-gateway-secret")
 	seedRow(t, st, gatewayRow(gw.URL()))
-	runtime := providers.NewRuntime(st, 60*time.Millisecond)
+	runtime := providers.NewRuntime(st, 60*time.Millisecond, providers.Unconstrained())
 	ctx := context.Background()
 
 	rows, err := runtime.RowsFor(ctx, nil)
@@ -305,7 +305,7 @@ func TestSnapshotPathAlsoDerives(t *testing.T) {
 	gw.add("gpt-5")
 	t.Setenv("GW_KEY", "sk-gateway-secret")
 	seedRow(t, st, gatewayRow(gw.URL()))
-	runtime := providers.NewRuntime(st, 60*time.Millisecond)
+	runtime := providers.NewRuntime(st, 60*time.Millisecond, providers.Unconstrained())
 	ctx := context.Background()
 
 	snap, err := runtime.SnapshotFor(ctx, nil)
@@ -338,7 +338,7 @@ func TestNameOverridesApplyToDerivedModels(t *testing.T) {
 	row := gatewayRow(gw.URL())
 	row.NameOverrides = map[string]string{"gpt-5": "GPT-5 (org flagship)"}
 	seedRow(t, st, row)
-	runtime := providers.NewRuntime(st, time.Minute)
+	runtime := providers.NewRuntime(st, time.Minute, providers.Unconstrained())
 
 	rows, err := runtime.RowsFor(context.Background(), nil)
 	if err != nil {
@@ -369,7 +369,7 @@ func TestMenuKnownSeparatesUnansweredFromEmpty(t *testing.T) {
 	row := gatewayRow(gw.URL())
 	seedRow(t, st, row)
 	// TTL 400ms → cooldown 100ms.
-	runtime := providers.NewRuntime(st, 400*time.Millisecond)
+	runtime := providers.NewRuntime(st, 400*time.Millisecond, providers.Unconstrained())
 	ctx := context.Background()
 	// A menu that is due a gateway call gets it behind the request that
 	// noticed, so ask, let that call land, and read what the next request
@@ -431,7 +431,7 @@ func TestGarbageGatewayResponseServesStale(t *testing.T) {
 	t.Cleanup(bad.Close)
 	t.Setenv("GW_KEY", "sk-gateway-secret")
 	seedRow(t, st, gatewayRow(bad.URL))
-	runtime := providers.NewRuntime(st, 40*time.Millisecond)
+	runtime := providers.NewRuntime(st, 40*time.Millisecond, providers.Unconstrained())
 
 	rows, err := runtime.RowsFor(context.Background(), nil)
 	if err != nil {
@@ -450,7 +450,7 @@ func TestRejectedKeyServesNoModelsButConnects(t *testing.T) {
 	gw.add("gpt-5")
 	t.Setenv("GW_KEY", "sk-not-accepted")
 	seedRow(t, st, gatewayRow(gw.URL()))
-	runtime := providers.NewRuntime(st, time.Minute)
+	runtime := providers.NewRuntime(st, time.Minute, providers.Unconstrained())
 	ctx := context.Background()
 
 	rows, err := runtime.RowsFor(ctx, nil)
@@ -481,7 +481,7 @@ func TestMenuFollowsARepointedRow(t *testing.T) {
 	t.Setenv("GW_KEY", "sk-gateway-secret")
 	row := gatewayRow(oldGW.URL())
 	seedRow(t, st, row)
-	runtime := providers.NewRuntime(st, time.Hour)
+	runtime := providers.NewRuntime(st, time.Hour, providers.Unconstrained())
 
 	rows, err := runtime.RowsFor(context.Background(), nil)
 	if err != nil {
@@ -528,7 +528,7 @@ func TestMenuFollowsARowRepointedByKeyOnly(t *testing.T) {
 	t.Setenv("GW_KEY_NEW", "sk-new-key")
 	row := gatewayRow(gw.URL)
 	seedRow(t, st, row)
-	runtime := providers.NewRuntime(st, time.Hour)
+	runtime := providers.NewRuntime(st, time.Hour, providers.Unconstrained())
 
 	rows, err := runtime.RowsFor(context.Background(), nil)
 	if err != nil {
@@ -583,7 +583,7 @@ func TestMenuFetchAppendsModelsToThePath(t *testing.T) {
 	for _, tc := range cases {
 		seedRow(t, st, store.ProviderRow{ID: tc.id, BaseURL: srv.URL + tc.base, APIKeyEnv: "GW_KEY"})
 	}
-	if _, err := providers.NewRuntime(st, time.Minute).RowsFor(context.Background(), nil); err != nil {
+	if _, err := providers.NewRuntime(st, time.Minute, providers.Unconstrained()).RowsFor(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
 

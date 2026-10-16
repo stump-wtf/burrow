@@ -5,10 +5,12 @@
 // and served stale when the gateway is unreachable.
 //
 // Governing: ADR-0001 (org LLM providers pointing at LiteLLM), ADR-0004
-// (gateway-derived model menus, store-backed rows), SPEC-0004. API keys are
-// never in the store — each row names an environment variable (OpenBao-fed in
-// deployment) whose value is read at request time and only ever served on
-// /connect or sent to the gateway as that row's bearer token.
+// (gateway-derived model menus, store-backed rows), ADR-0005 (what a row may
+// name), SPEC-0004. API keys are never in the store — each row names an
+// environment variable (OpenBao-fed in deployment) whose value is read at
+// request time and only ever served on /connect or sent to the gateway as that
+// row's bearer token, and only for a row whose variable and host are both on
+// the allowlists in policy.go.
 package providers
 
 import (
@@ -148,9 +150,13 @@ func modelGroupRows(path string) ([]string, error) {
 	return ids, nil
 }
 
-// validate checks a file provider against the contract's strict rules.
+// validate checks a file provider against the contract's strict rules. The
+// allowlists are not part of it: the seed file is operator-owned config that
+// the deployment renders, and a row there that names something outside them
+// is a deploy mistake the seed path warns about, not one that stops boot
+// before the config that would allow it has converged (ADR-0005: "Seeding").
 func validate(p Provider) error {
-	if err := validateIdentity(p.ID, p.ProviderID, p.Name, p.BaseURL, p.APIKeyEnv, p.Groups); err != nil {
+	if err := validateIdentity(p.ID, p.ProviderID, p.Name, p.BaseURL, p.APIKeyEnv, p.Groups, Unconstrained()); err != nil {
 		return err
 	}
 	for i, m := range p.Models {
@@ -165,7 +171,7 @@ func validate(p Provider) error {
 }
 
 // validateIdentity checks the fields every row — file or store — carries.
-func validateIdentity(id, providerID, name, baseURL, apiKeyEnv string, groups []string) error {
+func validateIdentity(id, providerID, name, baseURL, apiKeyEnv string, groups []string, pol Policy) error {
 	if !idRE.MatchString(id) {
 		// The id is not echoed: it may be any length and any bytes.
 		return fmt.Errorf("id must be lpr_ followed by 1 to 64 letters, digits, '_' or '-'")
@@ -207,6 +213,13 @@ func validateIdentity(id, providerID, name, baseURL, apiKeyEnv string, groups []
 	if strings.HasPrefix(strings.ToUpper(apiKeyEnv), reservedEnvPrefix) {
 		return fmt.Errorf("apiKeyEnv %q is in burrow's own %s namespace; name the provider key's own variable", apiKeyEnv, reservedEnvPrefix)
 	}
+	// The namespace check only excludes burrow itself: every other variable
+	// in the container was still nameable, which is #36. The allowlists turn
+	// "name a variable" into "name one of the org's provider keys", and are
+	// checked again wherever a row is used (ADR-0005).
+	if err := pol.CheckRow(apiKeyEnv, baseURL); err != nil {
+		return err
+	}
 	return validateGroups(groups)
 }
 
@@ -220,10 +233,10 @@ func hasControl(s string) bool {
 }
 
 // validateStoreRow applies the same validation a file Load performed
-// (SPEC-0004 REQ "Rows in the store"): an invalid write is rejected before
-// it can touch the served set.
-func validateStoreRow(p store.ProviderRow) error {
-	if err := validateIdentity(p.ID, p.ProviderID, p.Name, p.BaseURL, p.APIKeyEnv, p.Groups); err != nil {
+// (SPEC-0004 REQ "Rows in the store") under the policy the caller enforces:
+// an invalid write is rejected before it can touch the served set.
+func validateStoreRow(p store.ProviderRow, pol Policy) error {
+	if err := validateIdentity(p.ID, p.ProviderID, p.Name, p.BaseURL, p.APIKeyEnv, p.Groups, pol); err != nil {
 		return err
 	}
 	for id, name := range p.NameOverrides {
@@ -309,10 +322,43 @@ func lookupKey(env string) (string, bool) {
 	return value, ok
 }
 
+// keyFor is lookupKey under the allowlist: a variable name that fell outside
+// it (or predates it) reads nothing, so the value never becomes a bearer
+// token or a /connect payload whatever the row in the store says (ADR-0005).
+func (r *Runtime) keyFor(p store.ProviderRow) (string, bool) {
+	if err := r.pol.CheckAPIKeyEnv(p.APIKeyEnv); err != nil {
+		r.logRefusal(r.entry(p.ID), p, err)
+		return "", false
+	}
+	return lookupKey(p.APIKeyEnv)
+}
+
+// logRefusal records an allowlist refusal in the log, at most once per TTL
+// per row: a row nobody corrects would otherwise repeat itself on every
+// poll. The name, the host and the reason are logged; never a value.
+func (r *Runtime) logRefusal(e *menuEntry, p store.ProviderRow, reason error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	r.logRefusalLocked(e, p, reason)
+}
+
+// logRefusalLocked is logRefusal for a caller already holding e.mu.
+func (r *Runtime) logRefusalLocked(e *menuEntry, p store.ProviderRow, reason error) {
+	now := time.Now()
+	if !e.refusedAt.IsZero() && now.Before(e.refusedAt.Add(r.ttl)) {
+		return
+	}
+	e.refusedAt = now
+	slog.Warn("providers: provider row is outside the allowlist; it serves nothing until the row or the configuration is corrected",
+		"provider", p.ID, "reason", reason)
+}
+
 // menuEntry is the per-row derived-menu cache (SPEC-0004 REQ "Gateway-derived
 // model menus"). known distinguishes "never fetched" from "fetched empty";
 // nextTryAt is the failure cooldown (~TTL/4) that keeps a downed gateway
-// from being re-queried once per request. mu guards the fields and is never
+// from being re-queried once per request; refusedAt is when the row last
+// logged an allowlist refusal, so one nobody corrects says it about once per
+// TTL rather than once per poll. mu guards the fields and is never
 // held across a gateway call: a hung gateway must not hold up a reader.
 type menuEntry struct {
 	mu        sync.Mutex
@@ -321,6 +367,7 @@ type menuEntry struct {
 	ids       []string
 	fetchedAt time.Time
 	nextTryAt time.Time
+	refusedAt time.Time
 	// served is whether ids has gone out to a reader since the row took
 	// its current source. An unanswered or failing row serves no models,
 	// and that empty menu is as much a served set as a full one.
@@ -339,6 +386,10 @@ type Runtime struct {
 	st   *store.Store
 	ttl  time.Duration
 	http *http.Client
+	// pol is what a row may name: the key variable prefixes and the gateway
+	// hosts, checked wherever a row is used, not only where it is written
+	// (ADR-0005).
+	pol Policy
 	// coldWait is the longest one request waits for rows that have no
 	// answer yet; http's Timeout is what bounds a gateway call.
 	coldWait time.Duration
@@ -360,8 +411,10 @@ const (
 )
 
 // NewRuntime builds the store-backed runtime. modelsTTL bounds how long a
-// derived menu is trusted before the gateway is asked again.
-func NewRuntime(st *store.Store, modelsTTL time.Duration) *Runtime {
+// derived menu is trusted before the gateway is asked again. pol is the
+// policy a row is held to: build it from the config with NewPolicy, or pass
+// Unconstrained() where there is no surface to police.
+func NewRuntime(st *store.Store, modelsTTL time.Duration, pol Policy) *Runtime {
 	if modelsTTL <= 0 {
 		modelsTTL = time.Minute
 	}
@@ -371,6 +424,7 @@ func NewRuntime(st *store.Store, modelsTTL time.Duration) *Runtime {
 		http:     &http.Client{Timeout: fetchTimeout},
 		coldWait: firstFetchWait,
 		cache:    map[string]*menuEntry{},
+		pol:      pol,
 	}
 }
 
@@ -409,7 +463,7 @@ func (r *Runtime) MenuFor(ctx context.Context, p store.ProviderRow) ([]string, b
 	if r == nil {
 		return nil, false
 	}
-	_, hasKey := lookupKey(p.APIKeyEnv)
+	_, hasKey := r.keyFor(p)
 	r.awaitFirst(ctx, []store.ProviderRow{p})
 	ids, _ := r.menuIDs(ctx, p)
 	return append([]string(nil), ids...), hasKey
@@ -482,9 +536,16 @@ func (r *Runtime) ConnectFor(ctx context.Context, id string, memberGroups []stri
 	if !allowed(p.Groups, memberGroups) {
 		return Row{}, nil, false, nil
 	}
+	// Only allowlisted config is handed out: a row whose key variable or host
+	// fell outside the allowlist answers like a row the member cannot see, so
+	// neither its key nor its existence is revealed (ADR-0005).
+	if err := r.pol.CheckRow(p.APIKeyEnv, p.BaseURL); err != nil {
+		r.logRefusal(r.entry(p.ID), p, err)
+		return Row{}, nil, false, nil
+	}
 	row := r.row(ctx, p)
 	var key *string
-	if value, ok := lookupKey(p.APIKeyEnv); ok {
+	if value, ok := r.keyFor(p); ok {
 		key = &value
 	}
 	return row, key, true, nil
@@ -493,7 +554,7 @@ func (r *Runtime) ConnectFor(ctx context.Context, id string, memberGroups []stri
 // row builds the client-facing row for one stored provider from the menu the
 // cache holds now, computing hasApiKey from the live environment.
 func (r *Runtime) row(ctx context.Context, p store.ProviderRow) Row {
-	_, hasKey := lookupKey(p.APIKeyEnv)
+	_, hasKey := r.keyFor(p)
 	ids, bumpedAt := r.menuIDs(ctx, p)
 	if bumpedAt.After(p.UpdatedAt) {
 		p.UpdatedAt = bumpedAt
@@ -604,6 +665,18 @@ func (r *Runtime) awaitFirst(ctx context.Context, rows []store.ProviderRow) {
 // neither a menu nor a recorded failure — the one case worth a request's
 // wait. The caller holds e.mu.
 func (r *Runtime) refresh(ctx context.Context, p store.ProviderRow, e *menuEntry) <-chan struct{} {
+	// The allowlist is re-checked here, and not only at the write, so a row
+	// that predates it or outlived its configuration starts no gateway call
+	// and keeps no menu: its cached ids belong to a source burrow will not
+	// use again (ADR-0005).
+	if err := r.pol.CheckRow(p.APIKeyEnv, p.BaseURL); err != nil {
+		r.logRefusalLocked(e, p, err)
+		source := p.BaseURL + "\x00" + p.APIKeyEnv
+		e.source, e.known, e.ids, e.fetchedAt, e.nextTryAt, e.inFlight = source, false, nil, time.Time{}, time.Time{}, nil
+		e.served = false
+		return nil
+	}
+
 	// A row repointed at another gateway or key starts over: the old ids
 	// are another key's scope, and so is the answer to a call still in
 	// flight. The admin write already advanced updated_at, so the first
@@ -706,6 +779,12 @@ func (r *Runtime) derive(ctx context.Context, p store.ProviderRow, key string, e
 // about the key, and reading it as an empty menu would wipe the last-known
 // one and re-sync every client to it.
 func (r *Runtime) fetch(ctx context.Context, baseURL, key string) ([]string, error) {
+	// Checked again here, at the one place a key leaves the process: burrow
+	// sends a bearer only to a host the deployment named, whatever the row in
+	// the store says (ADR-0005).
+	if err := r.pol.CheckBaseURL(baseURL); err != nil {
+		return nil, err
+	}
 	// Joined as a path element: appended as text, "/models" lands in the
 	// query of a baseURL that carries one.
 	endpoint, err := url.JoinPath(baseURL, "models")
@@ -818,7 +897,8 @@ func allowed(aud, memberGroups []string) bool {
 }
 
 // ValidateStoreRow is the exported write gate for the admin API: the same
-// validation a file Load applied, on one candidate row.
-func ValidateStoreRow(p store.ProviderRow) error {
-	return validateStoreRow(p)
+// validation a file Load applied, on one candidate row, under the policy the
+// server enforces.
+func ValidateStoreRow(p store.ProviderRow, pol Policy) error {
+	return validateStoreRow(p, pol)
 }

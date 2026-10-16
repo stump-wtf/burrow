@@ -11,6 +11,7 @@ import (
 
 	"gitea.stump.rocks/stump.wtf/burrow/internal/httpapi"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/oidc"
+	"gitea.stump.rocks/stump.wtf/burrow/internal/providers"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/skills"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/store"
 )
@@ -177,7 +178,7 @@ func TestAccessGroupsClaimRecordedAtSignIn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("oidc client against fake issuer: %v", err)
 	}
-	e.srv.Config.Handler = httpapi.New(e.cfg, e.st, skills.NewCatalog(skills.Source{Dir: e.cfg.SkillsDir}), nil, client).Routes()
+	e.srv.Config.Handler = httpapi.New(e.cfg, e.st, skills.NewCatalog(skills.Source{Dir: e.cfg.SkillsDir}), nil, providers.Unconstrained(), client).Routes()
 
 	signIn := func(claim any) []string {
 		t.Helper()
@@ -297,7 +298,7 @@ func signStartScope(t *testing.T, requestGroups bool) string {
 	if err != nil {
 		t.Fatalf("oidc client against fake issuer: %v", err)
 	}
-	e.srv.Config.Handler = httpapi.New(e.cfg, e.st, skills.NewCatalog(skills.Source{Dir: e.cfg.SkillsDir}), nil, client).Routes()
+	e.srv.Config.Handler = httpapi.New(e.cfg, e.st, skills.NewCatalog(skills.Source{Dir: e.cfg.SkillsDir}), nil, providers.Unconstrained(), client).Routes()
 	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	start, err := noRedirect.Get(e.srv.URL + "/auth/oidc/start")
 	if err != nil {
