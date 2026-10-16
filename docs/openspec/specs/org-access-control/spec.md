@@ -1,6 +1,7 @@
 ---
 status: draft
 date: 2026-10-11
+amended: 2026-10-16 (ADR-0006, stump.wtf/burrow#39: the Library fails closed on group drift)
 implements: [ADR-0003]
 ---
 
@@ -140,15 +141,52 @@ next request, because burrow serves the Library itself and no key is involved;
 only a change of group membership waits for a sign-in.
 
 A group with no rule and a group whose rule allows nothing SHALL be different
-states. A member holding no group that has a rule SHALL keep the whole catalog;
-a member whose only group has a rule allowing nothing SHALL see no skills.
-Saving SHALL rewrite the groups the page displayed and leave the rest alone.
+states. Once any rule exists, a member holding no group that has a rule SHALL
+see no skills — the fail-closed default, which replaces the original "keep the
+whole catalog" because a group no rule names is exactly what a rename, a lost
+claim, or a not-yet-declared group looks like, and it must not be the widest
+door in the system (ADR-0006). While no rule is written anywhere every member
+SHALL keep the whole catalog, so REQ "Compatibility" stands untouched. A member
+whose only group has a rule allowing nothing SHALL see no skills — the same
+answer as the fail-closed default, for a different reason. Saving SHALL rewrite
+the groups the page displayed and leave the rest alone.
+
+The console SHALL make the fail-closed default visible: every group a member
+has signed in under that no rule names SHALL be named on the matrix page, and
+a sign-in that holds no declared group while any rule exists SHALL be logged.
+A group SHALL be declarable by name from the console, before any of its
+members has signed in.
 
 #### Scenario: switching a group off withdraws its rule
 
 - **GIVEN** group `family` has a rule
 - **WHEN** an admin saves with `family`'s switch off
-- **THEN** `family` has no rule, and a member whose only group is `family` sees the whole catalog again
+- **THEN** `family` has no rule; while another rule exists a member whose only
+  group is `family` sees no skills, and once it was the org's last rule,
+  everyone sees the whole catalog again
+
+#### Scenario: a new group is restricted before its first sign-in
+
+- **GIVEN** some rule exists
+- **WHEN** a member holding only the undeclared `newteam` lists the Library
+- **THEN** they see no skills, `newteam` is named on the matrix page, and an
+  admin can declare `newteam` by name and give it a pack without waiting for
+  any of its members to sign in
+
+#### Scenario: a sign-in with no groups claim fails closed
+
+- **GIVEN** some rule exists
+- **WHEN** a member signs in whose ID token carries no `groups` claim
+- **THEN** they see no skills, and the sign-in is logged
+
+#### Scenario: a rename does not silently re-bind its rule
+
+- **GIVEN** group `ops` has a rule and the identity provider renames it to `Ops`
+- **WHEN** the member recorded under `ops` signs in under `Ops`
+- **THEN** they see no skills, the sign-in is logged, and the console names
+  both `ops` as a rule nobody signs in under and `Ops` as a signed-in group
+  with no rule
+- **AND** the rule follows to `Ops` only once an admin declares that name
 
 ### Requirement: Compatibility
 

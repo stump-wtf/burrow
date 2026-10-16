@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 
+	"gitea.stump.rocks/stump.wtf/burrow/internal/skills"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/store"
 )
 
@@ -254,6 +255,18 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		slog.Error("sign-in user upsert failed", "user", user.ID, "error", err)
 		writeError(w, http.StatusInternalServerError, "server_error", "could not record the user")
 		return
+	}
+	// Sign-in is where group drift lands: the claim that stopped arriving,
+	// the IdP rename or recase. Under the fail-closed default (ADR-0006) such
+	// a member now sees no Library until a rule names one of their groups, so
+	// the event is logged — an admin must be able to see the drift without a
+	// member having to report a quiet Library (stump.wtf/burrow#39).
+	packs, err := s.store.ListSkillPacks(r.Context())
+	if err != nil {
+		slog.Warn("skills: pack lookup failed at sign-in", "user", user.ID, "error", err)
+	} else if len(packs) > 0 && !skills.HoldsDeclared(user.Groups, packs) {
+		slog.Warn("skills: sign-in holds no declared group", "user", user.ID,
+			"groups", len(user.Groups), "declared", len(packs))
 	}
 	grant, err := s.store.MintGrant(r.Context(), user.ID, s.cfg.GrantTTL)
 	if err != nil {
