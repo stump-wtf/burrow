@@ -1,7 +1,7 @@
 ---
 status: draft
 date: 2026-10-10
-implements: [ADR-0004]
+implements: [ADR-0004, ADR-0005]
 amends: [SPEC-0002, SPEC-0003]
 ---
 
@@ -154,31 +154,68 @@ body that carries anything after its one JSON object.
 
 Admin routes SHALL accept either (a) a web/desktop session whose member's
 recorded OIDC groups include any of `BURROW_ADMIN_GROUPS`, or (b) an API
-token bearing the `llm-admin` scope. `BURROW_ADMIN_GROUPS` defaults to empty,
-which closes group-based administration; with no tokens minted and no groups
-configured the admin surface serves `403` to everyone. API tokens SHALL be
-minted, listed, and revoked only by an existing admin at
-`/v1/admin/api-tokens`, SHALL be stored only as SHA-256 hashes, SHALL carry
+token bearing the `llm-admin` scope whose `user_id` still names a member
+holding one of those groups, re-read on every request (ADR-0005). A token
+carries no admin right of its own: a minter outside those groups is answered
+`403 admin_required`, and the token row survives — a demotion denies, it does
+not revoke, so a promotion put back restores the token and revoking stays an
+admin's act.
+`BURROW_ADMIN_GROUPS` defaults to empty, which closes group-based
+administration; with no tokens minted and no groups configured the admin
+surface serves `403` to everyone, and because nobody is then an admin, no
+token reaches it either.
+API tokens SHALL be minted, listed, and revoked only by an existing admin over
+a **session** at `/v1/admin/api-tokens`: an `llm-admin` token sent there is
+answered `403 session_required`, because extending the admin surface is a
+member's decision and a leaked token must not mint a successor that outlives
+its own revocation. Tokens SHALL be stored only as SHA-256 hashes, SHALL carry
 a name, the scope list, and an expiry (`BURROW_API_TOKEN_TTL`, default 90
 days), and every use SHALL update `last_used_at`.
 
 #### Scenario: Machine automation
 
-- **GIVEN** CI holds an `llm-admin` API token
+- **GIVEN** CI holds an `llm-admin` API token whose minter holds an admin group
 - **WHEN** it sends `PUT /v1/admin/llm-providers/{id}` with a fresh
   `If-Match`
-- **THEN** the row is replaced and the audit records the token's name as the
-  actor
+- **THEN** the row is replaced and the audit names the token as the actor
+
+#### Scenario: A token cannot mint a token
+
+- **GIVEN** CI holds an `llm-admin` API token
+- **WHEN** it sends `POST /v1/admin/api-tokens` with that bearer
+- **THEN** the answer is `403 session_required` and no token is issued
+
+#### Scenario: A demoted minter's token is denied, not deleted
+
+- **GIVEN** a token whose minter no longer holds any of
+  `BURROW_ADMIN_GROUPS`
+- **WHEN** the token sends any admin request
+- **THEN** the answer is `403 admin_required`, and the same token works again
+  once the member holds an admin group again
 
 ### Requirement: Audit
 
 Every create, update, and delete SHALL append a row to `llm_provider_audit`
-(actor identity — user id or token name — action, provider id, and the full
-before/after row as JSON, timestamped), written in the same transaction as
-the change. `GET /v1/admin/audit?limit=` SHALL return them newest-first
-(admin-gated) for the console and for incident review. Secret values are
+(actor identity, action, provider id, and the full before/after row as JSON,
+timestamped), written in the same transaction as the change. The actor SHALL
+name its kind (ADR-0005): `user:<sub>` for a session, and
+`token:<name>#<hash>@user:<sub>` for a token, where `<hash>` is the first 12
+hex characters of the token's SHA-256 hash and `<sub>` is the member whose
+admin rights the token borrows — so a caller-chosen token name can never
+produce a row that reads as a member's own. Rows written before that format
+exist in a database keep their bare values, and the boot seed writes `seed`;
+an actor carrying no kind prefix is one of those and nothing newer. Rows
+written after it SHALL equal a member's id or no member's id.
+`GET /v1/admin/audit?limit=` SHALL return them newest-first (admin-gated) for
+the console and for incident review, the actor verbatim. Secret values are
 never stored or logged: rows name environment variables, and audit rows
 repeat only those names.
+
+#### Scenario: A token named after a member
+
+- **GIVEN** a token named exactly some member's id
+- **WHEN** it writes a row
+- **THEN** that audit row's actor begins `token:` and is not that member's id
 
 ### Requirement: Admin console
 

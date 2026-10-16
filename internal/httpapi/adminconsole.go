@@ -75,7 +75,7 @@ func (s *Server) requireAdminPage(next func(http.ResponseWriter, *http.Request))
 		}
 		// The actor rides the context the way requireAdmin wires it, so a
 		// page handler that writes can say who did.
-		next(w, r.WithContext(context.WithValue(r.Context(), adminActorKey, userID)))
+		next(w, r.WithContext(context.WithValue(r.Context(), adminActorKey, userActor(userID))))
 	})
 }
 
