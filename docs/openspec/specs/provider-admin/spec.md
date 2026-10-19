@@ -230,7 +230,7 @@ offer: a provider list (name, baseURL, key presence, audience, model count)
 whose count comes from the derived-menu cache alone: a listing of counts
 SHALL start no gateway call and SHALL NOT advance a row's `updated_at`, and a
 row with no cached menu SHALL read as deriving rather than as a count of
-zero. It also offers a row editor for create/edit/delete (per-model
+zero. It also offers a row editor for
 create/edit/delete (per-model display-name overrides on the derived menu,
 row-level `groups`, and the `apiKeyEnv` NAME with a set/unset light - a key
 VALUE is never rendered, accepted, or stored), a visibility preview (pick a
