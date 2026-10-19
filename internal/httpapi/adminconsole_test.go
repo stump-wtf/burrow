@@ -107,8 +107,9 @@ func consoleBodyOf(t *testing.T, page string) string {
 }
 
 // The console is gated like the API: no session redirects to sign-in, a
-// member outside the admin groups gets a 403 page, and an unset
-// BURROW_ADMIN_GROUPS closes the surface to everyone.
+// member outside an open gate's admin groups gets a 403 page, and an unset
+// BURROW_ADMIN_GROUPS closes the surface to everyone, which the closed
+// surface says on a plain notice page (ADR-0007).
 func TestConsoleGate(t *testing.T) {
 	e := newConsoleEnv(t)
 
@@ -155,13 +156,69 @@ func TestConsoleGate(t *testing.T) {
 	}
 	mustContain(t, page, "admin_required")
 
-	// With no groups configured the surface is closed even to an admin.
+	// With no groups configured the surface is closed even to an admin, and
+	// it says so instead of refusing: ADR-0007.
 	e.cfg.AdminGroups = nil
 	resp, page = e.consoleGet(t, "/admin")
-	if resp.StatusCode != http.StatusForbidden {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("closed surface status %d", resp.StatusCode)
 	}
-	mustContain(t, page, "admin_required")
+	mustContain(t, page, "Admin console not enabled")
+	mustContain(t, page, "BURROW_ADMIN_GROUPS")
+	mustNotContain(t, page, "admin_required")
+
+	// The write API keeps its 403: the page is worded for an operator, the
+	// API's status code is still an assertion about the caller.
+	var denied any
+	if resp := e.doJSON(t, http.MethodGet, "/api/den/v1/admin/llm-providers", nil, &denied, true); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("closed API gate status %d", resp.StatusCode)
+	}
+}
+
+// A closed console is a notice, not a refusal (ADR-0007): a signed-in member
+// gets a 200 page naming the variable, with no links to pages that would
+// answer the same thing, and nothing on any method is written. A browser with
+// no session still goes to sign-in, so the notice is never a page served to
+// the internet.
+func TestConsoleClosedGateAnswersANoticePage(t *testing.T) {
+	e := newConsoleEnv(t)
+	e.cfg.AdminGroups = nil
+
+	for _, path := range []string{"/admin", "/admin/audit", "/admin/skills", "/admin/preview"} {
+		resp, page := e.consoleGet(t, path)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s with the gate closed: status %d", path, resp.StatusCode)
+		}
+		mustContain(t, page, "Admin console not enabled")
+		mustNotContain(t, page, "<nav>")
+		mustNotContain(t, page, ">LLM providers</h1>")
+	}
+
+	// A POST reaches no handler either: the row the form would have written
+	// is not there afterwards.
+	form := url.Values{"id": {"lpr_written"}, "name": {"Written"}, "baseURL": {"https://gw.example.com/v1"}, "apiKeyEnv": {"LLM_CLOSED"}}
+	resp, page := e.consolePost(t, "/admin/providers", form)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(page, "Admin console not enabled") {
+		t.Fatalf("POST with the gate closed: status %d", resp.StatusCode)
+	}
+	if _, err := e.st.GetProvider(context.Background(), "lpr_written"); err == nil {
+		t.Fatal("a closed console wrote a provider row")
+	}
+
+	noRedirect := e.srv.Client()
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	req, err := http.NewRequest(http.MethodGet, e.srv.URL+"/admin", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anon, err := noRedirect.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anon.Body.Close()
+	if anon.StatusCode != http.StatusFound || anon.Header.Get("Location") != "/?mode=sign-in" {
+		t.Fatalf("an anonymous browser with the gate closed must be sent to sign-in, got %d %q", anon.StatusCode, anon.Header.Get("Location"))
+	}
 }
 
 // A web (non-desktop) OIDC sign-in establishes the browser session the
@@ -593,9 +650,12 @@ func TestConsoleEmptyStates(t *testing.T) {
 }
 
 // A model count the console could not establish is not a count of zero. Only
-// a gateway that answered may put a number on the list or on the delete
-// confirm; a refused or unreachable gateway, its retry cooldown, and an
-// unset key variable all read as unknown.
+// a gateway that answered may put a number on the confirm or the preview; a
+// refused or unreachable gateway, its retry cooldown, and an unset key
+// variable all read as unknown there. The list is the one page that asks
+// nothing: it reads the cache, so the only count it can call unknown is one no
+// key could produce, and an unasked menu reads deriving (SPEC-0004 REQ
+// "Admin console").
 func TestConsoleModelCountUnknown(t *testing.T) {
 	gw := newFakeLLMGateway(t, map[string][]string{
 		"sk-two":   {"m1", "m2"},
@@ -638,14 +698,21 @@ func TestConsoleModelCountUnknown(t *testing.T) {
 	mustContain(t, page, unknown)
 	mustNotContain(t, page, "0 derived model")
 
-	// The list and the preview show the same distinction per row.
-	for _, path := range []string{"/admin", "/admin/preview?group=anyone"} {
-		_, page = e.consoleGet(t, path)
-		mustContain(t, page, "<td>2</td>")
-		mustContain(t, page, "<td>0</td>")
-		if got := strings.Count(page, unknown); got != 2 {
-			t.Fatalf("%s: two rows have an unknown count, page says so %d times:\n%s", path, got, consoleBodyOf(t, page))
-		}
+	// The preview asks the runtime, so it names what it found. The list does
+	// not ask at all: a row whose menu nobody has derived reads deriving, and
+	// only a row whose key is unset still reads as plain unknown.
+	_, page = e.consoleGet(t, "/admin/preview?group=anyone")
+	mustContain(t, page, "<td>2</td>")
+	mustContain(t, page, "<td>0</td>")
+	if got := strings.Count(page, unknown); got != 2 {
+		t.Fatalf("preview: two rows have an unknown count, page says so %d times:\n%s", got, consoleBodyOf(t, page))
+	}
+	_, page = e.consoleGet(t, "/admin")
+	mustContain(t, page, "<td>2</td>")
+	mustContain(t, page, "<td>0</td>")
+	mustContain(t, page, "deriving…")
+	if got := strings.Count(page, unknown); got != 1 {
+		t.Fatalf("the list asked nothing, so only the row no key could produce counts unknown: %d times:\n%s", got, consoleBodyOf(t, page))
 	}
 }
 

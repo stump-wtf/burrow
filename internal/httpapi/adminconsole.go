@@ -46,8 +46,12 @@ func adminSessionCookie(r *http.Request) string {
 // requireAdminPage gates the console the way the API is gated: a session
 // whose member holds any of BURROW_ADMIN_GROUPS. With no groups configured
 // the console is closed to everyone (holdsAny on an empty allow list
-// admits nobody). Unauthenticated browsers are sent to sign-in; a signed-in
-// member who is not an admin gets the same 403 the API would answer.
+// admits nobody), and a closed surface says so on a plain 200 page instead
+// of the 403 an open gate answers: nothing is wrong with the visitor, the
+// deployment simply did not open the surface, and the page writes nothing
+// either way (ADR-0007). Unauthenticated browsers are sent to sign-in; with
+// the gate open, a signed-in member who is not an admin gets the same 403
+// the API would answer.
 func (s *Server) requireAdminPage(next func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := adminSessionCookie(r)
@@ -70,6 +74,15 @@ func (s *Server) requireAdminPage(next func(http.ResponseWriter, *http.Request))
 			return
 		}
 		if !holdsAny(user.Groups, s.cfg.AdminGroups) {
+			if len(s.cfg.AdminGroups) == 0 {
+				renderConsole(w, http.StatusOK, consolePage{
+					Title: "Admin console not enabled",
+					Note: "burrow has no admin groups configured (BURROW_ADMIN_GROUPS is unset or empty), " +
+						"so the admin console, and the provider write API with it, is closed. " +
+						"An operator opens it by setting the variable. Nothing on this page changed anything.",
+				})
+				return
+			}
 			s.renderConsoleError(w, http.StatusForbidden, "admin_required: this member is not in an admin group (BURROW_ADMIN_GROUPS)")
 			return
 		}
@@ -122,17 +135,23 @@ type consoleModel struct {
 // menu too, and printing that as "0 models" tells an admin about to delete
 // the row something nobody established.
 type consoleRow struct {
-	ID              string
-	ProviderID      string
-	Name            string
-	BaseURL         string
-	APIKeyEnv       string
-	HasAPIKey       bool
-	Groups          []string
-	GroupsNull      bool
-	Models          []consoleModel
-	ModelCount      int
-	ModelsKnown     bool
+	ID          string
+	ProviderID  string
+	Name        string
+	BaseURL     string
+	APIKeyEnv   string
+	HasAPIKey   bool
+	Groups      []string
+	GroupsNull  bool
+	Models      []consoleModel
+	ModelCount  int
+	ModelsKnown bool
+	// MenuPending is the list's word for "this page did not ask, and burrow
+	// has not answered yet": the row's key is set and its menu is not in the
+	// cache, so the row reads deriving. Only the cache-only list sets it; the
+	// pages that ask the runtime have an answer to report, or a failure to
+	// name (SPEC-0004 REQ "Gateway-derived model menus").
+	MenuPending     bool
 	UpdatedAt       string
 	HiddenOverrides []consoleModel
 	IsNewRow        bool
@@ -170,6 +189,10 @@ type consolePage struct {
 	IsAudit      bool
 	Audit        []auditLine
 	Matrix       *skillMatrix
+	// Note is a page that is only a heading and one paragraph: the closed
+	// console's notice. With it set the page carries no navigation, because
+	// every console route would answer the same notice (ADR-0007).
+	Note string
 }
 
 const consoleCSS = `
@@ -232,10 +255,14 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 <main class="shell" style="width:100%">
 <header class="console-head">
 <div class="wordmark">burrow · admin</div>
-<nav><a href="/admin">Providers</a> &middot; <a href="/admin/skills">Skill packs</a> &middot; <a href="/admin/audit">Audit</a> &middot; <form method="post" action="/admin/sign-out"><button type="submit">Sign out</button></form></nav>
+{{if not .Note}}<nav><a href="/admin">Providers</a> &middot; <a href="/admin/skills">Skill packs</a> &middot; <a href="/admin/audit">Audit</a> &middot; <form method="post" action="/admin/sign-out"><button type="submit">Sign out</button></form></nav>{{end}}
 </header>
 {{if .Flash}}<p class="flash">{{.Flash}}</p>{{end}}
 {{range .Errors}}<p class="error">{{.}}</p>{{end}}
+{{if .Note}}
+<h1 style="font-size:19px;font-weight:600;margin:0 0 16px">{{.Title}}</h1>
+<p class="note">{{.Note}}</p>
+{{end}}
 
 {{if or .IsList .IsPreview}}
 {{if .IsPreview}}
@@ -272,7 +299,7 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 <td>{{.BaseURL}}</td>
 <td>{{if .HasAPIKey}}<span class="badge">{{.APIKeyEnv}} set</span>{{else}}<span class="badge warn">{{.APIKeyEnv}} unset</span>{{end}}</td>
 <td>{{if .GroupsNull}}<span class="badge warn">everyone (org-wide)</span>{{else}}{{range .Groups}}<span class="badge">{{.}}</span> {{end}}{{end}}</td>
-<td>{{if .ModelsKnown}}{{.ModelCount}}{{else}}<span class="sub">model count unknown (gateway unreachable or key unset)</span>{{end}}</td>
+<td>{{if .ModelsKnown}}{{.ModelCount}}{{else if .MenuPending}}<span class="sub" title="burrow keeps each row's menu in its cache and this page never asks a gateway, so a menu nobody has derived yet shows here until a member lists models or the row is opened">deriving…</span>{{else}}<span class="sub">model count unknown (gateway unreachable or key unset)</span>{{end}}</td>
 <td><a class="plain" href="/admin/providers/{{.ID}}">edit</a></td>
 </tr>
 {{end}}
@@ -462,8 +489,37 @@ func sortedOverrideIDs(overrides map[string]string) []string {
 	return ids
 }
 
+// consoleListRowOf builds the list's view of one row: what the store holds,
+// whether the row's key is provisioned, and the menu's size from the cache
+// alone. The list is a reading of what burrow already knows, so it starts no
+// gateway call and writes nothing: opening a page of counts is not a reason
+// to wait on a hung gateway or to advance a row's updated_at (SPEC-0004 REQ
+// "Gateway-derived model menus": a listing is not blocked on a live call).
+// A row whose menu has not been derived yet shows as deriving; the editor
+// and confirm pages, which list the models themselves, still ask the
+// runtime for the menu.
+func (s *Server) consoleListRowOf(p store.ProviderRow) consoleRow {
+	count, known := s.providers.CachedMenuCount(p)
+	keySet := s.providers.KeyProvisioned(p)
+	return consoleRow{
+		ID:          p.ID,
+		ProviderID:  p.ProviderID,
+		Name:        p.Name,
+		BaseURL:     p.BaseURL,
+		APIKeyEnv:   p.APIKeyEnv,
+		HasAPIKey:   keySet,
+		Groups:      p.Groups,
+		GroupsNull:  p.Groups == nil,
+		ModelCount:  count,
+		ModelsKnown: known,
+		MenuPending: !known && keySet,
+		UpdatedAt:   quoteETag(p.UpdatedAt),
+	}
+}
+
 // handleConsoleList answers GET /admin: every row with name, baseURL, key
-// status, audience, and model count.
+// status, audience, and model count. The counts come from the cache, so the
+// page costs a store read however many rows and gateways a deployment has.
 func (s *Server) handleConsoleList(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.store.ListProviders(r.Context())
 	if err != nil {
@@ -472,7 +528,7 @@ func (s *Server) handleConsoleList(w http.ResponseWriter, r *http.Request) {
 	}
 	page := consolePage{Title: "LLM providers", IsList: true}
 	for _, p := range rows {
-		page.Rows = append(page.Rows, s.consoleRowOf(r, p))
+		page.Rows = append(page.Rows, s.consoleListRowOf(p))
 	}
 	switch r.URL.Query().Get("saved") {
 	case "1":

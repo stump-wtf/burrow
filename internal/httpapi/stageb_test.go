@@ -24,6 +24,9 @@ type fakeLLMGateway struct {
 	srv   *httptest.Server
 	mu    sync.Mutex
 	byKey map[string][]string
+	// hits counts the /v1/models calls that arrived, so a test can say a
+	// surface asked the gateway nothing.
+	hits int
 }
 
 func newFakeLLMGateway(t *testing.T, byKey map[string][]string) *fakeLLMGateway {
@@ -36,6 +39,7 @@ func newFakeLLMGateway(t *testing.T, byKey map[string][]string) *fakeLLMGateway 
 			key = h[len("Bearer "):]
 		}
 		g.mu.Lock()
+		g.hits++
 		ids, ok := g.byKey[key]
 		g.mu.Unlock()
 		if !ok {
@@ -55,6 +59,20 @@ func newFakeLLMGateway(t *testing.T, byKey map[string][]string) *fakeLLMGateway 
 }
 
 func (g *fakeLLMGateway) baseURL() string { return g.srv.URL + "/v1" }
+
+// count is how many times the gateway has been asked since the last reset.
+func (g *fakeLLMGateway) count() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.hits
+}
+
+// reset forgets the hits so a test can count only the calls one request made.
+func (g *fakeLLMGateway) reset() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.hits = 0
+}
 
 func (g *fakeLLMGateway) set(key string, ids ...string) {
 	g.mu.Lock()

@@ -490,6 +490,47 @@ func (r *Runtime) MenuKnown(id string) bool {
 	return e.known
 }
 
+// CachedMenuCount is the console list's count for row p: the size of its
+// derived menu, and true when the row's current gateway and key have
+// answered. It reads the cache and nothing else, so it starts no gateway
+// call and writes nothing: no row's updated_at can move because an admin
+// opened a page. It reports 0 and false when the row has no menu of record
+// yet, which the console renders as deriving (SPEC-0004 REQ "Admin console").
+// A row repointed at another gateway or key has no menu of record: the cached
+// ids are another key's scope. MenuFor is the call that asks the gateway;
+// this one only reports what asking already produced. A nil Runtime has
+// cached nothing.
+func (r *Runtime) CachedMenuCount(p store.ProviderRow) (int, bool) {
+	if r == nil {
+		return 0, false
+	}
+	r.mu.Lock()
+	e := r.cache[p.ID]
+	r.mu.Unlock()
+	if e == nil {
+		return 0, false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.known || p.BaseURL+"\x00"+p.APIKeyEnv != e.source {
+		return 0, false
+	}
+	return len(e.ids), true
+}
+
+// KeyProvisioned reports whether row p's key variable is set, under the same
+// allowlist a gateway call would apply. It reads no gateway and never a
+// value, so a page can tell "key unset" from "menu not fetched yet" without
+// asking anything (SPEC-0004: burrow never holds a key). A nil Runtime holds
+// no key.
+func (r *Runtime) KeyProvisioned(p store.ProviderRow) bool {
+	if r == nil {
+		return false
+	}
+	_, ok := r.keyFor(p)
+	return ok
+}
+
 // SnapshotFor is the resource snapshot for one member: id→updatedAt for the
 // rows they may see (SPEC-0003 REQ "Resource snapshot follows visibility").
 // Deriving each row's menu is what advances updated_at when the gateway's

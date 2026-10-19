@@ -41,6 +41,13 @@ mode. Focus: 2px solid `--ink`, offset 2px, via `:focus-visible` only.
   `user-select: all` so a click selects the whole value.
 - **Alt link** — 13px muted, breaks long URLs, darkens on hover.
 - **Wordmark** — "burrow", 14px/600, muted, sits outside the card.
+- **Row (console)**: the `/admin` list row. Cells are 14px on the card with a
+  hairline bottom border (`--border`), the last row borderless, under a
+  header of 12px uppercase muted labels. A row states itself only through
+  `.badge` (muted pill; `.badge.warn` when the value needs the reader's
+  attention, like an unset key or an org-wide audience) and `.sub` muted
+  12.5px secondary text (the row id; a menu the cache has not produced yet,
+  which reads `deriving…` rather than a count of zero). No hue, per rule 1.
 
 ## Rules
 
