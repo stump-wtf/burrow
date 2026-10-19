@@ -43,7 +43,7 @@ func TestValidateStoreRowIDCharset(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			row := validStoreRow()
 			row.ID = id
-			err := providers.ValidateStoreRow(row)
+			err := providers.ValidateStoreRow(row, providers.Unconstrained())
 			if err == nil {
 				t.Fatalf("id %.40q must be rejected", id)
 			}
@@ -57,7 +57,7 @@ func TestValidateStoreRowIDCharset(t *testing.T) {
 	for _, id := range []string{"lpr_a", "lpr_litellm", "LPR_Family-2", "lpr__x", "lpr_" + strings.Repeat("a", 64)} {
 		row := validStoreRow()
 		row.ID = id
-		if err := providers.ValidateStoreRow(row); err != nil {
+		if err := providers.ValidateStoreRow(row, providers.Unconstrained()); err != nil {
 			t.Fatalf("id %q must be accepted: %v", id, err)
 		}
 	}
@@ -80,7 +80,7 @@ func TestValidateStoreRowBaseURLShape(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			row := validStoreRow()
 			row.BaseURL = baseURL
-			err := providers.ValidateStoreRow(row)
+			err := providers.ValidateStoreRow(row, providers.Unconstrained())
 			if err == nil {
 				t.Fatalf("baseURL %q must be rejected", baseURL)
 			}
@@ -96,7 +96,7 @@ func TestValidateStoreRowBaseURLShape(t *testing.T) {
 	} {
 		row := validStoreRow()
 		row.BaseURL = baseURL
-		if err := providers.ValidateStoreRow(row); err != nil {
+		if err := providers.ValidateStoreRow(row, providers.Unconstrained()); err != nil {
 			t.Fatalf("baseURL %q must be accepted: %v", baseURL, err)
 		}
 	}
@@ -123,7 +123,7 @@ func TestValidateStoreRowRejectsControlCharacters(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			row := validStoreRow()
 			mutate(&row)
-			if err := providers.ValidateStoreRow(row); err == nil {
+			if err := providers.ValidateStoreRow(row, providers.Unconstrained()); err == nil {
 				t.Fatalf("must be rejected: %+q", row)
 			}
 		})
@@ -132,7 +132,7 @@ func TestValidateStoreRowRejectsControlCharacters(t *testing.T) {
 	// Ordinary text in any script is not a control character.
 	row := validStoreRow()
 	row.Name, row.Groups = "Stump LiteLLM — família 家族", []string{"openwork-family", "Équipe A"}
-	if err := providers.ValidateStoreRow(row); err != nil {
+	if err := providers.ValidateStoreRow(row, providers.Unconstrained()); err != nil {
 		t.Fatalf("printable non-ASCII must be accepted: %v", err)
 	}
 }
@@ -151,7 +151,7 @@ func TestValidateStoreRowRejectsUntrimmedGroups(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			row := validStoreRow()
 			row.Groups = []string{"friends", group}
-			if err := providers.ValidateStoreRow(row); err == nil || !strings.Contains(err.Error(), "groups") {
+			if err := providers.ValidateStoreRow(row, providers.Unconstrained()); err == nil || !strings.Contains(err.Error(), "groups") {
 				t.Fatalf("group %q must be rejected with a groups error, got %v", group, err)
 			}
 		})
@@ -160,7 +160,7 @@ func TestValidateStoreRowRejectsUntrimmedGroups(t *testing.T) {
 	// Space inside a name is part of the name.
 	row := validStoreRow()
 	row.Groups = []string{"family and friends"}
-	if err := providers.ValidateStoreRow(row); err != nil {
+	if err := providers.ValidateStoreRow(row, providers.Unconstrained()); err != nil {
 		t.Fatalf("an inner space must be accepted: %v", err)
 	}
 

@@ -28,7 +28,7 @@ const SeedActor = "seed"
 // names the rows whose model-level groups were dropped. A skipped file is
 // still read once, only to warn about rows where it has drifted from the
 // store (warnSeedDrift).
-func SeedIfEmpty(ctx context.Context, st *store.Store, path string) (seeded int, warnings []string, skipped bool, err error) {
+func SeedIfEmpty(ctx context.Context, st *store.Store, path string, pol Policy) (seeded int, warnings []string, skipped bool, err error) {
 	done, err := st.ProvidersSeeded(ctx)
 	if err != nil {
 		return 0, nil, false, err
@@ -37,7 +37,7 @@ func SeedIfEmpty(ctx context.Context, st *store.Store, path string) (seeded int,
 		warnSeedDrift(ctx, st, path)
 		return 0, nil, true, nil
 	}
-	seeded, warnings, err = SeedFromFile(ctx, st, path)
+	seeded, warnings, err = SeedFromFile(ctx, st, path, pol)
 	if errors.Is(err, store.ErrAlreadySeeded) {
 		// Another process booting on the same database seeded it between
 		// the check above and the insert: that is a skip, not a failure.
@@ -115,7 +115,14 @@ func sameGroups(a, b []string) bool {
 // insert leaves the store as unseeded as it was and the next boot tries the
 // whole file again. A store that has already been written is refused with
 // store.ErrAlreadySeeded.
-func SeedFromFile(ctx context.Context, st *store.Store, path string) (seeded int, warnings []string, err error) {
+//
+// A row that is malformed stops the boot, as it always did. A row that only
+// trips the allowlist is logged and seeded anyway (ADR-0005: "Seeding"): the
+// file is the deployment's own rendering, so a row outside the lists is a
+// list that has not converged, and refusing to boot would take the whole
+// control plane down over it. Such a row serves nothing until either side is
+// corrected.
+func SeedFromFile(ctx context.Context, st *store.Store, path string, pol Policy) (seeded int, warnings []string, err error) {
 	list, err := Load(path)
 	if err != nil {
 		return 0, nil, err
@@ -145,8 +152,13 @@ func SeedFromFile(ctx context.Context, st *store.Store, path string) (seeded int
 			Groups:        p.Groups,
 			NameOverrides: overrides,
 		}
-		if err := validateStoreRow(row); err != nil {
-			return 0, nil, fmt.Errorf("providers: seed %s: %w", p.ID, err)
+		if err := validateStoreRow(row, pol); err != nil {
+			if errors.Is(err, ErrNotAllowed) {
+				slog.Warn("seeded llm provider row is outside the allowlist; it serves nothing until the row or the configuration is corrected",
+					"provider", p.ID, "file", path, "reason", err)
+			} else {
+				return 0, nil, fmt.Errorf("providers: seed %s: %w", p.ID, err)
+			}
 		}
 		rows = append(rows, row)
 		if dropped[p.ID] {

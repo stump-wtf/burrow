@@ -24,6 +24,7 @@ import (
 
 	"gitea.stump.rocks/stump.wtf/burrow/internal/config"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/httpapi"
+	"gitea.stump.rocks/stump.wtf/burrow/internal/providers"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/skills"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/store"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/store/storetest"
@@ -79,7 +80,7 @@ func newTestEnv(t *testing.T) *testEnv {
 		t.Fatalf("seed session: %v", err)
 	}
 
-	srv := httptest.NewServer(httpapi.New(cfg, st, skills.NewCatalog(skills.Source{Dir: skillsDir}), nil, nil).Routes())
+	srv := httptest.NewServer(httpapi.New(cfg, st, skills.NewCatalog(skills.Source{Dir: skillsDir}), nil, providers.Unconstrained(), nil).Routes())
 	t.Cleanup(srv.Close)
 
 	return &testEnv{

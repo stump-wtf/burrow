@@ -285,6 +285,20 @@ func (s *Server) handleAdminGetProvider(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{"llmProvider": row})
 }
 
+// checkProviderRow is the write gate: the contract's validation under this
+// server's allowlists (ADR-0005). A write refused by an allowlist is the
+// event worth seeing in the log, and the store only audits writes it applied,
+// so the refusal is logged here with who attempted it; the reason goes back to
+// the caller verbatim so they can see which list to change.
+func (s *Server) checkProviderRow(w http.ResponseWriter, r *http.Request, row store.ProviderRow) bool {
+	if err := providers.ValidateStoreRow(row, s.providerPolicy); err != nil {
+		slog.Warn("admin llm provider write refused", "provider", row.ID, "actor", adminActor(r), "error", err)
+		writeError(w, http.StatusBadRequest, "invalid_row", err.Error())
+		return false
+	}
+	return true
+}
+
 func (s *Server) handleAdminCreateProvider(w http.ResponseWriter, r *http.Request) {
 	var body adminProvider
 	if err := decodeStrict(r, &body); err != nil {
@@ -292,8 +306,7 @@ func (s *Server) handleAdminCreateProvider(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	row := body.toStoreRow()
-	if err := providers.ValidateStoreRow(row); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_row", err.Error())
+	if !s.checkProviderRow(w, r, row) {
 		return
 	}
 	if err := s.store.CreateProvider(r.Context(), row, adminActor(r)); err != nil {
@@ -349,8 +362,7 @@ func (s *Server) handleAdminUpdateProvider(w http.ResponseWriter, r *http.Reques
 	}
 	row := body.toStoreRow()
 	row.ID = current.ID
-	if err := providers.ValidateStoreRow(row); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_row", err.Error())
+	if !s.checkProviderRow(w, r, row) {
 		return
 	}
 	// The store re-checks the precondition inside its row lock, so a write

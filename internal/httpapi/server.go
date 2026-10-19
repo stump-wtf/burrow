@@ -24,17 +24,20 @@ type OIDCClient interface {
 
 // Server carries burrow's handlers.
 type Server struct {
-	cfg       *config.Config
-	store     *store.Store
-	skills    *skills.Catalog
-	providers *providers.Runtime // nil serves none
-	oidc      OIDCClient
-	adminAPI  *http.ServeMux // the /api/den/v1/admin subtree, driven in-process by the /admin console
+	cfg            *config.Config
+	store          *store.Store
+	skills         *skills.Catalog
+	providers      *providers.Runtime // nil serves none
+	providerPolicy providers.Policy   // what a write may name (ADR-0005)
+	oidc           OIDCClient
+	adminAPI       *http.ServeMux // the /api/den/v1/admin subtree, driven in-process by the /admin console
 }
 
-// New builds the server.
-func New(cfg *config.Config, st *store.Store, catalog *skills.Catalog, runtime *providers.Runtime, client OIDCClient) *Server {
-	return &Server{cfg: cfg, store: st, skills: catalog, providers: runtime, oidc: client}
+// New builds the server. providerPolicy is the pair of allowlists a provider
+// write is held to, the same policy the runtime applies wherever a row is
+// used; build it from the config with providers.NewPolicy.
+func New(cfg *config.Config, st *store.Store, catalog *skills.Catalog, runtime *providers.Runtime, providerPolicy providers.Policy, client OIDCClient) *Server {
+	return &Server{cfg: cfg, store: st, skills: catalog, providers: runtime, providerPolicy: providerPolicy, oidc: client}
 }
 
 // Routes assembles the full router. Every /v1 route lives under /api/den (the

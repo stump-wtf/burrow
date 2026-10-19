@@ -39,6 +39,14 @@ row's `etag`, so automation cannot clobber a concurrent change; `DELETE`
 honors `If-Match` when it is sent (`412` if the row changed) and deletes by
 id without it. Every write is audited in `llm_provider_audit`.
 
+A row names its key's environment variable (`apiKeyEnv`) and its gateway
+(`baseURL`), so both are held to allowlists: the variable must start with a
+prefix from `BURROW_PROVIDER_API_KEY_ENV_PREFIXES` (default `LITELLM_`), and
+the host must be on `BURROW_PROVIDER_BASE_URL_HOSTS`, which is empty by
+default and therefore allows no host. burrow checks both when a row is written
+and again wherever it uses one, so a row that predates the lists reads no
+variable and dials no host: it stays listed, with no models and no key (ADR-0005).
+
 `BURROW_PROVIDERS_FILE` is a **first-boot seed**: consulted only while the
 store has never been written, after which the store is the source of truth
 and the file is ignored — deleting every row does not bring the file back at

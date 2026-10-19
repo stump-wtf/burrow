@@ -32,7 +32,7 @@ func newConsoleEnv(t *testing.T) *testEnv {
 	}
 	e.srv.Config.Handler = httpapi.New(e.cfg, e.st,
 		skills.NewCatalog(skills.Source{Dir: e.cfg.SkillsDir}),
-		providers.NewRuntime(e.st, time.Minute), nil).Routes()
+		providers.NewRuntime(e.st, time.Minute, providers.Unconstrained()), providers.Unconstrained(), nil).Routes()
 	return e
 }
 
@@ -259,7 +259,7 @@ func newOIDCClientFor(t *testing.T, e *testEnv, issuer *fakeIssuer) *http.Client
 	}
 	e.srv.Config.Handler = httpapi.New(e.cfg, e.st,
 		skills.NewCatalog(skills.Source{Dir: e.cfg.SkillsDir}),
-		providers.NewRuntime(e.st, time.Minute), client).Routes()
+		providers.NewRuntime(e.st, time.Minute, providers.Unconstrained()), providers.Unconstrained(), client).Routes()
 	return newBrowser(t)
 }
 

@@ -65,6 +65,12 @@ func TestFromEnvProviderAdminKnobs(t *testing.T) {
 		if len(cfg.AdminGroups) != 0 {
 			t.Fatalf("no admin groups by default (the surface starts closed): %v", cfg.AdminGroups)
 		}
+		if strings.Join(cfg.KeyEnvPrefixes, ",") != "LITELLM_" {
+			t.Fatalf("the key variable prefix list defaults to the names the deployment renders: %v", cfg.KeyEnvPrefixes)
+		}
+		if len(cfg.GatewayHosts) != 0 {
+			t.Fatalf("no gateway host is configured by default, which allows none (ADR-0005): %v", cfg.GatewayHosts)
+		}
 		if !cfg.OIDCGroupsScope {
 			t.Fatalf("groups must be requested at sign-in by default")
 		}
@@ -75,6 +81,8 @@ func TestFromEnvProviderAdminKnobs(t *testing.T) {
 		t.Setenv("BURROW_MODELS_TTL", "5m")
 		t.Setenv("BURROW_API_TOKEN_TTL", "24h")
 		t.Setenv("BURROW_ADMIN_GROUPS", "openwork-owner, stumpcloud-admins ,")
+		t.Setenv("BURROW_PROVIDER_API_KEY_ENV_PREFIXES", " litellm_ ,OTHER_,")
+		t.Setenv("BURROW_PROVIDER_BASE_URL_HOSTS", " gw.example , gw.internal:8443,")
 		t.Setenv("BURROW_OIDC_GROUPS_SCOPE", "false")
 		cfg, err := config.FromEnv()
 		if err != nil {
@@ -85,6 +93,12 @@ func TestFromEnvProviderAdminKnobs(t *testing.T) {
 		}
 		if strings.Join(cfg.AdminGroups, ",") != "openwork-owner,stumpcloud-admins" {
 			t.Fatalf("admin groups must be trimmed and emptied entries dropped: %v", cfg.AdminGroups)
+		}
+		if strings.Join(cfg.KeyEnvPrefixes, ",") != "litellm_,OTHER_" {
+			t.Fatalf("key variable prefixes: %v", cfg.KeyEnvPrefixes)
+		}
+		if strings.Join(cfg.GatewayHosts, ",") != "gw.example,gw.internal:8443" {
+			t.Fatalf("gateway hosts: %v", cfg.GatewayHosts)
 		}
 		if cfg.OIDCGroupsScope {
 			t.Fatalf("BURROW_OIDC_GROUPS_SCOPE=false must disable the scope request")

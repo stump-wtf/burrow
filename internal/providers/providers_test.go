@@ -110,7 +110,7 @@ func TestRuntimeRowsAndConnect(t *testing.T) {
 	st := storetest.Open(t)
 	url := gatewayBase(seedGateway(t, "gpt-5", "claude-opus-5"))
 	seedRow(t, st, litellmRow(url))
-	runtime := providers.NewRuntime(st, time.Minute)
+	runtime := providers.NewRuntime(st, time.Minute, providers.Unconstrained())
 
 	t.Setenv("LITELLM_API_KEY", "sk-test-value")
 	rows, err := runtime.RowsFor(context.Background(), nil)
@@ -160,7 +160,7 @@ func TestRuntimeWithoutKeyReportsHasAPIKeyFalse(t *testing.T) {
 	st := storetest.Open(t)
 	gw := seedGateway(t, "gpt-5")
 	seedRow(t, st, litellmRow(gatewayBase(gw)))
-	runtime := providers.NewRuntime(st, time.Minute)
+	runtime := providers.NewRuntime(st, time.Minute, providers.Unconstrained())
 
 	// Force the key absent even when the host shell carries one.
 	t.Setenv("LITELLM_API_KEY", "")
@@ -207,7 +207,7 @@ func TestSnapshotCarriesPerRowUpdatedAt(t *testing.T) {
 	other := store.ProviderRow{ID: "lpr_other", ProviderID: "litellm", Name: "Other",
 		BaseURL: url, APIKeyEnv: "LITELLM_API_KEY"}
 	seedRow(t, st, other)
-	runtime := providers.NewRuntime(st, time.Minute)
+	runtime := providers.NewRuntime(st, time.Minute, providers.Unconstrained())
 
 	created, err := st.GetProvider(context.Background(), "lpr_other")
 	if err != nil {

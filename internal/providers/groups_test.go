@@ -44,25 +44,25 @@ func TestValidateStoreRowGroups(t *testing.T) {
 
 	withGroups := base
 	withGroups.Groups = []string{"family"}
-	if err := providers.ValidateStoreRow(withGroups); err != nil {
+	if err := providers.ValidateStoreRow(withGroups, providers.Unconstrained()); err != nil {
 		t.Fatalf("a row-level audience is valid: %v", err)
 	}
 
 	empty := base
 	empty.Groups = []string{}
-	if err := providers.ValidateStoreRow(empty); err == nil || !strings.Contains(err.Error(), "groups") {
+	if err := providers.ValidateStoreRow(empty, providers.Unconstrained()); err == nil || !strings.Contains(err.Error(), "groups") {
 		t.Fatalf("an empty groups list must be rejected, got %v", err)
 	}
 
 	badOverride := base
 	badOverride.NameOverrides = map[string]string{"gpt-5": " "}
-	if err := providers.ValidateStoreRow(badOverride); err == nil {
+	if err := providers.ValidateStoreRow(badOverride, providers.Unconstrained()); err == nil {
 		t.Fatal("an empty display name must be rejected")
 	}
 
 	badID := base
 	badID.ID = "nope"
-	if err := providers.ValidateStoreRow(badID); err == nil {
+	if err := providers.ValidateStoreRow(badID, providers.Unconstrained()); err == nil {
 		t.Fatal("an id without the lpr_ prefix must be rejected")
 	}
 }
@@ -80,7 +80,7 @@ func TestRowVisibilityFollowsRowGroups(t *testing.T) {
 	for _, p := range []store.ProviderRow{open, gated} {
 		seedRow(t, st, p)
 	}
-	runtime := providers.NewRuntime(st, time.Minute)
+	runtime := providers.NewRuntime(st, time.Minute, providers.Unconstrained())
 	ctx := context.Background()
 
 	ids := func(groups []string) string {
