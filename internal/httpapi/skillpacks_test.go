@@ -481,8 +481,11 @@ func TestConsoleSaveKeepsUntouchedColumnsAsRendered(t *testing.T) {
 func TestSkillMatrixPageIsGatedByAdminGroups(t *testing.T) {
 	e := newTestEnv(t) // no BURROW_ADMIN_GROUPS, no groups on alice
 	resp, body := e.consoleGet(t, "/admin/skills")
-	if resp.StatusCode != http.StatusForbidden || !strings.Contains(body, "admin_required") {
-		t.Fatalf("status %d: closed console must answer admin_required", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "Admin console not enabled") {
+		t.Fatalf("status %d: a closed console must answer its notice page", resp.StatusCode)
+	}
+	if strings.Contains(body, "admin_required") {
+		t.Fatal("a closed console is not a refusal of the member (ADR-0007)")
 	}
 }
 

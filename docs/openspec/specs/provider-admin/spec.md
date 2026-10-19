@@ -222,8 +222,15 @@ repeat only those names.
 Burrow SHALL serve a server-rendered console under `/admin` (no JS build
 step; the shared design tokens) for provider rows, gated by the API's own
 admin check: a session whose member holds any of `BURROW_ADMIN_GROUPS`
-(closed to everyone when unset). The console SHALL offer: a provider list
-(name, baseURL, key presence, audience, model count), a row editor for
+(closed to everyone when unset). With the gate closed the console SHALL write
+nothing and SHALL answer a signed-in browser with a plain 200 "not enabled"
+page instead of the 403 an open gate answers: a surface the deployment never
+opened is not a member standing outside a group (ADR-0007). The console SHALL
+offer: a provider list (name, baseURL, key presence, audience, model count)
+whose count comes from the derived-menu cache alone: a listing of counts
+SHALL start no gateway call and SHALL NOT advance a row's `updated_at`, and a
+row with no cached menu SHALL read as deriving rather than as a count of
+zero. It also offers a row editor for create/edit/delete (per-model
 create/edit/delete (per-model display-name overrides on the derived menu,
 row-level `groups`, and the `apiKeyEnv` NAME with a set/unset light - a key
 VALUE is never rendered, accepted, or stored), a visibility preview (pick a
@@ -288,7 +295,21 @@ key rotation stays an OpenBao/LiteLLM operation outside burrow.
 
 - **GIVEN** a deployment with `BURROW_ADMIN_GROUPS` unset
 - **WHEN** any member opens `/admin`
+- **THEN** the console writes nothing and answers a plain "not enabled" page
+  (200) naming the variable an operator sets, not a 403
+
+#### Scenario: Open gate, member outside the group
+
+- **GIVEN** a deployment with `BURROW_ADMIN_GROUPS` set to one group
+- **WHEN** a signed-in member outside it opens `/admin`
 - **THEN** the console answers 403, exactly like the API
+
+#### Scenario: Console list meets a cold menu cache
+
+- **GIVEN** a row whose gateway burrow has not asked yet
+- **WHEN** an admin opens the provider list
+- **THEN** the row reads `deriving…`, the gateway is not called, and the
+  row's `updated_at` does not move
 
 ### Requirement: Visibility unchanged
 

@@ -612,3 +612,68 @@ func TestMenuFetchAppendsModelsToThePath(t *testing.T) {
 		}
 	}
 }
+
+// The console list reads a row's derived-menu count from the cache alone
+// (SPEC-0004 REQ "Admin console"): no menu yet is unknown rather than zero,
+// the read costs no gateway call, and a row repointed at another source has
+// no menu of record.
+func TestCachedMenuCountServesTheConsole(t *testing.T) {
+	st := storetest.Open(t)
+	gw := newFakeGateway(t)
+	gw.add("gpt-5", "claude-opus-5")
+	row := gatewayRow(gw.URL())
+	seedRow(t, st, row)
+	runtime := providers.NewRuntime(st, time.Minute, providers.Unconstrained())
+
+	// Nothing cached yet: unknown, not zero, and the answer cost no call.
+	if n, ok := runtime.CachedMenuCount(row); ok || n != 0 {
+		t.Fatalf("no menu cached yet must report unknown, got %d,%v", n, ok)
+	}
+	if n := gw.count(); n != 0 {
+		t.Fatalf("reading a count must not reach the gateway, got %d calls", n)
+	}
+
+	// A member's listing derives the menu; the console then reads its size
+	// from the cache without asking again.
+	t.Setenv("GW_KEY", "sk-gateway-secret")
+	if _, err := runtime.RowsFor(context.Background(), nil); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if n, ok := runtime.CachedMenuCount(row); !ok || n != 2 {
+		t.Fatalf("cached count must be 2, got %d,%v", n, ok)
+	}
+	if n := gw.count(); n != 1 {
+		t.Fatalf("the count read must stay a cache hit, got %d calls", n)
+	}
+
+	// A row repointed at another gateway has no menu of record: the cached
+	// ids are another key's scope.
+	repointed := row
+	repointed.BaseURL = row.BaseURL + "-elsewhere"
+	if n, ok := runtime.CachedMenuCount(repointed); ok || n != 0 {
+		t.Fatalf("a repointed row has no menu of record, got %d,%v", n, ok)
+	}
+}
+
+// KeyProvisioned is the console's key-presence light: presence, never the
+// value. A set-but-empty variable is not provisioned, and a variable that
+// fell outside the allowlist reads unset whatever it holds (ADR-0005), so the
+// console never points at a variable burrow would not use.
+func TestKeyProvisionedIsPresenceUnderTheAllowlist(t *testing.T) {
+	st := storetest.Open(t)
+	row := gatewayRow("https://gw.example.com")
+	t.Setenv("GW_KEY", "")
+	if providers.NewRuntime(st, time.Minute, providers.Unconstrained()).KeyProvisioned(row) {
+		t.Fatal("a set-but-empty variable is not provisioned")
+	}
+	t.Setenv("GW_KEY", "sk-gateway-secret")
+	if !providers.NewRuntime(st, time.Minute, providers.Unconstrained()).KeyProvisioned(row) {
+		t.Fatal("a set variable is provisioned")
+	}
+	if providers.NewRuntime(st, time.Minute, providers.NewPolicy([]string{"LLM_"}, nil)).KeyProvisioned(row) {
+		t.Fatal("a variable outside the allowlist reads unset, whatever it holds")
+	}
+	if r := (*providers.Runtime)(nil); r.KeyProvisioned(row) {
+		t.Fatal("a nil Runtime holds no key")
+	}
+}
