@@ -27,9 +27,13 @@ jobs:
   # The suite talks to a real Postgres (ADR-0002): burrow's store is Postgres,
   # and a store tested against a fake is a store nobody has tested. The tests
   # fail outright when BURROW_TEST_DATABASE_URL is missing rather than skipping,
-  # so a green run here proves the database was actually reached — the failure
-  # mode cairn documents, where a suite self-skips under a green pipeline and
-  # the gate silently stops gating.
+  # and the Makefile runs them with -count=1, so a green run here proves the
+  # database was actually reached. Both halves are needed: setup-go restores
+  # Go's test cache along with the build cache, the URL below is the same on
+  # every run, and the server behind it is not a cache input, so without
+  # -count=1 an unchanged package is answered `ok (cached)` without opening a
+  # connection. That is the failure mode cairn documents, where a suite stops
+  # running under a green pipeline and the gate silently stops gating.
   #
   # Why a user-defined network rather than a `services:` sidecar or a published
   # port, established empirically on this runner fleet (cairn's probe run 4005,
@@ -45,18 +49,33 @@ jobs:
     env:
       NET: burrow-ci-${{ gitea.run_id }}
       PG: burrow-pg-${{ gitea.run_id }}
+      BURROW_TEST_DATABASE_URL: postgres://burrow:burrow@postgres:5432/burrow?sslmode=disable
     steps:
       # cancel-in-progress kills the job container without running its
       # `if: always()` steps, so every superseding push would otherwise leave a
       # network and a Postgres behind on a shared daemon. Reclaim the ones whose
       # job is gone: no live task container attached, and labelled as burrow's.
+      #
+      # The label is read with `index` because its key is the literal string
+      # `ci.owner`: `{{.Labels.ci.owner}}` parses as a field chain, prints
+      # `<no value>` for every network, and the reaper reaps nothing.
+      #
+      # A network with nothing attached is left alone. It may be an orphan, but
+      # it is also what a healthy run looks like between `network create` and
+      # `network connect` in the start step below, and from here the two are
+      # indistinguishable. Removing it would fail that run's connect. And the
+      # membership is read once: the verdict and the removals work from the
+      # same reading, so a job that joins a moment later is never in the list
+      # of containers to remove.
       - name: Reap sidecars left by cancelled runs
         run: |
           set -euo pipefail
           for net in $(docker network ls --filter 'name=^burrow-ci-' --format '{{.Name}}'); do
-            [ "$(docker network inspect -f '{{.Labels.ci.owner}}' "$net")" = "burrow" ] || continue
+            [ "$(docker network inspect -f '{{index .Labels "ci.owner"}}' "$net")" = "burrow" ] || continue
+            members=$(docker network inspect -f '{{range .Containers}}{{.Name}} {{end}}' "$net") || continue
+            [ -n "$members" ] || continue
             live=""
-            for c in $(docker network inspect -f '{{range .Containers}}{{.Name}} {{end}}' "$net"); do
+            for c in $members; do
               case "${c#/}" in
                 GITEA-ACTIONS-TASK-*)
                   if [ "$(docker inspect -f '{{.State.Running}}' "${c#/}" 2>/dev/null)" = "true" ]; then
@@ -69,7 +88,7 @@ jobs:
               echo "keeping $net: a live job is attached"
               continue
             fi
-            for c in $(docker network inspect -f '{{range .Containers}}{{.Name}} {{end}}' "$net"); do
+            for c in $members; do
               docker rm -f "${c#/}" >/dev/null 2>&1 || true
             done
             echo "reaping $net (no live job attached)"
@@ -86,6 +105,14 @@ jobs:
         run: |
           set -euo pipefail
           docker network create --label ci.owner=burrow --label "ci.run=${{ gitea.run_id }}" "$NET"
+          # Join the job container itself, so `postgres` resolves from here —
+          # and join before Postgres starts, not after. The reaper above, in
+          # another run on the same daemon, reads "containers attached, none
+          # of them a live job" as a cancelled run and removes the lot; a
+          # network holding only Postgres is exactly that. First in here and
+          # last out in the tear-down, the job container is attached for as
+          # long as Postgres is.
+          docker network connect "$NET" "$HOSTNAME"
           # Durability off: this database exists for one run and is thrown away,
           # so there is nothing to protect from a crash. Every test creates a
           # private schema and applies the whole DDL, and on a contended runner
@@ -96,8 +123,6 @@ jobs:
             -e POSTGRES_USER=burrow -e POSTGRES_PASSWORD=burrow -e POSTGRES_DB=burrow \
             postgres:18-alpine \
             -c fsync=off -c synchronous_commit=off -c full_page_writes=off
-          # Join the job container itself, so `postgres` resolves from here.
-          docker network connect "$NET" "$HOSTNAME"
 
       - name: Wait for Postgres
         run: |
@@ -110,15 +135,26 @@ jobs:
           exit 1
 
       - name: make test
-        env:
-          BURROW_TEST_DATABASE_URL: postgres://burrow:burrow@postgres:5432/burrow?sslmode=disable
         run: make test
+
+      # `make check` is fmt, vet, test and race, and AGENTS.md, CLAUDE.md, the
+      # README and the Makefile all call it the CI gate. `make lint` above is
+      # fmt and vet and the step before this one is test; without this step
+      # nothing here runs the race detector and those four documents are
+      # wrong. It is a step in this job rather than a job of its own so it
+      # shares the Postgres already running and reports under `ci / test`, a
+      # context branch protection already requires. -race needs cgo, which the
+      # Makefile turns on, and a C compiler, which this runner image has.
+      - name: make race
+        run: make race
 
       - name: Tear down
         if: always()
         run: |
-          docker network disconnect "$NET" "$HOSTNAME" >/dev/null 2>&1 || true
+          # Postgres first, then this container: the reverse of the start step,
+          # for the reaper's sake (see there).
           docker rm -f "$PG" >/dev/null 2>&1 || true
+          docker network disconnect "$NET" "$HOSTNAME" >/dev/null 2>&1 || true
           # Not hidden: `docker network rm` fails only when something is still
           # attached, and a silent failure is how a network keeps its /16 until
           # a human goes looking.

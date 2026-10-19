@@ -42,12 +42,17 @@ fmt:
 vet:
 	$(GO) vet ./...
 
+# -count=1 keeps Go's test cache out of the gate. The cache keys a result on
+# the test binary, its flags and the environment it read — not on the Postgres
+# server behind BURROW_TEST_DATABASE_URL — so an unchanged package reports
+# `ok (cached)` whether or not a database is there to reach, and CI restores
+# that cache between runs.
 test: test-db
-	$(GO) test ./...
+	$(GO) test -count=1 ./...
 
 # -race needs CGO enabled.
 race: test-db
-	CGO_ENABLED=1 $(GO) test -race ./...
+	CGO_ENABLED=1 $(GO) test -race -count=1 ./...
 
 # The store is Postgres (ADR-0002), so the suites need a real server. Locally
 # this starts a disposable container and points the tests at it; CI exports
@@ -59,38 +64,55 @@ BURROW_TEST_DATABASE_URL ?= postgres://burrow:burrow@127.0.0.1:$(PG_PORT)/burrow
 export BURROW_TEST_DATABASE_URL
 
 # `origin`, not `-n`: the value is always non-empty because of the default
-# above, so the only way to tell "CI set it" from "make defaulted it" is where
-# it came from.
-ifeq ($(origin BURROW_TEST_DATABASE_URL),environment)
+# above, so the only way to tell "someone set it" from "make defaulted it" is
+# where it came from. Anything but this file's own default counts — CI's
+# environment, and `make test BURROW_TEST_DATABASE_URL=…` on the command line,
+# which would otherwise fall through to the docker branch and start a server
+# nobody asked for.
+ifneq ($(origin BURROW_TEST_DATABASE_URL),file)
 test-db:
-	@echo "test-db: using BURROW_TEST_DATABASE_URL from the environment"
+	@echo "test-db: using BURROW_TEST_DATABASE_URL from the $(origin BURROW_TEST_DATABASE_URL)"
 else
+# Readiness is probed over TCP (-h 127.0.0.1), never the unix socket: on a cold
+# start the postgres image runs a temporary init server that listens on the
+# socket only, answers pg_isready there, and then shuts down before the real
+# server starts. A socket probe goes ready, not ready, ready, so a loop that
+# breaks on the first "ready" hands the tests a server that is on its way down.
+# The loop's own exit is the verdict — there is no second probe to land in the
+# restart gap.
 test-db:
 	@if docker inspect -f '{{.State.Running}}' $(PG_NAME) 2>/dev/null | grep -q true; then \
 		echo "test-db: reusing the running $(PG_NAME) container on :$(PG_PORT)"; \
-	elif command -v docker >/dev/null 2>&1; then \
+	elif ! command -v docker >/dev/null 2>&1; then \
+		echo "test-db: no docker here — export BURROW_TEST_DATABASE_URL pointing at a Postgres whose user may CREATE SCHEMA" >&2; \
+		exit 1; \
+	elif docker container inspect $(PG_NAME) >/dev/null 2>&1; then \
+		echo "test-db: starting the stopped $(PG_NAME) container"; \
+		docker start $(PG_NAME) >/dev/null || exit 1; \
+	else \
 		echo "test-db: starting $(PG_NAME) on :$(PG_PORT)"; \
 		docker run -d --name $(PG_NAME) -p $(PG_PORT):5432 \
 			-e POSTGRES_USER=burrow -e POSTGRES_PASSWORD=burrow -e POSTGRES_DB=burrow \
-			$(PG_IMAGE) >/dev/null; \
-		for _ in $$(seq 1 60); do \
-			docker exec $(PG_NAME) pg_isready -q -U burrow >/dev/null 2>&1 && break; \
-			sleep 1; \
-		done; \
-		docker exec $(PG_NAME) pg_isready -q -U burrow; \
-	else \
-		echo "test-db: no docker here — export BURROW_TEST_DATABASE_URL pointing at a Postgres whose user may CREATE SCHEMA" >&2; \
-		exit 1; \
-	fi
+			$(PG_IMAGE) >/dev/null || exit 1; \
+	fi; \
+	for _ in $$(seq 1 60); do \
+		docker exec $(PG_NAME) pg_isready -q -h 127.0.0.1 -U burrow >/dev/null 2>&1 && exit 0; \
+		sleep 1; \
+	done; \
+	echo "test-db: $(PG_NAME) did not accept TCP connections within 60s — see: docker logs $(PG_NAME)" >&2; \
+	exit 1
 endif
 
 # Stop and remove the disposable test server.
 db-down:
 	@docker rm -f $(PG_NAME) >/dev/null 2>&1 && echo "test-db: removed $(PG_NAME)" || true
 
-# Apply formatting in place. Uses gofumpt if installed, falls back to gofmt.
+# Apply formatting in place: the same tool over the same files as the `fmt`
+# gate, so `make tidy` produces exactly the tree CI calls clean. Not gofumpt,
+# which rewrites files gofmt accepts, and not `.`, which walks into every other
+# worktree parked under .claude/worktrees/ and reformats their files too.
 tidy:
-	@command -v gofumpt >/dev/null 2>&1 && gofumpt -w . || gofmt -w .
+	@gofmt -w $$(git ls-files '*.go' | grep -v '^vendor/')
 	$(GO) mod tidy
 
 # Build and run burrow against its default address.
