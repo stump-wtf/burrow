@@ -295,7 +295,7 @@ func TestMCPAuthFailuresCarryRemintCodes(t *testing.T) {
 
 	// An expired token has its own code: the client remints on it, and
 	// folding it into invalid_mcp_token would hide which of the two happened.
-	expired, _, err := e.st.MintMCPToken(context.Background(), aliceSub, e.cfg.OrgID(), -time.Hour)
+	expired, _, err := e.st.MintMCPToken(context.Background(), aliceSub, e.cfg.OrgID(), "", -time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}

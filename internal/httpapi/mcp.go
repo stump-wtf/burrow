@@ -26,13 +26,15 @@ const mcpProtocolVersion = "2025-06-18"
 const skillIndexURI = "skill://index.json"
 
 // handleMCPToken answers POST /v1/mcp/token: mint an org-scoped MCP token.
-// resource is the origin's /mcp, so <resource>/agent ends in /mcp/agent.
+// resource is the origin's /mcp, so <resource>/agent ends in /mcp/agent. The
+// token is keyed to the calling session's family: signing that family out
+// ends the token early (SPEC-0001 REQ "Session revocation").
 func (s *Server) handleMCPToken(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Scopes []string `json:"scopes"`
 	}
 	_ = decodeBody(r, &body)
-	token, expiresAt, err := s.store.MintMCPToken(r.Context(), userID(r), s.cfg.OrgID(), s.cfg.MCPTokenTTL)
+	token, expiresAt, err := s.store.MintMCPToken(r.Context(), userID(r), s.cfg.OrgID(), bearerToken(r), s.cfg.MCPTokenTTL)
 	if err != nil {
 		slog.Error("mcp: token mint failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "server_error", "could not mint an MCP token")

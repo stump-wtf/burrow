@@ -371,7 +371,8 @@ func (s *Server) handleMintHandoff(w http.ResponseWriter, r *http.Request) {
 // Authentication §2). No Authorization header is sent. A grant from a fresh
 // OIDC sign-in buys a full BURROW_SESSION_TTL; a grant minted by a session
 // buys one that ends no later than that session (SPEC-0001 REQ "Session
-// lifetime").
+// lifetime"), and that is keyed to that session, so signing the family out
+// ends it (SPEC-0001 REQ "Session revocation").
 func (s *Server) handleExchange(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Grant string `json:"grant"`
@@ -388,7 +389,7 @@ func (s *Server) handleExchange(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "missing grant")
 		return
 	}
-	uid, notAfter, err := s.store.ConsumeGrant(r.Context(), body.Grant)
+	uid, lineage, err := s.store.ConsumeGrant(r.Context(), body.Grant)
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrGrantInvalid):
@@ -409,7 +410,7 @@ func (s *Server) handleExchange(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "server_error", "grant pointed at a missing user")
 		return
 	}
-	token, err := s.store.CreateSessionCapped(r.Context(), user.ID, s.cfg.SessionTTL, notAfter)
+	token, err := s.store.CreateSessionFrom(r.Context(), user.ID, s.cfg.SessionTTL, lineage)
 	if err != nil {
 		slog.Error("grant exchange session create failed", "user", user.ID, "error", err)
 		writeError(w, http.StatusInternalServerError, "server_error", "could not create a session")

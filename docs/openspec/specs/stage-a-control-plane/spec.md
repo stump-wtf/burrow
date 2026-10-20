@@ -45,7 +45,9 @@ ADR-0002). The API SHALL answer
 401 with exactly `unauthorized` (no header), `invalid_session` (unknown
 token), or `session_expired` (expired token) — all three are in the client's
 sign-out set, and no other 401 code may leak into these paths.
-`POST <api base>/api/auth/sign-out` SHALL revoke the session.
+`POST <api base>/api/auth/sign-out` SHALL revoke the session — that session,
+every session a handoff derived from it, and every MCP token any of them
+minted (see "Session revocation").
 
 ### Requirement: Session lifetime
 
@@ -59,12 +61,36 @@ the issuer again, which is also when burrow re-reads their groups. Exchange of
 a grant whose minting session has already expired SHALL fail with
 `invalid_grant`.
 
+### Requirement: Session revocation
+
+A session SHALL be keyed to the session that minted the grant it was bought
+with, and an MCP token to the session that minted it, `ON DELETE CASCADE`, so
+revocation needs no bookkeeping beyond one DELETE: signing a session out ends
+that session, every session derived from it through the pre-provisioning
+mint, and every MCP token any of them minted (ADR-0008). Revocation SHALL be
+downward only — signing out a derived session SHALL NOT end the sessions
+above it. An unexchanged handoff grant SHALL die with its minting session.
+A database upgraded to these columns SHALL keep working with familyless rows
+until the member signs in again.
+
+`POST /v1/admin/members/{id}/revoke` SHALL end everything a member holds —
+every session of theirs with its families and minted tokens, their
+unexchanged grants, their MCP tokens and their API tokens — and clear their
+stored group snapshot, so access is not served from groups the issuer no
+longer asserts (SPEC-0003 REQ "Groups claim"). The member row SHALL survive:
+this is revocation, not deletion. The route SHALL accept a session only — a
+`bat_` bearer is the wrong credential kind and SHALL be answered `403
+session_required`, the rule burrow#37 set for surface-extending actions
+(ADR-0005) — and an unknown member id SHALL be 404, not a success that
+revoked nothing.
+
 ### Requirement: Pre-provisioning mint
 
 `POST /v1/auth/desktop-handoff {desktopScheme:"openwork"}` SHALL require an
 authenticated session and mint a grant for the calling member. An
 unauthenticated mint would be an auth bypass, so it SHALL 401. The grant SHALL
-record the calling session's expiry (see "Session lifetime").
+record the calling session's expiry (see "Session lifetime") and the calling
+session itself (see "Session revocation").
 
 ### Requirement: Single-org model
 
@@ -119,7 +145,9 @@ the client enforces (kebab-case names ≤64, `type: skill-md`, description
 1..1024, `url: skill://…`, `capability: skill:<name>` or
 `plugin:<pluginId>:<configObjectId>`). Missing, unknown, or expired MCP
 tokens SHALL fail 401 carrying `missing_mcp_token` / `invalid_mcp_token` /
-`expired_mcp_token` — codes the client remints on.
+`expired_mcp_token` — codes the client remints on. A token minted by a
+session SHALL die with that session's family (see "Session revocation"), and
+the refusal it then earns is `invalid_mcp_token`.
 
 ### Requirement: Secrets
 

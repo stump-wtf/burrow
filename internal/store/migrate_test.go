@@ -386,9 +386,81 @@ func TestLegacyGrantsTableGainsItsSessionExpiry(t *testing.T) {
 			t.Fatalf("boot %d: a handoff grant needs the column: %v", boot, err)
 		}
 		if boot == 1 {
-			if _, notAfter, err := st.ConsumeGrant(ctx, inFlight); err != nil || !notAfter.IsZero() {
-				t.Fatalf("the in-flight grant must still exchange, uncapped: notAfter=%v err=%v", notAfter, err)
+			if _, lineage, err := st.ConsumeGrant(ctx, inFlight); err != nil || !lineage.NotAfter.IsZero() || lineage.Parent != "" {
+				t.Fatalf("the in-flight grant must still exchange, uncapped and familyless: lineage=%+v err=%v", lineage, err)
 			}
+		}
+	}
+}
+
+// The family columns are guarded changes too: a database from before them
+// boots, keeps exchanging its in-flight grants (familyless — the migration
+// cannot know who minted them), and every family minted after the boot
+// cascades like on a fresh database.
+func TestLegacyDatabasesGainTheirFamilyColumns(t *testing.T) {
+	dsn := storetest.DSN(t)
+	db := rawDB(t, dsn)
+	ctx := context.Background()
+
+	first, err := store.Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("first boot: %v", err)
+	}
+	if err := first.UpsertUser(ctx, store.User{ID: "u1", Email: "u1@example.com"}); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	root, err := first.CreateSession(ctx, "u1", time.Hour)
+	if err != nil {
+		t.Fatalf("create the pre-upgrade session: %v", err)
+	}
+	inFlight, err := first.MintHandoffGrant(ctx, root, time.Minute)
+	if err != nil {
+		t.Fatalf("mint the in-flight grant: %v", err)
+	}
+	first.Close()
+
+	// Back to the tables as the build before the family columns left them.
+	for _, ddl := range []string{
+		`ALTER TABLE mcp_tokens DROP COLUMN IF EXISTS session_token_hash`,
+		`ALTER TABLE grants DROP COLUMN IF EXISTS parent_session_hash`,
+		`ALTER TABLE sessions DROP COLUMN IF EXISTS parent_session_hash`,
+	} {
+		if _, err := db.Exec(ddl); err != nil {
+			t.Fatalf("drop a family column: %v", err)
+		}
+	}
+
+	for boot := 1; boot <= 2; boot++ {
+		st, err := store.Open(ctx, dsn)
+		if err != nil {
+			t.Fatalf("boot %d on the pre-family schema: %v", boot, err)
+		}
+		t.Cleanup(func() { st.Close() })
+
+		if boot == 1 {
+			if _, _, err := st.ConsumeGrant(ctx, inFlight); err != nil {
+				t.Fatalf("an in-flight pre-upgrade grant must still exchange: %v", err)
+			}
+		}
+
+		// Families minted after the boot cascade: sign-out reaches them.
+		parent, err := st.CreateSession(ctx, "u1", time.Hour)
+		if err != nil {
+			t.Fatalf("boot %d: create session: %v", boot, err)
+		}
+		child, _ := handoff(t, st, parent, time.Hour)
+		mcp, _, err := st.MintMCPToken(ctx, "u1", "org_burrow", child, time.Hour)
+		if err != nil {
+			t.Fatalf("boot %d: mint mcp token: %v", boot, err)
+		}
+		if err := st.DeleteSession(ctx, parent); err != nil {
+			t.Fatalf("boot %d: sign out: %v", boot, err)
+		}
+		if _, err := st.LookupSession(ctx, child); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("boot %d: a post-upgrade family must cascade, session lookup got %v", boot, err)
+		}
+		if _, _, err := st.LookupMCPToken(ctx, mcp); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("boot %d: a post-upgrade token must cascade, token lookup got %v", boot, err)
 		}
 	}
 }

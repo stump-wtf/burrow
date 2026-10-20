@@ -441,6 +441,50 @@ func (s *Server) handleAdminDeleteProvider(w http.ResponseWriter, r *http.Reques
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleAdminRevokeMember answers POST /v1/admin/members/{id}/revoke: the
+// operator's way to end a member's access without raw SQL — every session of
+// theirs (with each one's handoff-derived sessions and minted MCP tokens, via
+// the schema's cascade), any grant not yet exchanged, every MCP token, and
+// every machine API token minted in their name, plus their stored group
+// snapshot so nothing keeps being served from groups the issuer no longer
+// asserts (SPEC-0001 REQ "Session revocation", ADR-0008).
+//
+// It sits behind requireAdminSession, not requireAdmin: a bat_ token carries
+// the provider-admin scope, and member revocation is not provider work. The
+// same session-only rule that bounds a leaked token's reach (burrow#37,
+// ADR-0005) is what keeps a stolen automation token from ending everyone's
+// sessions. The member must sign in as an admin to pull the trigger.
+func (s *Server) handleAdminRevokeMember(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	rev, err := s.store.RevokeMember(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "no such member")
+		return
+	}
+	if err != nil {
+		s.adminStoreError(w, "revoke member", err)
+		return
+	}
+	// The actor and the target are logged together: this is the one admin
+	// action with no provider-audit row, and "who ended whose access" is the
+	// first question afterwards.
+	slog.Info("admin: member revoked",
+		"actor", adminActor(r), "member", id,
+		"sessions", rev.Sessions, "grants", rev.Grants,
+		"mcp_tokens", rev.MCPTokens, "api_tokens", rev.APITokens,
+		"groups_cleared", rev.GroupsCleared)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"revoked": map[string]any{
+			"member":        id,
+			"sessions":      rev.Sessions,
+			"grants":        rev.Grants,
+			"mcpTokens":     rev.MCPTokens,
+			"apiTokens":     rev.APITokens,
+			"groupsCleared": rev.GroupsCleared,
+		},
+	})
+}
+
 // toStoreRow maps a wire row onto a store row. The path id is applied by
 // the caller; timestamps belong to the store.
 func (b adminProvider) toStoreRow() store.ProviderRow {
