@@ -32,7 +32,7 @@ func TestPurgeExpiredRemovesOnlyExpiredRows(t *testing.T) {
 		if err = st.SaveOIDCState(ctx, fmt.Sprintf("expired-%d", i), "verifier", false, -time.Minute); err != nil {
 			t.Fatalf("seed expired state: %v", err)
 		}
-		if deadMCP, _, err = st.MintMCPToken(ctx, user.ID, "org_burrow", -time.Minute); err != nil {
+		if deadMCP, _, err = st.MintMCPToken(ctx, user.ID, "org_burrow", "", -time.Minute); err != nil {
 			t.Fatalf("seed expired mcp token: %v", err)
 		}
 	}
@@ -48,7 +48,7 @@ func TestPurgeExpiredRemovesOnlyExpiredRows(t *testing.T) {
 	if err := st.SaveOIDCState(ctx, "live", "verifier-live", true, time.Hour); err != nil {
 		t.Fatalf("seed live state: %v", err)
 	}
-	mcp, _, err := st.MintMCPToken(ctx, user.ID, "org_burrow", time.Hour)
+	mcp, _, err := st.MintMCPToken(ctx, user.ID, "org_burrow", "", time.Hour)
 	if err != nil {
 		t.Fatalf("seed live mcp token: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestExpiredRowsAreRefusedBeforeAnyPurge(t *testing.T) {
 		t.Fatalf("an unswept expired session must be ErrExpired, got %v", err)
 	}
 
-	mcp, _, err := st.MintMCPToken(ctx, user.ID, "org_burrow", -time.Minute)
+	mcp, _, err := st.MintMCPToken(ctx, user.ID, "org_burrow", "", -time.Minute)
 	if err != nil {
 		t.Fatalf("seed mcp token: %v", err)
 	}

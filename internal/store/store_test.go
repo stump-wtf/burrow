@@ -112,15 +112,15 @@ func handoff(t *testing.T, st *store.Store, session string, ttl time.Duration) (
 	if err != nil {
 		t.Fatalf("mint handoff grant: %v", err)
 	}
-	userID, notAfter, err := st.ConsumeGrant(ctx, grant)
+	userID, lineage, err := st.ConsumeGrant(ctx, grant)
 	if err != nil {
 		t.Fatalf("consume handoff grant: %v", err)
 	}
-	next, err := st.CreateSessionCapped(ctx, userID, ttl, notAfter)
+	next, err := st.CreateSessionFrom(ctx, userID, ttl, lineage)
 	if err != nil {
 		t.Fatalf("create capped session: %v", err)
 	}
-	return next, notAfter
+	return next, lineage.NotAfter
 }
 
 // Governing: SPEC-0001 REQ "Session lifetime". A handoff grant carries the
@@ -185,16 +185,16 @@ func TestSignInGrantBuysAFullSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mint grant: %v", err)
 	}
-	userID, notAfter, err := st.ConsumeGrant(ctx, grant)
+	userID, lineage, err := st.ConsumeGrant(ctx, grant)
 	if err != nil || userID != user.ID {
 		t.Fatalf("consume grant: %v %q", err, userID)
 	}
-	if !notAfter.IsZero() {
-		t.Fatalf("a sign-in grant must carry no cap, got %s", notAfter)
+	if !lineage.NotAfter.IsZero() || lineage.Parent != "" {
+		t.Fatalf("a sign-in grant must carry no cap and no family, got %+v", lineage)
 	}
 
 	before := time.Now()
-	session, err := st.CreateSessionCapped(ctx, userID, time.Hour, notAfter)
+	session, err := st.CreateSessionFrom(ctx, userID, time.Hour, lineage)
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestMCPTokenRoundTrip(t *testing.T) {
 	user := seedUser(t, st)
 	ctx := context.Background()
 
-	token, expiresAt, err := st.MintMCPToken(ctx, user.ID, "org_burrow", time.Hour)
+	token, expiresAt, err := st.MintMCPToken(ctx, user.ID, "org_burrow", "", time.Hour)
 	if err != nil {
 		t.Fatalf("mint mcp token: %v", err)
 	}

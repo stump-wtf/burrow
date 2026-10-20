@@ -113,6 +113,10 @@ func (s *Server) Routes() http.Handler {
 	api.HandleFunc("GET /v1/admin/api-tokens", s.requireAdminSession(s.handleAdminListTokens))
 	api.HandleFunc("POST /v1/admin/api-tokens", s.requireAdminSession(s.handleAdminMintToken))
 	api.HandleFunc("DELETE /v1/admin/api-tokens/{hashOrToken}", s.requireAdminSession(s.handleAdminRevokeToken))
+	// Member revocation is a member's decision for the same reason: a bat_
+	// bearer is refused here too, so a leaked automation token cannot end
+	// anyone's sessions (ADR-0008).
+	api.HandleFunc("POST /v1/admin/members/{id}/revoke", s.requireAdminSession(s.handleAdminRevokeMember))
 
 	// The console drives these exact handlers in-process (consoleCall), so
 	// there is exactly one management path for provider rows.

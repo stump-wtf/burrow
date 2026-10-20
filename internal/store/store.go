@@ -128,6 +128,31 @@ var schemaChanges = []struct {
 		pending: `SELECT to_regclass('llm_provider_audit_provider_idx') IS NULL`,
 		ddl:     `CREATE INDEX IF NOT EXISTS llm_provider_audit_provider_idx ON llm_provider_audit (provider_id)`,
 	},
+	{
+		// SPEC-0001 REQ "Session revocation": databases older than the column.
+		// The grant remembers the session that minted it, so the session it
+		// buys can be keyed to that family.
+		name:    "grants.parent_session_hash",
+		pending: `SELECT NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('grants') AND attname = 'parent_session_hash' AND NOT attisdropped)`,
+		ddl: `ALTER TABLE grants ADD COLUMN IF NOT EXISTS parent_session_hash TEXT
+		        REFERENCES sessions(token_hash) ON DELETE CASCADE`,
+	},
+	{
+		// A session bought by a handoff names the session that minted the
+		// grant, and dies with it (SPEC-0001 REQ "Session revocation").
+		name:    "sessions.parent_session_hash",
+		pending: `SELECT NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('sessions') AND attname = 'parent_session_hash' AND NOT attisdropped)`,
+		ddl: `ALTER TABLE sessions ADD COLUMN IF NOT EXISTS parent_session_hash TEXT
+		        REFERENCES sessions(token_hash) ON DELETE CASCADE`,
+	},
+	{
+		// MCP tokens die with the session family that minted them
+		// (SPEC-0001 REQ "Session revocation").
+		name:    "mcp_tokens.session_token_hash",
+		pending: `SELECT NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('mcp_tokens') AND attname = 'session_token_hash' AND NOT attisdropped)`,
+		ddl: `ALTER TABLE mcp_tokens ADD COLUMN IF NOT EXISTS session_token_hash TEXT
+		        REFERENCES sessions(token_hash) ON DELETE CASCADE`,
+	},
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -146,7 +171,11 @@ CREATE TABLE IF NOT EXISTS sessions (
 	token_hash TEXT PRIMARY KEY,
 	user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 	created_at TIMESTAMPTZ NOT NULL,
-	expires_at TIMESTAMPTZ NOT NULL
+	expires_at TIMESTAMPTZ NOT NULL,
+	-- SPEC-0001 REQ "Session revocation": the session whose handoff grant
+	-- bought this one, so signing that one out revokes the family. NULL for a
+	-- session bought at the OIDC callback, which has no parent session.
+	parent_session_hash TEXT REFERENCES sessions(token_hash) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS grants (
 	token_hash TEXT PRIMARY KEY,
@@ -156,7 +185,11 @@ CREATE TABLE IF NOT EXISTS grants (
 	-- SPEC-0001 REQ "Session lifetime": the expiry of the session that minted
 	-- this grant, which the session it buys may not outlive. NULL for a grant
 	-- minted by the OIDC callback, which has no parent session.
-	session_expires_at TIMESTAMPTZ
+	session_expires_at TIMESTAMPTZ,
+	-- SPEC-0001 REQ "Session revocation": the minting session itself, so the
+	-- session this grant buys can be keyed to it. NULL for a grant minted by
+	-- the OIDC callback.
+	parent_session_hash TEXT REFERENCES sessions(token_hash) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS oidc_states (
 	state      TEXT PRIMARY KEY,
@@ -170,7 +203,11 @@ CREATE TABLE IF NOT EXISTS mcp_tokens (
 	user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 	org_id     TEXT NOT NULL,
 	created_at TIMESTAMPTZ NOT NULL,
-	expires_at TIMESTAMPTZ NOT NULL
+	expires_at TIMESTAMPTZ NOT NULL,
+	-- SPEC-0001 REQ "Session revocation": the session that minted this token,
+	-- so signing that family out ends the token too. NULL for a token minted
+	-- before this column existed, which its expiry or an admin revoke ends.
+	session_token_hash TEXT REFERENCES sessions(token_hash) ON DELETE CASCADE
 );
 -- SPEC-0004 REQ "Rows in the store": provider rows, source of truth for the
 -- desktop-facing set. provider_groups is NULL for every member and a JSON
@@ -394,14 +431,16 @@ func (s *Store) MintGrant(ctx context.Context, userID string, ttl time.Duration)
 // that session's user, valid for ttl. The grant records the session's expiry,
 // and the session it buys cannot outlive it (SPEC-0001 REQ "Session
 // lifetime") — otherwise a session could mint its own successor forever and
-// the session TTL would bound nothing. The user and the expiry are read from
-// the session row in the same statement as the insert, so a session signed
-// out in between mints nothing: ErrNotFound.
+// the session TTL would bound nothing. The grant also names the minting
+// session, so the session it buys dies with that family (SPEC-0001 REQ
+// "Session revocation"). The user and the expiry are read from the session
+// row in the same statement as the insert, so a session signed out in between
+// mints nothing: ErrNotFound.
 func (s *Store) MintHandoffGrant(ctx context.Context, sessionToken string, ttl time.Duration) (string, error) {
 	grant := randomToken()
 	tag, err := s.db.ExecContext(ctx, `
-INSERT INTO grants (token_hash, user_id, created_at, expires_at, session_expires_at)
-SELECT $1, user_id, $2, $3, expires_at FROM sessions WHERE token_hash = $4`,
+INSERT INTO grants (token_hash, user_id, created_at, expires_at, session_expires_at, parent_session_hash)
+SELECT $1, user_id, $2, $3, expires_at, token_hash FROM sessions WHERE token_hash = $4`,
 		hashToken(grant), now(), now().Add(ttl), hashToken(sessionToken))
 	if err != nil {
 		return "", fmt.Errorf("store: mint handoff grant: %w", err)
@@ -419,60 +458,87 @@ SELECT $1, user_id, $2, $3, expires_at FROM sessions WHERE token_hash = $4`,
 // ErrGrantInvalid marks a grant that is unknown, already used, or expired.
 var ErrGrantInvalid = errors.New("store: grant is invalid, used, or expired")
 
+// GrantLineage is what a burned grant says about the session it was minted
+// from: the latest moment the session it buys may live to, and the minting
+// session itself, which that session then dies with (SPEC-0001 REQ "Session
+// revocation"). Both are zero for a grant from the OIDC callback, which has
+// no parent session.
+type GrantLineage struct {
+	NotAfter time.Time // the minting session's expiry; zero means no cap
+	Parent   string    // the minting session's token hash; "" means no family
+}
+
 // ConsumeGrant validates and burns a grant in one statement, returning the
-// user it was minted for. The DELETE is the read: a second call with the same
-// grant finds no row, so no interleaving of two requests can spend a grant
-// twice. An expired row is deleted and answered the same way a reused one is.
+// user it was minted for and the grant's lineage. The DELETE is the read: a
+// second call with the same grant finds no row, so no interleaving of two
+// requests can spend a grant twice. An expired row is deleted and answered
+// the same way a reused one is.
 //
-// notAfter is the expiry of the session that minted the grant — the latest
+// NotAfter is the expiry of the session that minted the grant — the latest
 // moment the session this grant buys may live to — and the zero time for a
 // grant from a fresh OIDC sign-in. A grant whose minting session has already
 // expired is refused like an expired grant: the sign-in it descends from is
 // over.
-func (s *Store) ConsumeGrant(ctx context.Context, grant string) (userID string, notAfter time.Time, err error) {
+func (s *Store) ConsumeGrant(ctx context.Context, grant string) (userID string, lineage GrantLineage, err error) {
 	var expiresAt time.Time
 	var sessionExpiresAt sql.NullTime
+	var parent sql.NullString
 	err = s.db.QueryRowContext(ctx,
-		`DELETE FROM grants WHERE token_hash = $1 RETURNING user_id, expires_at, session_expires_at`, hashToken(grant)).
-		Scan(&userID, &expiresAt, &sessionExpiresAt)
+		`DELETE FROM grants WHERE token_hash = $1 RETURNING user_id, expires_at, session_expires_at, parent_session_hash`, hashToken(grant)).
+		Scan(&userID, &expiresAt, &sessionExpiresAt, &parent)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", time.Time{}, ErrGrantInvalid
+			return "", GrantLineage{}, ErrGrantInvalid
 		}
-		return "", time.Time{}, fmt.Errorf("store: consume grant: %w", err)
+		return "", GrantLineage{}, fmt.Errorf("store: consume grant: %w", err)
 	}
 	if now().After(expiresAt) {
-		return "", time.Time{}, ErrGrantInvalid
+		return "", GrantLineage{}, ErrGrantInvalid
 	}
 	if sessionExpiresAt.Valid {
 		if now().After(sessionExpiresAt.Time) {
-			return "", time.Time{}, ErrGrantInvalid
+			return "", GrantLineage{}, ErrGrantInvalid
 		}
-		notAfter = sessionExpiresAt.Time
+		lineage.NotAfter = sessionExpiresAt.Time
 	}
-	return userID, notAfter, nil
+	lineage.Parent = parent.String
+	return userID, lineage, nil
 }
 
 // CreateSession issues a session token for user, valid for ttl, returning the
-// raw token value.
+// raw token value. It belongs to no family: this is the session of a fresh
+// sign-in.
 func (s *Store) CreateSession(ctx context.Context, userID string, ttl time.Duration) (string, error) {
-	return s.CreateSessionCapped(ctx, userID, ttl, time.Time{})
+	return s.CreateSessionFrom(ctx, userID, ttl, GrantLineage{})
 }
 
-// CreateSessionCapped is CreateSession for a session bought with a grant: it
-// is valid for ttl but never past notAfter, the value ConsumeGrant returned.
-// A zero notAfter is no cap. The expiry is stored as notAfter itself, not as
-// a ttl recomputed from it, so a chain of handoffs cannot creep past the
-// sign-in it started from.
+// CreateSessionCapped is CreateSession for a session bought with a grant that
+// only carries a cap — the lineage of a grant written before the parent
+// column existed. A zero lineage is no cap and no family.
 func (s *Store) CreateSessionCapped(ctx context.Context, userID string, ttl time.Duration, notAfter time.Time) (string, error) {
+	return s.CreateSessionFrom(ctx, userID, ttl, GrantLineage{NotAfter: notAfter})
+}
+
+// CreateSessionFrom is CreateSession for a session bought with a grant: it is
+// valid for ttl but never past lineage.NotAfter, and it is keyed to
+// lineage.Parent — the session that minted the grant — so signing that one
+// out, or revoking that member, revokes this session and everything under it
+// (SPEC-0001 REQ "Session revocation"). The expiry is stored as the cap
+// itself, not as a ttl recomputed from it, so a chain of handoffs cannot
+// creep past the sign-in it started from.
+func (s *Store) CreateSessionFrom(ctx context.Context, userID string, ttl time.Duration, lineage GrantLineage) (string, error) {
 	token := randomToken()
 	expiresAt := now().Add(ttl)
-	if !notAfter.IsZero() && notAfter.Before(expiresAt) {
-		expiresAt = notAfter
+	if !lineage.NotAfter.IsZero() && lineage.NotAfter.Before(expiresAt) {
+		expiresAt = lineage.NotAfter
+	}
+	var parent any
+	if lineage.Parent != "" {
+		parent = lineage.Parent
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES ($1, $2, $3, $4)`,
-		hashToken(token), userID, now(), expiresAt)
+		`INSERT INTO sessions (token_hash, user_id, created_at, expires_at, parent_session_hash) VALUES ($1, $2, $3, $4, $5)`,
+		hashToken(token), userID, now(), expiresAt, parent)
 	if err != nil {
 		return "", fmt.Errorf("store: create session: %w", err)
 	}
@@ -501,13 +567,94 @@ func (s *Store) LookupSession(ctx context.Context, token string) (userID string,
 	return userID, nil
 }
 
-// DeleteSession removes a session (sign-out).
+// DeleteSession removes a session (sign-out). The cascade through
+// parent_session_hash and mcp_tokens.session_token_hash takes the session's
+// whole family with it: sessions a handoff derived from it, and the MCP
+// tokens any of them minted (SPEC-0001 REQ "Session revocation").
 func (s *Store) DeleteSession(ctx context.Context, token string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE token_hash = $1`, hashToken(token))
 	if err != nil {
 		return fmt.Errorf("store: delete session: %w", err)
 	}
 	return nil
+}
+
+// MemberRevocation counts what RevokeMember removed, so the admin surface can
+// report the effect instead of just claiming success.
+type MemberRevocation struct {
+	Sessions      int64
+	Grants        int64
+	MCPTokens     int64
+	APITokens     int64
+	GroupsCleared bool
+}
+
+// RevokeMember is the admin path that ends everything a member holds: every
+// session of theirs (the cascade takes each one's handoff-derived sessions
+// and minted MCP tokens with it), any grant still waiting to be exchanged,
+// every MCP token that somehow stands outside a family, and every machine API
+// token minted in their name. It ends with their stored group snapshot, so
+// access is not served from the groups of a sign-in the admin just ended —
+// their next sign-in re-reads the claim from the issuer (SPEC-0003 REQ
+// "Groups claim"). The member row survives: this is revocation, not
+// deletion, and the audit trail's actor names keep resolving.
+//
+// A member row that does not exist is ErrNotFound: an admin revoking a typo
+// must not answer success with zero rows touched.
+func (s *Store) RevokeMember(ctx context.Context, userID string) (MemberRevocation, error) {
+	var rev MemberRevocation
+	var exists bool
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)`, userID).Scan(&exists); err != nil {
+		return rev, fmt.Errorf("store: revoke member lookup: %w", err)
+	}
+	if !exists {
+		return rev, ErrNotFound
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return rev, fmt.Errorf("store: revoke member begin: %w", err)
+	}
+	defer tx.Rollback()
+	// The counts are read before the deletes: a command tag counts only the
+	// rows its own statement removed, never the ones the cascade took, and
+	// an operator reading "revoked 1 session" when the family was four
+	// would be reading a wrong incident record.
+	for _, count := range []struct {
+		stmt  string
+		total *int64
+	}{
+		{`SELECT count(*) FROM sessions WHERE user_id = $1`, &rev.Sessions},
+		{`SELECT count(*) FROM grants WHERE user_id = $1`, &rev.Grants},
+		{`SELECT count(*) FROM mcp_tokens WHERE user_id = $1`, &rev.MCPTokens},
+		{`SELECT count(*) FROM api_tokens WHERE user_id = $1`, &rev.APITokens},
+	} {
+		if err := tx.QueryRowContext(ctx, count.stmt, userID).Scan(count.total); err != nil {
+			return rev, fmt.Errorf("store: count revoke member rows: %w", err)
+		}
+	}
+	for _, stmt := range []string{
+		`DELETE FROM sessions WHERE user_id = $1`,
+		`DELETE FROM grants WHERE user_id = $1`,
+		`DELETE FROM mcp_tokens WHERE user_id = $1`,
+		`DELETE FROM api_tokens WHERE user_id = $1`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt, userID); err != nil {
+			return rev, fmt.Errorf("store: revoke member: %w", err)
+		}
+	}
+	tag, err := tx.ExecContext(ctx, `UPDATE users SET oidc_groups = '[]', updated_at = $2 WHERE id = $1 AND oidc_groups <> '[]'`, userID, now())
+	if err != nil {
+		return rev, fmt.Errorf("store: revoke member groups: %w", err)
+	}
+	cleared, err := tag.RowsAffected()
+	if err != nil {
+		return rev, fmt.Errorf("store: revoke member groups rows: %w", err)
+	}
+	rev.GroupsCleared = cleared > 0
+	if err := tx.Commit(); err != nil {
+		return rev, fmt.Errorf("store: revoke member commit: %w", err)
+	}
+	return rev, nil
 }
 
 // SaveOIDCState records the PKCE verifier for one in-flight sign-in.
@@ -540,13 +687,22 @@ func (s *Store) TakeOIDCState(ctx context.Context, state string) (verifier strin
 	return verifier, desktop, nil
 }
 
-// MintMCPToken issues an org-scoped MCP token valid for ttl.
-func (s *Store) MintMCPToken(ctx context.Context, userID, orgID string, ttl time.Duration) (string, time.Time, error) {
+// MintMCPToken issues an org-scoped MCP token valid for ttl, minted by the
+// session sessionToken (empty for a token with no session behind it). The
+// token dies with that session's family (SPEC-0001 REQ "Session revocation");
+// a session already signed out cannot have minted one, so the reference is
+// left dangling only against a family an admin has not revoked — and every
+// mint path requires a live session first.
+func (s *Store) MintMCPToken(ctx context.Context, userID, orgID, sessionToken string, ttl time.Duration) (string, time.Time, error) {
 	token := randomToken()
 	expiresAt := now().Add(ttl)
+	var parent any
+	if sessionToken != "" {
+		parent = hashToken(sessionToken)
+	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO mcp_tokens (token_hash, user_id, org_id, created_at, expires_at) VALUES ($1, $2, $3, $4, $5)`,
-		hashToken(token), userID, orgID, now(), expiresAt)
+		`INSERT INTO mcp_tokens (token_hash, user_id, org_id, created_at, expires_at, session_token_hash) VALUES ($1, $2, $3, $4, $5, $6)`,
+		hashToken(token), userID, orgID, now(), expiresAt, parent)
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("store: mint mcp token: %w", err)
 	}
