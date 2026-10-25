@@ -229,3 +229,72 @@ func TestModelAudiencesRevisionIgnoresOrder(t *testing.T) {
 		t.Fatal("a wider audience must not fingerprint the same")
 	}
 }
+
+// A separator carried inside a group name must not alias two rule sets to
+// the same change-detection text (stump.wtf/burrow#78).
+func TestChangedModelProvidersDoesNotAliasSeparatorNames(t *testing.T) {
+	cases := []struct {
+		name   string
+		before []store.ModelAudience
+		after  []store.ModelAudience
+	}{
+		{
+			name:   "comma in a group name",
+			before: []store.ModelAudience{{ProviderID: "lpr_a", ModelID: "m1", Groups: []string{"a,b", "c"}}},
+			after:  []store.ModelAudience{{ProviderID: "lpr_a", ModelID: "m1", Groups: []string{"a", "b", "c"}}},
+		},
+		{
+			name:   "pipe in a group name",
+			before: []store.ModelAudience{{ProviderID: "lpr_a", ModelID: "m1", Groups: []string{"a|b", "c"}}},
+			after:  []store.ModelAudience{{ProviderID: "lpr_a", ModelID: "m1", Groups: []string{"a|b,c"}}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := store.ChangedModelProviders(tc.before, tc.after)
+			if len(changed) != 1 || changed[0] != "lpr_a" {
+				t.Fatalf("aliased rule sets must be seen as changed, got %v", changed)
+			}
+		})
+	}
+}
+
+// A save that only moved a separator-bearing group name used to render the
+// rules identically, so the row was seen as unchanged: no updated_at bump, no
+// audit entry, and a member's client stuck on the stale menu
+// (stump.wtf/burrow#78).
+func TestSaveModelAudiencesBumpsARowAliasedBySeparators(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	seedModelProviders(t, st, "lpr_local")
+
+	saveModels(t, st, store.ModelAudience{ProviderID: "lpr_local", ModelID: "gpt-5", Groups: []string{"a|b", "c"}})
+	mid, err := st.GetProvider(ctx, "lpr_local")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	// The old render of ["a|b", "c"] and of ["a|b,c"] is the one string
+	// "gpt-5\x00a|b,c", which is how the second save slipped through.
+	saveModels(t, st, store.ModelAudience{ProviderID: "lpr_local", ModelID: "gpt-5", Groups: []string{"a|b,c"}})
+	after, err := st.GetProvider(ctx, "lpr_local")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !after.UpdatedAt.After(mid.UpdatedAt) {
+		t.Fatalf("a save that only changed a separator-bearing name must move updated_at: %v then %v", mid.UpdatedAt, after.UpdatedAt)
+	}
+	entries, err := st.ListAudit(ctx, 10)
+	if err != nil {
+		t.Fatalf("audit: %v", err)
+	}
+	count := 0
+	for _, entry := range entries {
+		if entry.Action == "model-audiences" {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Fatalf("each aliased save must append its audit entry, got %d", count)
+	}
+}
