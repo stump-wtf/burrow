@@ -189,6 +189,9 @@ type consolePage struct {
 	IsAudit      bool
 	Audit        []auditLine
 	Matrix       *skillMatrix
+	// Models is the models matrix, the console's editor for per-model
+	// audiences inside a provider row (SPEC-0003 REQ "Model audience").
+	Models *modelMatrix
 	// Note is a page that is only a heading and one paragraph: the closed
 	// console's notice. With it set the page carries no navigation, because
 	// every console route would answer the same notice (ADR-0007).
@@ -255,7 +258,7 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 <main class="shell" style="width:100%">
 <header class="console-head">
 <div class="wordmark">burrow · admin</div>
-{{if not .Note}}<nav><a href="/admin">Providers</a> &middot; <a href="/admin/skills">Skill packs</a> &middot; <a href="/admin/audit">Audit</a> &middot; <form method="post" action="/admin/sign-out"><button type="submit">Sign out</button></form></nav>{{end}}
+{{if not .Note}}<nav><a href="/admin">Providers</a> &middot; <a href="/admin/models">Model access</a> &middot; <a href="/admin/skills">Skill packs</a> &middot; <a href="/admin/audit">Audit</a> &middot; <form method="post" action="/admin/sign-out"><button type="submit">Sign out</button></form></nav>{{end}}
 </header>
 {{if .Flash}}<p class="flash">{{.Flash}}</p>{{end}}
 {{range .Errors}}<p class="error">{{.}}</p>{{end}}
@@ -419,6 +422,34 @@ var consoleTmpl = template.Must(template.New("console").Parse(`<!doctype html>
 <input type="text" id="newGroup" name="newGroup" placeholder="a group that has not signed in yet" autocomplete="off"></div>
 </form>
 {{if not .Matrix.Groups}}<p class="note">No group has reached burrow yet. A group's column appears after one of its members signs in, or once a rule names it.</p>{{end}}
+{{end}}
+
+{{if .Models}}
+<h1 style="font-size:19px;font-weight:600;margin:0 0 16px">Model access</h1>
+{{if .Models.NoRules}}<p class="note">Nothing configured yet, so every model follows its provider row's audience. Check a model for the groups whose members may see it; a model with no box checked keeps following its row.</p>{{else}}<p class="note">A checked box gives that group the model, and only the groups checked for a model can see it — a checked box replaces the row's audience for that model, so a personal row can offer one model to another group without offering the rest.</p>{{end}}
+<p class="note">The list is what members see. It is not what the row's key reaches: one row has one gateway key, and a member served the row can reach every model behind that key. Restrict a model you must keep to a group at the gateway too.</p>
+{{if .Models.NamedGroups}}<p class="note">A rule names {{range .Models.NamedGroups}}<span class="badge">{{.}}</span> {{end}}but no member has signed in with that group yet — check the spelling in the identity provider.</p>{{end}}
+{{if .Models.MenusPending}}<p class="note">The menu for {{range .Models.MenusPending}}<span class="badge">{{.}}</span> {{end}}has not been derived yet, so its model list may be incomplete. Ask the row's gateway by opening the row, then reload.</p>{{end}}
+<form method="post" action="/admin/models">
+<input type="hidden" name="groupCount" value="{{len .Models.Groups}}">
+<input type="hidden" name="revision" value="{{.Models.Revision}}">
+{{range $column, $group := .Models.Groups}}<input type="hidden" name="group.{{$column}}" value="{{$group}}">
+{{end}}<table class="matrix">
+<thead><tr><th>Model</th>{{range $column, $group := .Models.Groups}}<th class="c">{{$group}}</th>{{end}}</tr></thead>
+<tbody>
+{{range $row, $model := .Models.Rows}}
+<tr>
+<td><strong>{{$model.ModelID}}</strong><div class="sub">{{$model.ProviderName}}{{if not $model.Declared}} · follows its row{{end}}</div>
+<input type="hidden" name="model.{{$row}}.provider" value="{{$model.ProviderID}}">
+<input type="hidden" name="model.{{$row}}.id" value="{{$model.ModelID}}"></td>
+{{range $column, $checked := $model.Cells}}<td class="c"><input type="checkbox" name="cell.{{$column}}.{{$row}}" value="1"{{if $checked}} checked{{end}} aria-label="{{$model.ModelID}} for {{index $.Models.Groups $column}}"></td>{{end}}
+</tr>
+{{end}}
+</tbody></table>
+<div class="actions"><button class="button inline" type="submit">Save</button></div>
+</form>
+{{if not .Models.Groups}}<p class="note">No group has reached burrow yet. A group's column appears after one of its members signs in.</p>{{end}}
+{{if not .Models.Rows}}<p class="note">No model has been derived yet. A row's models appear here once burrow has asked that row's gateway for them.</p>{{end}}
 {{end}}
 </main>
 </body></html>`))

@@ -63,6 +63,8 @@ func (s *Server) Routes() http.Handler {
 	console.HandleFunc("GET /admin/audit", s.requireAdminPage(s.handleConsoleAudit))
 	console.HandleFunc("GET /admin/skills", s.requireAdminPage(s.handleConsoleSkills))
 	console.HandleFunc("POST /admin/skills", s.requireAdminPage(s.handleConsoleSkillsSave))
+	console.HandleFunc("GET /admin/models", s.requireAdminPage(s.handleConsoleModels))
+	console.HandleFunc("POST /admin/models", s.requireAdminPage(s.handleConsoleModelsSave))
 	console.HandleFunc("GET /admin/preview", s.requireAdminPage(s.handleConsolePreview))
 	console.HandleFunc("GET /admin/providers/new", s.requireAdminPage(s.handleConsoleNew))
 	console.HandleFunc("POST /admin/providers", s.requireAdminPage(s.handleConsoleCreate))

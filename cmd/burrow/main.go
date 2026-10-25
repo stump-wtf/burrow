@@ -153,6 +153,9 @@ func main() {
 			}
 		}
 	}
+	// A model audience narrower than its row hides the model from the listing
+	// but not from the row's one key (SPEC-0003 REQ "Key-scope warning").
+	llmRuntime.WarnKeyScope(ctx)
 
 	catalog := skills.NewCatalog(skills.Source{
 		Dir:      cfg.SkillsDir,

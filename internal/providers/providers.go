@@ -429,8 +429,11 @@ func NewRuntime(st *store.Store, modelsTTL time.Duration, pol Policy) *Runtime {
 }
 
 // RowsFor returns the rows a member holding memberGroups may see (SPEC-0003
-// REQ "Visibility", unchanged by SPEC-0004 except that a model's audience is
-// now always its row's audience).
+// REQ "Visibility"), each listing only the models they may see. A row whose
+// models are governed by rules and whose derived menu then leaves nothing
+// visible to that member is not served at all; a row with no rules is served as
+// SPEC-0004 describes it, whatever its gateway is doing (SPEC-0003 REQ
+// "Model audience").
 func (r *Runtime) RowsFor(ctx context.Context, memberGroups []string) ([]Row, error) {
 	if r == nil {
 		return []Row{}, nil
@@ -439,14 +442,33 @@ func (r *Runtime) RowsFor(ctx context.Context, memberGroups []string) ([]Row, er
 	if err != nil {
 		return nil, err
 	}
+	aud, err := r.audiences(ctx)
+	if err != nil {
+		return nil, err
+	}
 	r.prune(rows)
-	rows = visibleTo(rows, memberGroups)
+	rows = visibleToAudiences(rows, aud, memberGroups)
 	r.awaitFirst(ctx, rows)
 	out := make([]Row, 0, len(rows))
 	for _, p := range rows {
-		out = append(out, r.row(ctx, p))
+		row, served := r.rowFor(ctx, p, aud, memberGroups)
+		if !served {
+			continue
+		}
+		out = append(out, row)
 	}
 	return out, nil
+}
+
+// audiences reads the declared model audiences (SPEC-0003 REQ "Model
+// audience"). It is one query per listing, as the Library's mapping is, so a
+// save takes effect on the next request rather than at a sign-in.
+func (r *Runtime) audiences(ctx context.Context) (Audiences, error) {
+	rules, err := r.st.ListModelAudiences(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return AudiencesOf(rules), nil
 }
 
 // MenuFor returns the row's current derived model ids and whether its key is
@@ -545,11 +567,18 @@ func (r *Runtime) SnapshotFor(ctx context.Context, memberGroups []string) (map[s
 	if err != nil {
 		return nil, err
 	}
-	rows = visibleTo(rows, memberGroups)
+	aud, err := r.audiences(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows = visibleToAudiences(rows, aud, memberGroups)
 	r.awaitFirst(ctx, rows)
 	snapshot := map[string]string{}
 	for _, p := range rows {
-		_, bumpedAt := r.menuIDs(ctx, p) // starts the refresh that may advance updated_at (ADR-0004)
+		ids, bumpedAt := r.menuIDs(ctx, p) // starts the refresh that may advance updated_at (ADR-0004)
+		if !aud.servesRow(p, memberGroups, ids, r.MenuKnown(p.ID)) {
+			continue
+		}
 		if bumpedAt.After(p.UpdatedAt) {
 			p.UpdatedAt = bumpedAt
 		}
@@ -560,9 +589,14 @@ func (r *Runtime) SnapshotFor(ctx context.Context, memberGroups []string) (map[s
 
 // ConnectFor is /connect for a member: a row the member cannot see answers
 // exactly like an unknown id, so its key is never handed out and its
-// existence is not revealed (SPEC-0003 REQ "Connect follows visibility").
-// It hands over the key with whatever menu is known and never waits on the
-// gateway, not even for a row's first fetch (ADR-0004).
+// existence is not revealed (SPEC-0003 REQ "Connect follows visibility"). A row
+// whose models are governed by rules answers the same way when the menu burrow
+// has derived for it leaves the member no visible model: the key reaches every
+// model in the row, so it goes only to someone who can see at least one of them
+// (SPEC-0003 REQ "Model audience"). Whether the member is entitled at all is
+// judged from the rules, never from the gateway. It hands over the key with
+// whatever menu is known and never waits on the gateway, not even for a row's
+// first fetch (ADR-0004).
 func (r *Runtime) ConnectFor(ctx context.Context, id string, memberGroups []string) (Row, *string, bool, error) {
 	if r == nil {
 		return Row{}, nil, false, nil
@@ -574,7 +608,11 @@ func (r *Runtime) ConnectFor(ctx context.Context, id string, memberGroups []stri
 		}
 		return Row{}, nil, false, err
 	}
-	if !allowed(p.Groups, memberGroups) {
+	aud, err := r.audiences(ctx)
+	if err != nil {
+		return Row{}, nil, false, err
+	}
+	if !aud.entitled(p, memberGroups) {
 		return Row{}, nil, false, nil
 	}
 	// Only allowlisted config is handed out: a row whose key variable or host
@@ -584,7 +622,10 @@ func (r *Runtime) ConnectFor(ctx context.Context, id string, memberGroups []stri
 		r.logRefusal(r.entry(p.ID), p, err)
 		return Row{}, nil, false, nil
 	}
-	row := r.row(ctx, p)
+	row, served := r.rowFor(ctx, p, aud, memberGroups)
+	if !served {
+		return Row{}, nil, false, nil
+	}
 	var key *string
 	if value, ok := r.keyFor(p); ok {
 		key = &value
@@ -592,16 +633,22 @@ func (r *Runtime) ConnectFor(ctx context.Context, id string, memberGroups []stri
 	return row, key, true, nil
 }
 
-// row builds the client-facing row for one stored provider from the menu the
-// cache holds now, computing hasApiKey from the live environment.
-func (r *Runtime) row(ctx context.Context, p store.ProviderRow) Row {
+// rowFor builds the client-facing row as one member holding memberGroups sees
+// it, and reports whether they are served the row at all. hasApiKey comes from
+// the live environment; models carries the visible part of the menu the cache
+// holds now.
+func (r *Runtime) rowFor(ctx context.Context, p store.ProviderRow, aud Audiences, memberGroups []string) (Row, bool) {
 	_, hasKey := r.keyFor(p)
 	ids, bumpedAt := r.menuIDs(ctx, p)
+	if !aud.servesRow(p, memberGroups, ids, r.MenuKnown(p.ID)) {
+		return Row{}, false
+	}
 	if bumpedAt.After(p.UpdatedAt) {
 		p.UpdatedAt = bumpedAt
 	}
-	models := make([]ModelRow, 0, len(ids))
-	for _, id := range ids {
+	visible := aud.visibleModels(p, ids, memberGroups)
+	models := make([]ModelRow, 0, len(visible))
+	for _, id := range visible {
 		name := id
 		if override, ok := p.NameOverrides[id]; ok && override != "" {
 			name = override
@@ -621,7 +668,7 @@ func (r *Runtime) row(ctx context.Context, p store.ProviderRow) Row {
 		HasAPIKey: hasKey,
 		Models:    models,
 		UpdatedAt: FormatUpdatedAt(p.UpdatedAt),
-	}
+	}, true
 }
 
 // entry returns the row's cache entry, creating it on first need.
@@ -908,17 +955,6 @@ func sameIDSet(a, b []string) bool {
 		}
 	}
 	return true
-}
-
-// visibleTo keeps the rows a member holding memberGroups may see.
-func visibleTo(rows []store.ProviderRow, memberGroups []string) []store.ProviderRow {
-	out := make([]store.ProviderRow, 0, len(rows))
-	for _, p := range rows {
-		if allowed(p.Groups, memberGroups) {
-			out = append(out, p)
-		}
-	}
-	return out
 }
 
 // allowed reports whether a member holding memberGroups may see something
