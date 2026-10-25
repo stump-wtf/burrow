@@ -1,7 +1,9 @@
 ---
 status: draft
 date: 2026-10-11
-amended: 2026-10-16 (ADR-0006, stump.wtf/burrow#39: the Library fails closed on group drift)
+amended:
+  - 2026-10-16 (ADR-0006, stump.wtf/burrow#39: the Library fails closed on group drift)
+  - 2026-10-25 (ADR-0009, stump.wtf/burrow#13: model audiences inside a row)
 implements: [ADR-0003]
 ---
 
@@ -16,8 +18,10 @@ that declares no audiences behaves exactly as the stages before it did.
 
 Provider audiences live where the key's scope is derived from, so the menu and
 the key change together: SPEC-0004 moved those declarations from the providers
-file onto store rows, and retired model-level groups for derived menus — a
-derived model's audience is its row's (ADR-0004).
+file onto store rows, and retired model-level groups for derived menus, so a
+model that declares nothing has its row's audience (ADR-0004). A model that
+wants a different audience from its row declares one, in the store and in the
+console, not as a field of the row (ADR-0009, REQ "Model audience").
 
 Library skills have no key to keep in step, so their mapping is edited at
 runtime in burrow's own console (#12). Shared MCP connections (#4) follow the
@@ -63,9 +67,10 @@ so it names an audience no member holds.
 
 ### Requirement: Visibility
 
-A model's audience SHALL be its own `groups` when present, else its provider's
-`groups` when present, else every member. A member SHALL see a model when the
-model has no audience or the member holds at least one of its groups. A
+A model's audience SHALL be its own declared audience when present (REQ "Model
+audience"), else its provider's `groups` when present, else every member. A
+member SHALL see a model when the model has no audience or the member holds at
+least one of its groups. A
 provider row SHALL be served to a member only when the member sees at least one
 of its models (a row with no models follows the provider's `groups`), and the
 row SHALL list only the models the member sees.
@@ -78,9 +83,63 @@ row SHALL list only the models the member sees.
 
 #### Scenario: model-level audience
 
-- **GIVEN** a row whose model `m2` has `groups: ["owner"]`
+- **GIVEN** a row whose model `m2` declares the audience `["owner"]`
 - **WHEN** a member without `owner` lists providers
 - **THEN** the row is served without `m2`
+
+### Requirement: Model audience
+
+A model whose audience differs from its row's SHALL declare it in the store, per
+provider row and model id, and the declaration SHALL be editable as a matrix of
+the models burrow derives against the groups burrow has seen. A declaration
+SHALL replace the row's audience for that model rather than intersect it, so one
+rule can narrow an open row or open one model of a restricted row. A model that
+declares nothing SHALL follow its row, and an org where nothing is declared
+SHALL behave exactly as it did before model audiences existed.
+
+Saving SHALL cover the whole table against one revision, the way REQ "Mapping is
+edited, not deployed" words it for the Library: a page whose revision is out of
+date SHALL be refused with 409, an empty audience or a group name carrying
+control characters SHALL be refused with 400, and a provider row the page names
+that no longer exists SHALL refuse the save. A row whose declarations changed
+SHALL have its `updated_at` bumped and an audit entry naming the actor written;
+a row whose declarations did not change SHALL NOT.
+
+Whether a member may hold a row's key SHALL be decided from these declarations
+and the row's `groups` alone, never from a gateway answer; a menu burrow already
+has SHALL only decide whether the row is served at all.
+
+#### Scenario: a rule narrows one model of an open row
+
+- **GIVEN** a row with no `groups` whose model `m1` declares `["owner"]`
+- **WHEN** a member who holds neither the row's audience nor `owner` lists providers
+- **THEN** the row is served without `m1`
+
+#### Scenario: a rule opens one model of a restricted row
+
+- **GIVEN** a row with `groups: ["owner"]` whose model `m2` declares `["family"]`
+- **WHEN** a member holding only `family` lists providers and connects to the row
+- **THEN** the row is served with `m2` and `/connect` returns its key
+
+#### Scenario: a member who sees no model is served no row and no key
+
+- **GIVEN** a row with `groups: ["family"]` whose every model declares an audience that does not include `family`
+- **WHEN** a member holding only `family` lists providers and then calls `/connect` for the row
+- **THEN** the row is absent and `/connect` answers 404, as it does for an unknown id
+
+#### Scenario: a gateway that answers nothing changes no answer
+
+- **GIVEN** a row whose models declare audiences, and a gateway whose menu burrow cannot fetch
+- **WHEN** a member entitled to the row lists providers and calls `/connect`
+- **THEN** the row is served, filtered by the same rules, and its key is returned,
+  and a member who is not entitled is still served nothing
+
+#### Scenario: withdrawing a rule returns the model to its row
+
+- **GIVEN** a matrix saved with every box unchecked for a model that had a rule
+- **WHEN** the save succeeds
+- **THEN** the model carries no declaration, follows its row, and the audit entry
+  names who saved it
 
 ### Requirement: Connect follows visibility
 
@@ -197,5 +256,6 @@ scope.
 
 ## Out of scope
 
-Shared MCP connections by group (#4), and per-member keys minted by burrow
-(ADR-0003 option 3).
+Shared MCP connections by group (#4), per-member keys minted by burrow
+(ADR-0003 option 3), and the per-group virtual key that would make a hidden
+model unreachable rather than merely unlisted (the open decision in ADR-0009).
