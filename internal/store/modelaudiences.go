@@ -262,16 +262,24 @@ func dedupeGroups(groups []string) []string {
 
 // changedModelProviders lists the rows whose rules differ between two rule
 // sets, sorted, so a save touches and audits exactly the rows it changed.
+// Each provider's rules render through the same JSON encoding
+// ModelAudiencesRevision uses: a separator join would alias two rule sets
+// whose names carry a comma or a pipe (stump.wtf/burrow#78), and JSON
+// quoting keeps the render as collision-proof as the fingerprint.
 func changedModelProviders(before, after []ModelAudience) []string {
 	render := func(rules []ModelAudience) map[string]string {
-		byProvider := map[string][]string{}
+		byProvider := map[string][][]string{}
 		for _, rule := range rules {
-			byProvider[rule.ProviderID] = append(byProvider[rule.ProviderID], rule.ModelID+modelAudiencesKey+strings.Join(rule.Groups, ","))
+			groups := append([]string{}, rule.Groups...)
+			sort.Strings(groups)
+			byProvider[rule.ProviderID] = append(byProvider[rule.ProviderID],
+				append([]string{rule.ModelID + modelAudiencesKey}, groups...))
 		}
 		out := map[string]string{}
 		for providerID, entries := range byProvider {
-			sort.Strings(entries)
-			out[providerID] = strings.Join(entries, "|")
+			sort.Slice(entries, func(i, j int) bool { return entries[i][0] < entries[j][0] })
+			encoded, _ := json.Marshal(entries)
+			out[providerID] = string(encoded)
 		}
 		return out
 	}

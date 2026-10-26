@@ -13,3 +13,7 @@ func SetMigrateLockTimeout(t *testing.T, d time.Duration) {
 	migrateLockTimeout = d
 	t.Cleanup(func() { migrateLockTimeout = old })
 }
+
+// ChangedModelProviders is the unexported comparator, exported so a test can
+// pin down which rows a save sees as changed.
+var ChangedModelProviders = changedModelProviders
