@@ -263,6 +263,20 @@ CREATE TABLE IF NOT EXISTS skill_pack_skills (
 	created_at TIMESTAMPTZ NOT NULL,
 	PRIMARY KEY (pack_group, skill)
 );
+-- SPEC-0003 REQ "Model audience": a model whose audience differs from its row's
+-- (stump.wtf/burrow#13). A model with no row here follows its row's audience,
+-- which is the behavior before this table existed. model_groups is a JSON array
+-- of group names; an empty array is refused at the write, so it never lands.
+-- Deleting the provider row takes its rules with it, so a row recreated with the
+-- same id cannot inherit an audience nobody wrote for it.
+CREATE TABLE IF NOT EXISTS model_audiences (
+	provider_id  TEXT NOT NULL REFERENCES llm_providers(id) ON DELETE CASCADE,
+	model_id     TEXT NOT NULL,
+	model_groups TEXT NOT NULL,
+	created_at   TIMESTAMPTZ NOT NULL,
+	updated_at   TIMESTAMPTZ NOT NULL,
+	PRIMARY KEY (provider_id, model_id)
+);
 `
 	// One transaction: the lock_timeout is local to it, so it bounds the boot's
 	// lock waits and nothing the pool does afterwards. It is the server's own
