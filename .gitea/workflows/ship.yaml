@@ -188,7 +188,7 @@ jobs:
           password: ${{ secrets.GIT_AUTH_TOKEN }}
 
       - name: Deploy burrow to cloud01
-        uses: https://gitea.stump.rocks/stumpcloud/ansible-runner@v2.1.1
+        uses: https://gitea.stump.rocks/stumpcloud/ansible-runner@v2.2.0
         with:
           playbook: playbooks/services/burrow.yaml
           inventory: gva.yaml
