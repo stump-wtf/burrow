@@ -5,13 +5,9 @@ import (
 )
 
 // Stage stubs: endpoints the client polls but whose stage has not landed.
-// Each returns exactly the empty the client contract prescribes.
-
-// handleMCPConnections answers GET /v1/mcp-connections: an empty connections
-// list until Stage C.
-func (s *Server) handleMCPConnections(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"connections": []any{}})
-}
+// Each returns exactly the empty the client contract prescribes. Stage C took
+// GET /v1/mcp-connections off this list (ADR-0010); what remains is what the
+// client polls and burrow still answers as none.
 
 // handleInferenceProviders answers GET /v1/inference-providers with a 404 —
 // the client treats the miss as "none" (contract, Stage A table).

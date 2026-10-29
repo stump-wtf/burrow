@@ -7,11 +7,14 @@ import (
 	"strings"
 	"time"
 
+	"gitea.stump.rocks/stump.wtf/burrow/internal/buildinfo"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/config"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/oidc"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/providers"
+	"gitea.stump.rocks/stump.wtf/burrow/internal/seal"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/skills"
 	"gitea.stump.rocks/stump.wtf/burrow/internal/store"
+	"gitea.stump.rocks/stump.wtf/burrow/internal/upstream"
 )
 
 // OIDCClient is the slice of the OIDC flow the API drives; production binds
@@ -31,13 +34,35 @@ type Server struct {
 	providerPolicy providers.Policy   // what a write may name (ADR-0005)
 	oidc           OIDCClient
 	adminAPI       *http.ServeMux // the /api/den/v1/admin subtree, driven in-process by the /admin console
+
+	// The Stage C MCP surface (ADR-0010): the client burrow speaks to upstream
+	// servers with, the host allowlist every such request passes, the sealer a
+	// stored credential needs, and how long an upstream tool list is trusted. All
+	// four come from the config, so no handler assembles its own transport.
+	mcpUpstream *upstream.Client
+	mcpPolicy   upstream.Policy
+	mcpSeal     *seal.Sealer
+	mcpCache    *upstream.ToolCache
 }
 
 // New builds the server. providerPolicy is the pair of allowlists a provider
 // write is held to, the same policy the runtime applies wherever a row is
 // used; build it from the config with providers.NewPolicy.
 func New(cfg *config.Config, st *store.Store, catalog *skills.Catalog, runtime *providers.Runtime, providerPolicy providers.Policy, client OIDCClient) *Server {
-	return &Server{cfg: cfg, store: st, skills: catalog, providers: runtime, providerPolicy: providerPolicy, oidc: client}
+	s := &Server{cfg: cfg, store: st, skills: catalog, providers: runtime, providerPolicy: providerPolicy, oidc: client}
+	// A credential key that will not build a sealer is a configuration mistake, and
+	// saying so at boot beats a member finding it out on PUT /my-credential.
+	sealer, err := seal.New(cfg.MCPCredentialKey)
+	if err != nil {
+		slog.Error("mcp: BURROW_MCP_CREDENTIAL_KEY will not seal credentials; member credentials are off",
+			"error", err)
+		sealer = nil
+	}
+	s.mcpUpstream = upstream.NewClient(&http.Client{Timeout: 30 * time.Second}, upstream.NewPolicy(cfg.MCPURLHosts), buildinfo.Version)
+	s.mcpPolicy = upstream.NewPolicy(cfg.MCPURLHosts)
+	s.mcpSeal = sealer
+	s.mcpCache = upstream.NewToolCache(cfg.MCPToolsTTL)
+	return s
 }
 
 // Routes assembles the full router. Every /v1 route lives under /api/den (the
@@ -110,6 +135,10 @@ func (s *Server) Routes() http.Handler {
 	api.HandleFunc("PUT /v1/admin/llm-providers/{id}", s.requireAdmin(s.handleAdminUpdateProvider))
 	api.HandleFunc("DELETE /v1/admin/llm-providers/{id}", s.requireAdmin(s.handleAdminDeleteProvider))
 	api.HandleFunc("GET /v1/admin/audit", s.requireAdmin(s.handleAdminAudit))
+	api.HandleFunc("GET /v1/admin/mcp-connections", s.requireAdmin(s.handleAdminListMCPConnections))
+	api.HandleFunc("POST /v1/admin/mcp-connections", s.requireAdmin(s.handleAdminCreateMCPConnection))
+	api.HandleFunc("PUT /v1/admin/mcp-connections/{id}", s.requireAdmin(s.handleAdminUpdateMCPConnection))
+	api.HandleFunc("DELETE /v1/admin/mcp-connections/{id}", s.requireAdmin(s.handleAdminDeleteMCPConnection))
 	// Token management is a member's decision: a bat_ bearer is refused here,
 	// so a leaked token cannot mint a successor (ADR-0005, #37).
 	api.HandleFunc("GET /v1/admin/api-tokens", s.requireAdminSession(s.handleAdminListTokens))
@@ -125,6 +154,14 @@ func (s *Server) Routes() http.Handler {
 	s.adminAPI = api
 
 	api.HandleFunc("GET /v1/mcp-connections", s.requireSession(s.handleMCPConnections))
+	api.HandleFunc("GET /v1/mcp-connections/{id}/connect/start", s.requireSession(s.handleMCPConnectStart))
+	api.HandleFunc("PUT /v1/mcp-connections/{id}/my-credential", s.requireSession(s.handleMCPPutMyCredential))
+	api.HandleFunc("POST /v1/mcp-connections/{id}/disconnect-my-account", s.requireSession(s.handleMCPDisconnectMyAccount))
+	api.HandleFunc("POST /v1/oauth-providers/{id}/disconnect", s.requireAdmin(s.handleOAuthProviderDisconnect))
+	// The browser's half of an OAuth connect. It is outside requireSession on
+	// purpose: the single-use state the redirect carries is the proof, so the
+	// member's session need not survive the trip to the authorization server.
+	mux.HandleFunc("GET /mcp-connections/{id}/oauth/callback", s.handleMCPOAuthCallback)
 	api.HandleFunc("GET /v1/inference-providers", s.requireSession(s.handleInferenceProviders))
 	api.HandleFunc("POST /v1/mcp/token", s.requireSession(s.handleMCPToken))
 	api.HandleFunc("POST /api/auth/sign-out", s.requireSession(s.handleSignOut))

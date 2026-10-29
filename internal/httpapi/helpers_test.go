@@ -48,6 +48,15 @@ const (
 
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
+	return newTestEnvWith(t, nil)
+}
+
+// newTestEnvWith is newTestEnv for a suite that needs a deployment knob the
+// server reads while it is being built (a Stage C host allowlist, a credential
+// key): those have to be in the config before httpapi.New runs, so a test that
+// starts its own upstream server names them here rather than on e.cfg after.
+func newTestEnvWith(t *testing.T, mutate func(*config.Config)) *testEnv {
+	t.Helper()
 
 	skillsDir := t.TempDir()
 	writeSkillFixture(t, skillsDir, "code-review", "Code Review", "Review code changes carefully.")
@@ -62,11 +71,20 @@ func newTestEnv(t *testing.T) *testEnv {
 		SessionTTL:  24 * time.Hour,
 		MCPTokenTTL: time.Hour,
 		// Deployment takes these from config.FromEnv. A zero APITokenTTL
-		// would mint an already-expired token, and a zero ModelsTTL would
-		// ask the gateway on every request.
-		ModelsTTL:    time.Minute,
-		APITokenTTL:  90 * 24 * time.Hour,
-		OIDCStateTTL: 10 * time.Minute,
+		// would mint an already-expired token, a zero ModelsTTL would
+		// ask the gateway on every request, and a zero MCPOAuthStateTTL
+		// would expire an MCP connect before the browser finishes it.
+		ModelsTTL:        time.Minute,
+		APITokenTTL:      90 * 24 * time.Hour,
+		OIDCStateTTL:     10 * time.Minute,
+		MCPToolsTTL:      time.Minute,
+		MCPOAuthStateTTL: 10 * time.Minute,
+		// config.FromEnv's own default; a suite that wants a shared
+		// connection to read a key names a variable under it.
+		MCPKeyEnvPrefixes: []string{"BURROW_MCP_KEY_"},
+	}
+	if mutate != nil {
+		mutate(cfg)
 	}
 
 	st := storetest.Open(t)
