@@ -11,7 +11,7 @@ single sign-on through the identity provider you already run.
 
 ## Status
 
-**Stage A and B shipped.** The staged plan (ADR-0001):
+**Stages A, B and C shipped.** The staged plan (ADR-0001):
 
 | Stage | Scope | Status |
 |---|---|---|
@@ -20,7 +20,7 @@ single sign-on through the identity provider you already run.
 | B+ | Per-member provider access by OIDC group (SPEC-0003; model-level groups retired by SPEC-0004) | shipped |
 | B++ | Provider rows in the store, model menus derived from each row's gateway key, admin API (SPEC-0004, ADR-0004) | shipped |
 | B+++ | Library skill packs by OIDC group, edited at `/admin/skills` (SPEC-0003) | shipped |
-| C | Shared MCP connections | planned |
+| C | Shared MCP connections: one org list, burrow as the MCP proxy, OAuth connect (ADR-0010) | shipped |
 | D | Automations and Dashboard | planned |
 
 ## Administering LLM providers

@@ -44,6 +44,8 @@ These rules bind every session, human or agent:
 | `internal/store` | persistence and the schema; single-use grant tokens live here |
 | `internal/skills` | the Library: `<name>/SKILL.md` from a directory or a git checkout, with a cache |
 | `internal/providers` | Stage B org LLM providers, fail-closed at boot |
+| `internal/upstream` | Stage C: burrow as an MCP *client* — the streamable-HTTP calls, the host allowlist every one passes, the OAuth calls, the tool cache |
+| `internal/seal` | AES-256-GCM sealing for a credential burrow must present again (a member's MCP key, an OAuth token) |
 | `docs/client-contract.md` | the client contract, as observed from the MIT client |
 | `docs/adrs`, `docs/openspec/specs` | decisions and specifications (SDD layout) |
 
