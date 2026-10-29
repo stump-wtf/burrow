@@ -36,7 +36,7 @@ const (
 // server on /mcp, and an authorization server on /authorize and /token. One
 // host:port serves all of them so a test names one host in the allowlist.
 type fakeUpstream struct {
-	t *testing.T
+	t   *testing.T
 	srv *httptest.Server
 
 	mu           sync.Mutex
