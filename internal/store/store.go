@@ -277,6 +277,59 @@ CREATE TABLE IF NOT EXISTS model_audiences (
 	updated_at   TIMESTAMPTZ NOT NULL,
 	PRIMARY KEY (provider_id, model_id)
 );
+-- ADR-0010 (Stage C, stump.wtf/burrow#4): the org's shared MCP connections. One
+-- row is one upstream server, and it carries no secret: a shared API key is
+-- named by api_key_env and read from the environment (the same rule ADR-0005
+-- puts on a provider row, for the same reason), and a token — shared or the
+-- member's own — lives in mcp_credentials. mcp_groups is the connection's
+-- audience in SPEC-0003's shape, so the access model #13 built for providers and
+-- models extends to MCP connections without a second seam.
+CREATE TABLE IF NOT EXISTS mcp_connections (
+	id               TEXT PRIMARY KEY,
+	name             TEXT NOT NULL,
+	url              TEXT NOT NULL,
+	auth_type        TEXT NOT NULL,
+	credential_mode  TEXT NOT NULL,
+	expose_directly  BOOLEAN NOT NULL DEFAULT false,
+	api_key_env      TEXT NOT NULL DEFAULT '',
+	mcp_groups       TEXT NOT NULL DEFAULT '[]',
+	oauth_issuer     TEXT NOT NULL DEFAULT '',
+	oauth_auth_url   TEXT NOT NULL DEFAULT '',
+	oauth_token_url  TEXT NOT NULL DEFAULT '',
+	oauth_client_id  TEXT NOT NULL DEFAULT '',
+	oauth_scopes     TEXT NOT NULL DEFAULT '',
+	created_at       TIMESTAMPTZ NOT NULL,
+	updated_at       TIMESTAMPTZ NOT NULL
+);
+-- The credential a connection is actually connected with, one row per member,
+-- where member_id '' is the org's shared slot. credential_hash is SHA-256 of the
+-- value: which credential this is, for a log line and for telling a re-save from
+-- a change. credential_sealed and refresh_sealed are the values sealed under
+-- BURROW_MCP_CREDENTIAL_KEY, so reading the database hands out nothing usable; a
+-- server without that key cannot store a credential at all.
+CREATE TABLE IF NOT EXISTS mcp_credentials (
+	connection_id     TEXT NOT NULL REFERENCES mcp_connections(id) ON DELETE CASCADE,
+	member_id         TEXT NOT NULL DEFAULT '',
+	kind              TEXT NOT NULL,
+	credential_hash   TEXT NOT NULL,
+	credential_sealed TEXT NOT NULL,
+	refresh_sealed    TEXT NOT NULL DEFAULT '',
+	expires_at        TIMESTAMPTZ,
+	connected_at      TIMESTAMPTZ NOT NULL,
+	updated_at        TIMESTAMPTZ NOT NULL,
+	PRIMARY KEY (connection_id, member_id)
+);
+-- An OAuth connect in flight. The client opens authorizeUrl and then polls the
+-- list, so the browser that lands on the callback carries only this single-use
+-- state — never a session cookie, exactly like the desktop handoff's grant.
+CREATE TABLE IF NOT EXISTS mcp_oauth_states (
+	state          TEXT PRIMARY KEY,
+	connection_id  TEXT NOT NULL REFERENCES mcp_connections(id) ON DELETE CASCADE,
+	member_id      TEXT NOT NULL,
+	code_verifier  TEXT NOT NULL,
+	expires_at     TIMESTAMPTZ NOT NULL,
+	created_at     TIMESTAMPTZ NOT NULL
+);
 `
 	// One transaction: the lock_timeout is local to it, so it bounds the boot's
 	// lock waits and nothing the pool does afterwards. It is the server's own
@@ -742,19 +795,22 @@ func (s *Store) LookupMCPToken(ctx context.Context, token string) (userID, orgID
 
 // Purged counts the expired rows one PurgeExpired call removed, per table.
 type Purged struct {
-	Sessions   int64
-	Grants     int64
-	OIDCStates int64
-	MCPTokens  int64
+	Sessions      int64
+	Grants        int64
+	OIDCStates    int64
+	MCPTokens     int64
+	MCPOAuthState int64
 }
 
-// PurgeExpired deletes every session, grant, OIDC sign-in state and MCP token
-// past its expires_at. It is housekeeping, not enforcement: each lookup still
-// checks expiry itself, so a row this has not reached yet is refused exactly
-// as before. Without it nothing ever removes an expired row — and
-// /auth/oidc/start writes a state row for every anonymous request, so the
-// tables only grow. Once swept, an expired token reads as unknown rather than
-// expired, which every caller already answers with a refusal.
+// PurgeExpired deletes every session, grant, sign-in state, MCP token and MCP
+// OAuth state past its expires_at. It is housekeeping, not enforcement: each
+// lookup still checks expiry itself, so a row this has not reached yet is
+// refused exactly as before. Without it nothing ever removes an expired row —
+// and /auth/oidc/start writes a state row for every anonymous request, and
+// /v1/mcp-connections/:id/connect/start writes one for every connect a member
+// starts, so the tables only grow. Once swept, an expired token reads as
+// unknown rather than expired, which every caller already answers with a
+// refusal.
 //
 // Admin API tokens are left alone on purpose: they are a short list an admin
 // mints and revokes by name, and an expired one is still worth seeing there.
@@ -769,6 +825,7 @@ func (s *Store) PurgeExpired(ctx context.Context) (Purged, error) {
 		{"grants", &purged.Grants},
 		{"oidc_states", &purged.OIDCStates},
 		{"mcp_tokens", &purged.MCPTokens},
+		{"mcp_oauth_states", &purged.MCPOAuthState},
 	} {
 		tag, err := s.db.ExecContext(ctx, `DELETE FROM `+t.table+` WHERE expires_at < $1`, cutoff)
 		if err != nil {

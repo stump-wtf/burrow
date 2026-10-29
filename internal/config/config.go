@@ -79,6 +79,22 @@ type Config struct {
 	// non-default port.
 	GatewayHosts []string
 
+	// The Stage C MCP surface (ADR-0010). MCPURLHosts is the fail-closed list of
+	// hosts burrow will speak MCP to as a client — an upstream request carries a
+	// credential, so a connection row naming an arbitrary host would be a way to
+	// send one anywhere (the same rule ADR-0005 puts on a provider row's
+	// baseURL). MCPKeyEnvPrefixes bounds what a connection's shared key may be
+	// named, MCPCredentialKey seals what a member's own key and an OAuth token
+	// are stored as, and MCPToolsTTL is how long an upstream tool list is
+	// trusted before the server is asked again.
+	MCPURLHosts       []string
+	MCPKeyEnvPrefixes []string
+	MCPCredentialKey  string
+	MCPToolsTTL       time.Duration
+	// MCPOAuthStateTTL bounds how long a member has to finish an OAuth connect
+	// they started (BURROW_MCP_OAUTH_STATE_TTL).
+	MCPOAuthStateTTL time.Duration
+
 	// APITokenTTL is the lifetime of a minted admin API token
 	// (BURROW_API_TOKEN_TTL, default 90 days).
 	APITokenTTL time.Duration
@@ -115,30 +131,35 @@ func FromEnv() (*Config, error) {
 		return b
 	}
 	c := &Config{
-		Addr:             env("BURROW_ADDR", ":8080"),
-		BaseURL:          strings.TrimRight(os.Getenv("BURROW_BASE_URL"), "/"),
-		DatabaseURL:      strings.TrimSpace(os.Getenv("BURROW_DATABASE_URL")),
-		OIDCIssuerURL:    strings.TrimRight(os.Getenv("BURROW_OIDC_ISSUER_URL"), "/"),
-		OIDCClientID:     os.Getenv("BURROW_OIDC_CLIENT_ID"),
-		OIDCClientSecret: os.Getenv("BURROW_OIDC_CLIENT_SECRET"),
-		OIDCRedirectURL:  os.Getenv("BURROW_OIDC_REDIRECT_URL"),
-		OrgName:          env("BURROW_ORG_NAME", "burrow"),
-		OrgSlug:          env("BURROW_ORG_SLUG", "burrow"),
-		SkillsDir:        os.Getenv("BURROW_SKILLS_DIR"),
-		SkillsGitURL:     os.Getenv("BURROW_SKILLS_GIT_URL"),
-		SkillsCacheDir:   env("BURROW_SKILLS_CACHE_DIR", ""),
-		SkillsSubdir:     os.Getenv("BURROW_SKILLS_SUBDIR"),
-		ProvidersFile:    os.Getenv("BURROW_PROVIDERS_FILE"),
-		ModelsTTL:        duration("BURROW_MODELS_TTL", 60*time.Second),
-		AdminGroups:      envList("BURROW_ADMIN_GROUPS"),
-		KeyEnvPrefixes:   envListDefault("BURROW_PROVIDER_API_KEY_ENV_PREFIXES", []string{"LITELLM_"}),
-		GatewayHosts:     envList("BURROW_PROVIDER_BASE_URL_HOSTS"),
-		APITokenTTL:      duration("BURROW_API_TOKEN_TTL", 90*24*time.Hour),
-		OIDCGroupsScope:  boolean("BURROW_OIDC_GROUPS_SCOPE", true),
-		GrantTTL:         duration("BURROW_GRANT_TTL", 5*time.Minute),
-		SessionTTL:       duration("BURROW_SESSION_TTL", 30*24*time.Hour),
-		MCPTokenTTL:      duration("BURROW_MCP_TOKEN_TTL", 24*time.Hour),
-		OIDCStateTTL:     duration("BURROW_OIDC_STATE_TTL", 10*time.Minute),
+		Addr:              env("BURROW_ADDR", ":8080"),
+		BaseURL:           strings.TrimRight(os.Getenv("BURROW_BASE_URL"), "/"),
+		DatabaseURL:       strings.TrimSpace(os.Getenv("BURROW_DATABASE_URL")),
+		OIDCIssuerURL:     strings.TrimRight(os.Getenv("BURROW_OIDC_ISSUER_URL"), "/"),
+		OIDCClientID:      os.Getenv("BURROW_OIDC_CLIENT_ID"),
+		OIDCClientSecret:  os.Getenv("BURROW_OIDC_CLIENT_SECRET"),
+		OIDCRedirectURL:   os.Getenv("BURROW_OIDC_REDIRECT_URL"),
+		OrgName:           env("BURROW_ORG_NAME", "burrow"),
+		OrgSlug:           env("BURROW_ORG_SLUG", "burrow"),
+		SkillsDir:         os.Getenv("BURROW_SKILLS_DIR"),
+		SkillsGitURL:      os.Getenv("BURROW_SKILLS_GIT_URL"),
+		SkillsCacheDir:    env("BURROW_SKILLS_CACHE_DIR", ""),
+		SkillsSubdir:      os.Getenv("BURROW_SKILLS_SUBDIR"),
+		ProvidersFile:     os.Getenv("BURROW_PROVIDERS_FILE"),
+		ModelsTTL:         duration("BURROW_MODELS_TTL", 60*time.Second),
+		AdminGroups:       envList("BURROW_ADMIN_GROUPS"),
+		KeyEnvPrefixes:    envListDefault("BURROW_PROVIDER_API_KEY_ENV_PREFIXES", []string{"LITELLM_"}),
+		GatewayHosts:      envList("BURROW_PROVIDER_BASE_URL_HOSTS"),
+		MCPURLHosts:       envList("BURROW_MCP_URL_HOSTS"),
+		MCPKeyEnvPrefixes: envListDefault("BURROW_MCP_API_KEY_ENV_PREFIXES", []string{"BURROW_MCP_KEY_"}),
+		MCPCredentialKey:  os.Getenv("BURROW_MCP_CREDENTIAL_KEY"),
+		MCPToolsTTL:       duration("BURROW_MCP_TOOLS_TTL", 60*time.Second),
+		MCPOAuthStateTTL:  duration("BURROW_MCP_OAUTH_STATE_TTL", 10*time.Minute),
+		APITokenTTL:       duration("BURROW_API_TOKEN_TTL", 90*24*time.Hour),
+		OIDCGroupsScope:   boolean("BURROW_OIDC_GROUPS_SCOPE", true),
+		GrantTTL:          duration("BURROW_GRANT_TTL", 5*time.Minute),
+		SessionTTL:        duration("BURROW_SESSION_TTL", 30*24*time.Hour),
+		MCPTokenTTL:       duration("BURROW_MCP_TOKEN_TTL", 24*time.Hour),
+		OIDCStateTTL:      duration("BURROW_OIDC_STATE_TTL", 10*time.Minute),
 	}
 	if invalid != nil {
 		return nil, invalid
