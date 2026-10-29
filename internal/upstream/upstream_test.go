@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -257,5 +258,30 @@ func TestToolCacheExpiryAndForget(t *testing.T) {
 	}
 	if NewToolCache(0) != nil {
 		t.Fatal("a zero ttl means no cache")
+	}
+}
+
+func TestUpstreamCallsDoNotFollowRedirects(t *testing.T) {
+	var hops int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hops, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+
+	client := NewHTTPClient(30 * time.Second)
+	if _, err := ExchangeCode(context.Background(), client, Unconstrained(), srv.URL, "code-1", "verifier-1", "burrow-client", "https://burrow.test/cb"); err == nil {
+		t.Fatal("the token exchange followed a 307 instead of refusing it")
+	}
+	pol := NewClient(client, Unconstrained(), "test")
+	if _, err := pol.CallTool(context.Background(), srv.URL, Headers{"Authorization": "Bearer k"}, "tool", nil); err == nil {
+		t.Fatal("the tool call followed a 307 instead of refusing it")
+	}
+	if atomic.LoadInt32(&hops) != 0 {
+		t.Fatalf("the redirect target saw %d requests it must never see", hops)
 	}
 }

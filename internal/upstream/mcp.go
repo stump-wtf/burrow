@@ -15,9 +15,12 @@
 //     an operator edits, and a row that names an arbitrary host would otherwise
 //     send a stored key to it (the same reasoning ADR-0005 applies to a provider
 //     row's baseURL).
-//   - Nothing here retries, follows a redirect chain into a host the allowlist
-//     refuses, or logs a credential. Authorize values are never logged; a refusal
-//     names the host and the outcome.
+//   - Nothing here retries, follows a redirect, or logs a credential. Redirects
+//     are refused outright rather than followed across hosts: Go re-sends a
+//     307/308 body untouched, and for the token endpoint that body is the code,
+//     the verifier, or a refresh token, which must never reach a second host.
+//     Authorize values are never logged; a refusal names the host and the
+//     outcome.
 //
 // Governing: ADR-0001 (clean room), ADR-0005 (what a row may name), ADR-0010.
 package upstream
@@ -141,6 +144,20 @@ func normalizeHost(host string) string {
 	return strings.TrimSuffix(host, ".")
 }
 
+// NewHTTPClient builds the transport every burrow-to-upstream call uses: one
+// timeout, and no redirect following. A 3xx is returned to the caller as the
+// response it is, so a credential-bearing request is never replayed to a second
+// host (Go re-sends a 307/308 body as-is, and for the token endpoint that body
+// carries the code, the verifier, or a refresh token).
+func NewHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
 // Client talks Streamable HTTP to one upstream server. It is safe to share: it
 // holds only an *http.Client and the policy every URL passes.
 type Client struct {
@@ -154,7 +171,7 @@ type Client struct {
 // upstream call, with the policy every connection URL is checked against.
 func NewClient(httpClient *http.Client, policy Policy, version string) *Client {
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 30 * time.Second}
+		httpClient = NewHTTPClient(30 * time.Second)
 	}
 	return &Client{http: httpClient, policy: policy, Version: version}
 }

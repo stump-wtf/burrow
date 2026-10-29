@@ -129,7 +129,7 @@ func postToken(ctx context.Context, client *http.Client, policy Policy, tokenURL
 		return Token{}, fmt.Errorf("upstream: token url: %w", err)
 	}
 	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
+		client = NewHTTPClient(30 * time.Second)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -145,6 +145,9 @@ func postToken(ctx context.Context, client *http.Client, policy Policy, tokenURL
 	payload, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return Token{}, fmt.Errorf("upstream: read token response: %w", err)
+	}
+	if resp.StatusCode/100 == 3 {
+		return Token{}, fmt.Errorf("upstream: token endpoint redirected (http %d); refusing to follow", resp.StatusCode)
 	}
 	var answered struct {
 		AccessToken  string `json:"access_token"`

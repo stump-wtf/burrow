@@ -58,7 +58,7 @@ func New(cfg *config.Config, st *store.Store, catalog *skills.Catalog, runtime *
 			"error", err)
 		sealer = nil
 	}
-	s.mcpUpstream = upstream.NewClient(&http.Client{Timeout: 30 * time.Second}, upstream.NewPolicy(cfg.MCPURLHosts), buildinfo.Version)
+	s.mcpUpstream = upstream.NewClient(upstream.NewHTTPClient(30*time.Second), upstream.NewPolicy(cfg.MCPURLHosts), buildinfo.Version)
 	s.mcpPolicy = upstream.NewPolicy(cfg.MCPURLHosts)
 	s.mcpSeal = sealer
 	s.mcpCache = upstream.NewToolCache(cfg.MCPToolsTTL)
