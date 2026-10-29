@@ -287,14 +287,22 @@ func (s *Server) callTool(r *http.Request, name string, args json.RawMessage) (a
 				"url":         "skill://" + skill.Name,
 			})
 		}
-		return textResult(entries, len(matches))
+		// Stage C: the org's MCP connections are part of what an agent can reach,
+		// and burrow is the way it reaches them (ADR-0010). A connection that is
+		// not connected, not theirs, or not answering contributes nothing.
+		entries = append(entries, s.mcpUpstreamEntries(r)...)
+		return textResult(entries, len(entries))
 
 	case "execute_capability":
 		var params struct {
 			Capability string `json:"capability"`
+			Input      string `json:"input"`
 		}
 		if err := json.Unmarshal(args, &params); err != nil || params.Capability == "" {
 			return nil, &jsonrpcError{Code: -32602, Message: "execute_capability requires a capability"}
+		}
+		if _, _, isUpstream := mcpSplitCapability(params.Capability); isUpstream {
+			return s.mcpUpstreamCall(r, params.Capability, params.Input)
 		}
 		skill, ok, err := s.skillByCapability(r, params.Capability)
 		if err != nil {
